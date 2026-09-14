@@ -230,6 +230,10 @@ class SchedulerProfilerManager:
             self.rpd_profiler.rangePush("", "rpd profile range", "")
             self.profile_in_progress = True
         elif torchprof_activities:
+            if _is_npu:
+                # Graph replay is asynchronous. Drain the preceding stage
+                # before recording, then let every TP rank arm its profiler.
+                torch.npu.synchronize()
             self.torch_profiler = torch.profiler.profile(
                 activities=torchprof_activities,
                 with_stack=with_stack if with_stack is not None else True,
@@ -259,6 +263,8 @@ class SchedulerProfilerManager:
             )
             try:
                 self.torch_profiler.start()
+                if _is_npu:
+                    torch.distributed.barrier(self.dp_tp_cpu_group)
             except RuntimeError as e:
                 self.torch_profiler = None
                 return ProfileReqOutput(success=False, message=str(e))
@@ -333,6 +339,9 @@ class SchedulerProfilerManager:
         stage_suffix = f"-{stage.name}" if stage else ""
         logger.info("Stop profiling" + stage_suffix + "...")
         if self.torch_profiler is not None:
+            if _is_npu:
+                # Keep the final enqueued graph kernels inside the trace.
+                torch.npu.synchronize()
             self.torch_profiler.stop()
             if not _is_npu:
                 # Build filename with only non-zero ranks to maintain backward compatibility
