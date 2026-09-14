@@ -4,8 +4,9 @@ Attention K/V retain their allocator and physical page table. Only compressed
 index keys use this layout. Prefix caching and disaggregation are unsupported.
 """
 
-from dataclasses import dataclass
+import logging
 import os
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -57,18 +58,29 @@ def cache_options(model_config, requests, full_tokens, page_size):
         raise ValueError(
             "GLM compact caches require TP16/EP16 without prefix cache, PD or unified memory"
         )
+    layout = (
+        make_layout(
+            requests,
+            model_config.context_len,
+            full_tokens,
+            page_size,
+            cfg.speculative_num_draft_tokens or 0,
+        )
+        if compact
+        else None
+    )
+    logging.getLogger(__name__).info(
+        "GLM native cache layout: context=%s requests=%s compact_index=%s "
+        "index_pages=%s full_pages=%s shared_zero_rope=%s",
+        model_config.context_len,
+        requests,
+        layout is not None,
+        layout.pages if layout is not None else full_tokens // page_size + 1,
+        full_tokens // page_size + 1,
+        shared,
+    )
     return {
-        "index_layout": (
-            make_layout(
-                requests,
-                model_config.context_len,
-                full_tokens,
-                page_size,
-                cfg.speculative_num_draft_tokens or 0,
-            )
-            if compact
-            else None
-        ),
+        "index_layout": layout,
         "share_zero_rope": shared,
     }
 
