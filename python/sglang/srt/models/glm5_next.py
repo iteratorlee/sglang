@@ -31,7 +31,10 @@ from sglang.srt.layers.communicator import (
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
 )
-from sglang.srt.layers.communicator_mhc import MHCLayerCommunicator
+from sglang.srt.layers.communicator_mhc import (
+    AscendMHCLayerCommunicator,
+    MHCLayerCommunicator,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
@@ -699,7 +702,12 @@ class Glm5NextDecoderLayer(nn.Module):
                 hc_ffn_pre=self.hc_ffn_pre,
                 hc_post=self.hc_post,
             )
-            self.layer_communicator = MHCLayerCommunicator(
+            from sglang.srt.utils import is_npu
+
+            communicator = (
+                AscendMHCLayerCommunicator if is_npu() else MHCLayerCommunicator
+            )
+            self.layer_communicator = communicator(
                 **shared_kwargs,
                 **mhc_kwargs,
             )
@@ -1078,11 +1086,17 @@ class Glm5NextModel(nn.Module):
 
 
 class Glm5NextForConditionalGeneration(nn.Module):
+    supports_unaligned_npu_graph = True
     hf_to_sglang_mapper = WeightsMapper(
-        orig_to_new_substr={
+        orig_to_new_prefix={
             "model.language_model.": "model.",
             "model.visual": "visual",
-        }
+        },
+        orig_to_new_substr={
+            ".self_attn.forget_gate.": ".self_attn.",
+            ".attn_hc.": ".hc_attn_",
+            ".ffn_hc.": ".hc_ffn_",
+        },
     )
 
     packed_modules_mapping = {
@@ -1241,9 +1255,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
         )
         if self.num_fused_shared_experts == 0:
             return
-        assert self.num_fused_shared_experts == 1, (
-            f"Only 1 fused shared expert is supported for {type(self).__name__}"
-        )
+        assert (
+            self.num_fused_shared_experts == 1
+        ), f"Only 1 fused shared expert is supported for {type(self).__name__}"
         log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
@@ -1365,6 +1379,20 @@ class Glm5NextForConditionalGeneration(nn.Module):
         else:
             return hidden_states
 
+    def validate_weights_after_loading(self):
+        from sglang.srt.utils import is_npu
+
+        if (
+            is_npu()
+            and self.quant_config is not None
+            and self.quant_config.get_name() == "modelslim"
+        ):
+            from sglang.srt.hardware_backend.npu.quantization.glm53_audit import (
+                validate_w8a8_model,
+            )
+
+            validate_w8a8_model(self)
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
@@ -1430,6 +1458,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
             if getattr(self, "language_only", False) and is_visual_weight:
                 continue
 
+            # ModelSlim retains the training module nesting for KDA and mHC.
+            name = (
+                name.replace(".self_attn.forget_gate.", ".self_attn.")
+                .replace(".attn_hc.", ".hc_attn_")
+                .replace(".ffn_hc.", ".hc_ffn_")
+            )
             if "language_model." in name:
                 name = name.replace("language_model.", "")
             if "model.visual." in name:

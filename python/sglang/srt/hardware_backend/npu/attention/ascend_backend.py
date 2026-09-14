@@ -507,6 +507,13 @@ class AscendAttnBackend(AttentionBackend):
             ][:, :: self.page_size]
             // self.page_size
         )
+        if self.use_mla and self.qk_rope_head_dim == 0:
+            # KPool masks unused sparse slots with the first future token.
+            # At a page boundary this must resolve to a valid zero guard page.
+            table = self.forward_metadata.block_tables
+            self.forward_metadata.block_tables = torch.cat(
+                (table, table.new_zeros((table.shape[0], 1))), dim=1
+            )
         if self.is_hybrid_swa:
             self.forward_metadata.block_tables_swa = (
                 (
@@ -625,6 +632,8 @@ class AscendAttnBackend(AttentionBackend):
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         total_context_len = self.max_context_len + self.page_size - 1
+        if self.use_mla and self.qk_rope_head_dim == 0:
+            total_context_len += self.page_size
         if self.speculative_num_draft_tokens is not None:
             total_context_len += self.speculative_num_draft_tokens
         self.graph_metadata = {
@@ -1153,12 +1162,15 @@ class AscendAttnBackend(AttentionBackend):
 
         if save_kv_cache:
             k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
-            k_rope = k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
+            if self.qk_rope_head_dim:
+                k_rope = k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
             self.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, k_rope
             )
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        if self.qk_rope_head_dim == 0:
+            q_pe = q_nope.new_zeros((*q_nope.shape[:-1], k_pe.shape[-1]))
 
         if is_prefill:
             if self.forward_metadata.actual_seq_lengths_q is not None:

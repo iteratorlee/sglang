@@ -51,7 +51,12 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
 
-class IndexerKPool(MultiPlatformOp):
+from sglang.srt.hardware_backend.npu.attention.glm53.kpool_indexer import (
+    AscendIndexerKPoolMixin,
+)
+
+
+class IndexerKPool(AscendIndexerKPoolMixin, MultiPlatformOp):
     def __init__(
         self,
         hidden_size: int,
@@ -99,9 +104,9 @@ class IndexerKPool(MultiPlatformOp):
             f"index_topk ({self.index_topk}) must be divisible by "
             f"index_kpool ({self.index_kpool})"
         )
-        assert 64 % self.index_kpool == 0, (
-            f"index_kpool ({self.index_kpool}) must divide page_size (64)"
-        )
+        assert (
+            64 % self.index_kpool == 0
+        ), f"index_kpool ({self.index_kpool}) must divide page_size (64)"
 
         self.index_kpool_compress_ape = nn.Parameter(
             torch.zeros(self.index_kpool, self.head_dim, dtype=torch.float32)
@@ -155,6 +160,8 @@ class IndexerKPool(MultiPlatformOp):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
+        if is_npu():
+            self._init_ascend_kpool()
 
     @torch.compile(dynamic=True)
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
@@ -904,9 +911,9 @@ class IndexerKPool(MultiPlatformOp):
         total_k_rows = plan.ragged_total_k_rows
 
         n_real = seq_lens_expanded.shape[0]
-        assert n_real <= total_q, (
-            f"plan has more real rows ({n_real}) than q_fp8 ({total_q})"
-        )
+        assert (
+            n_real <= total_q
+        ), f"plan has more real rows ({n_real}) than q_fp8 ({total_q})"
 
         if total_k_rows > 0:
             k_u8 = plan.ragged_k_u8

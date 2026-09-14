@@ -389,10 +389,23 @@ class FusedRMSNormGated(nn.Module):
         prenorm: bool = False,
         residual_in_fp32: bool = False,
     ) -> torch.Tensor:
-        if _use_cpu:
-            assert self.activation == "silu", (
-                "CPU rmsnorm_gated currently only supports activation silu"
+        if (
+            _is_npu
+            and self.activation == "sigmoid"
+            and self.weight is not None
+            and residual is None
+            and not prenorm
+            and not residual_in_fp32
+        ):
+            from sglang.srt.hardware_backend.npu.attention.glm53.rms_norm_gated_npu import (
+                glm_rms_norm_gated_npu,
             )
+
+            return glm_rms_norm_gated_npu(x, g, self.weight, self.eps)
+        if _use_cpu:
+            assert (
+                self.activation == "silu"
+            ), "CPU rmsnorm_gated currently only supports activation silu"
             return torch.ops.sgl_kernel.fused_rmsnorm_gated_cpu(
                 x, self.weight, g, self.eps
             )

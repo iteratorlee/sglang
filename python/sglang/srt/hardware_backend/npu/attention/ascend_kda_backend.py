@@ -131,6 +131,10 @@ class AscendKDAAttnBackend(KDAAttnBackend):
 
     def __init__(self, model_runner):
         super().__init__(model_runner)
+        self.glm_bounded_recurrence = any(
+            name.startswith("Glm5Next")
+            for name in model_runner.model_config.hf_config.architectures
+        )
         # The NPU pool is allocated as [layers, pool, window, channels]
         # (transposed from the shared KDA [channels, window]). Expose the
         # transposed shape so _init_track_conv_indices reads
@@ -146,6 +150,45 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             )
         )
         self.kernel_dispatcher.extend_kernel = _AscendKDAExtendKernel()
+
+    def _glm_recurrent(
+        self,
+        layer,
+        q,
+        k,
+        v,
+        a,
+        b,
+        states,
+        indices,
+        starts,
+        *,
+        intermediate=None,
+        prefill=False,
+    ):
+        from sglang.srt.hardware_backend.npu.attention.glm53.kda_recurrent_npu import (
+            glm_kda_varlen_recurrent_npu,
+        )
+
+        # Native Ascend state/rollback uses logical [V,K], while the GLM tile
+        # updates [K,V]. Preserve views and explicit strides, never copy state.
+        return glm_kda_varlen_recurrent_npu(
+            q=q,
+            k=k,
+            v=v,
+            a=a.reshape(1, -1, layer.num_v_heads, layer.head_k_dim),
+            b=b.reshape(1, -1, layer.num_v_heads),
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            initial_state_source=states.transpose(-1, -2),
+            initial_state_indices=indices,
+            cu_seqlens=starts,
+            lower_bound=layer.lower_bound,
+            prefill=prefill,
+            intermediate_state=(
+                intermediate.transpose(-1, -2) if intermediate is not None else None
+            ),
+        )
 
     def _get_conv_weights_t(
         self, layer: RadixLinearAttention, dtype: torch.dtype
@@ -194,7 +237,15 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             run_mode=1,
         )
 
-        if self.kernel_dispatcher.supports_packed_decode:
+        if self.glm_bounded_recurrence:
+            q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
+            q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)
+            k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
+            v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
+            core_attn_out = self._glm_recurrent(
+                layer, q, k, v, a, b, ssm_states, cache_indices, query_start_loc
+            )
+        elif self.kernel_dispatcher.supports_packed_decode:
             assert qkv.shape[0] == cache_indices.shape[0], (
                 "KDA packed decode requires one token per sequence (T=1): "
                 f"got {qkv.shape[0]} tokens for {cache_indices.shape[0]} requests."
@@ -300,6 +351,23 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
+        if self.glm_bounded_recurrence:
+            if self.forward_metadata.has_mamba_track_mask:
+                raise NotImplementedError(
+                    "GLM bounded KDA currently requires --disable-radix-cache"
+                )
+            return self._glm_recurrent(
+                layer,
+                q,
+                k,
+                v,
+                a,
+                b,
+                ssm_states,
+                cache_indices,
+                query_start_loc,
+                prefill=True,
+            )
         g, beta, extend_A_log, extend_dt_bias = self._prepare_extend_gate_inputs(
             layer, a, b
         )
@@ -347,8 +415,12 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         ``chunk_kda``. Keeping this platform override here leaves the shared
         GPU model/backend paths unchanged.
         """
+        # GLM supplies [1, T, H*D] with raw beta; Kimi supplies
+        # [1, T, H, D] with beta already activated (same shared-backend contract).
+        if g.ndim == 3:
+            beta = beta.float().sigmoid()
         preactivated_g = fused_kda_gate_npu(
-            g.flatten(-2),
+            g.reshape(1, -1, layer.A_log.numel() * layer.head_k_dim),
             layer.A_log,
             layer.head_k_dim,
             gate_bias=layer.dt_bias,
@@ -434,11 +506,30 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
 
+        if self.glm_bounded_recurrence:
+            out = self._glm_recurrent(
+                layer,
+                q,
+                k,
+                v,
+                dense_a,
+                dense_b,
+                cache.temporal,
+                cache_indices[:batch_size],
+                dense_query_start_loc,
+                intermediate=intermediate_state,
+            )
+            if dense_token_indices is None:
+                return out
+            padded_out = out.new_zeros(1, num_dense_tokens + 1, *out.shape[2:])
+            padded_out[:, :num_dense_tokens] = out
+            return padded_out[:, dense_token_indices]
+
         # Activate the forget gate and beta in FP32 before entering the
         # recurrent kernel to match the checkpoint's verify contract.
         # This stays in the Ascend backend so shared/GPU model code is unchanged.
         preactivated_a = fused_kda_gate_npu(
-            dense_a.flatten(-2),
+            dense_a.reshape(1, -1, layer.A_log.numel() * layer.head_k_dim),
             layer.A_log,
             layer.head_k_dim,
             gate_bias=layer.dt_bias,
@@ -529,8 +620,14 @@ class AscendKDAHybridLinearAttnBackend:
                     speculative_state_scatter_npu,
                 )
 
-                del req_pool_indices
                 request_number = last_correct_step_indices.shape[0]
+                from sglang.srt.hardware_backend.npu.attention.glm53.accepted_state import (
+                    commit_kpool_tails,
+                )
+
+                commit_kpool_tails(
+                    self, model, last_correct_step_indices, req_pool_indices
+                )
 
                 state_indices_tensor = (
                     self.linear_attn_backend.forward_metadata.mamba_cache_indices[
@@ -538,7 +635,9 @@ class AscendKDAHybridLinearAttnBackend:
                     ]
                 )
 
-                mamba_caches = self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+                mamba_caches = (
+                    self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+                )
 
                 conv_states = mamba_caches.conv[0]
                 ssm_states = mamba_caches.temporal

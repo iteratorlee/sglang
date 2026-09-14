@@ -3803,6 +3803,7 @@ class HybridLinearKVPool(KVCache):
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
+        npu_pool_options: Optional[dict] = None,
     ):
         self.size = size
         self.dtype = dtype
@@ -3864,6 +3865,24 @@ class HybridLinearKVPool(KVCache):
                 enable_kv_cache_copy=enable_kv_cache_copy,
                 **quant_method_kwarg,
                 **post_capture_kwargs,
+            )
+        elif use_dsa and _is_npu:
+            from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                NPUMLATokenToKVPool,
+            )
+
+            self.full_kv_pool = NPUMLATokenToKVPool(
+                size=size,
+                page_size=self.page_size,
+                dtype=dtype,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                layer_num=self.full_layer_nums,
+                device=device,
+                index_head_dim=index_head_dim,
+                enable_memory_saver=enable_memory_saver,
+                kv_cache_dim=kv_cache_dim,
+                **(npu_pool_options or {}),
             )
         elif use_dsa:
             # DSA sparse full-attention layers share the MLA latent layout and

@@ -1103,9 +1103,9 @@ def mhc_pre(
             gemm_out_sqrsum = torch.empty(
                 n_splits, num_tokens, dtype=torch.float32, device=residual.device
             )
-            assert n_splits == 1, (
-                "The simple TileLang version gemm_sqrsum doesn't support split-k"
-            )
+            assert (
+                n_splits == 1
+            ), "The simple TileLang version gemm_sqrsum doesn't support split-k"
             _mhc_pre_gemm_sqrsum_dispatch()(
                 residual_flat.view(num_tokens, hc_mult * hidden_size),
                 fn_flat,
@@ -1119,9 +1119,9 @@ def mhc_pre(
 
     if norm_weight is not None:
         assert norm_eps is not None, "norm_eps required when norm_weight is provided"
-        assert norm_weight.shape == (hidden_size,), (
-            f"norm_weight shape {tuple(norm_weight.shape)} != (hidden_size={hidden_size},)"
-        )
+        assert norm_weight.shape == (
+            hidden_size,
+        ), f"norm_weight shape {tuple(norm_weight.shape)} != (hidden_size={hidden_size},)"
         norm_weight_bf = (
             norm_weight.bfloat16()
             if norm_weight.dtype != torch.bfloat16
@@ -1835,7 +1835,7 @@ def _mhc_pre_dispatch(
     norm_eps: float | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
     assert residual.dim() == 3, f"residual must be (s, n, h); got {residual.shape}"
-    if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+    if residual.device.type == "npu" or not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
         post_mix, comb_mix, layer_input = _mhc_pre_torch(
             residual=residual,
             fn=fn,
@@ -1874,7 +1874,7 @@ def _mhc_post_dispatch(
 ) -> torch.Tensor:
     assert x.dim() == 2 and residual.dim() == 3
     assert post_layer_mix.dim() == 3 and comb_res_mix.dim() == 3
-    if not envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
+    if x.device.type == "npu" or not envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
         return _mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
     return mhc_post(x, residual, post_layer_mix, comb_res_mix)
 
@@ -1893,6 +1893,31 @@ def hc_pre(
     out_norm_weight: torch.Tensor | None = None,
     out_norm_eps: float | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    # Preserve the checkpoint's FP32 hyper-connection arithmetic on Ascend.
+    if (
+        x.device.type == "npu"
+        and x.dtype == torch.bfloat16
+        and hc_mult == 4
+        and x.shape[-1] == 16384
+        and x.shape[0] <= 4096
+    ):
+        from sglang.kernels.ops.layernorm.mhc_npu import hc_pre as ascend_hc_pre
+
+        fn = hc_fn if hc_norm_weight is None else hc_fn * hc_norm_weight
+        return ascend_hc_pre(
+            x,
+            fn,
+            hc_scale,
+            hc_base,
+            hc_mult,
+            rms_eps,
+            hc_eps,
+            sinkhorn_iters,
+            post_mult_value,
+            None,
+            out_norm_weight,
+            out_norm_eps,
+        )
     s, total = x.shape
     hidden_size = total // hc_mult
     if x.numel() == 0:
@@ -1933,6 +1958,16 @@ def hc_post(
     h_res: torch.Tensor,
     hc_mult: int,
 ) -> torch.Tensor:
+    if (
+        x.device.type == "npu"
+        and x.dtype == torch.bfloat16
+        and hc_mult == 4
+        and x.shape[-1] == 4096
+        and x.shape[0] <= 4096
+    ):
+        from sglang.kernels.ops.layernorm.mhc_npu import hc_post as ascend_hc_post
+
+        return ascend_hc_post(x, residual, h_post, h_res, hc_mult)
     s, hidden_size = x.shape
     if s == 0:
         return x.new_zeros((s, hc_mult * hidden_size))

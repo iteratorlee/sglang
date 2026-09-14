@@ -322,9 +322,9 @@ class KVCacheConfigurator:
                 )
 
         if not self.spec_algorithm.is_none() and self.is_draft_worker:
-            assert self.memory_pool_config is not None, (
-                "Draft worker requires memory_pool_config"
-            )
+            assert (
+                self.memory_pool_config is not None
+            ), "Draft worker requires memory_pool_config"
             config = self.memory_pool_config
         else:
             config = self._resolve_memory_pool_config(pre_model_load_memory)
@@ -742,9 +742,9 @@ class KVCacheConfigurator:
         config = self.mambaish_config
         assert config is not None and self.is_hybrid_swa
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
-        assert not self.use_mla_backend, (
-            "unified tri-pool does not support an MLA full side yet"
-        )
+        assert (
+            not self.use_mla_backend
+        ), "unified tri-pool does not support an MLA full side yet"
         # Mirror the non-shared path's extra_max_context_len computation.
         extra_max_context_len = 4
         if get_spec().speculative_num_draft_tokens is not None:
@@ -856,9 +856,9 @@ class KVCacheConfigurator:
         # Both sub-pools are page-aware; the SWA composite runs alloc_extend_kernel
         # once in virtual space and binds the new pages on both sub-allocators.
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
-        assert not self.use_mla_backend, (
-            "unified memory pool does not support MLA-SWA hybrid yet"
-        )
+        assert (
+            not self.use_mla_backend
+        ), "unified memory pool does not support MLA-SWA hybrid yet"
         # Mirror the non-shared path's extra_max_context_len computation.
         extra_max_context_len = 4
         if get_spec().speculative_num_draft_tokens is not None:
@@ -1250,6 +1250,7 @@ class KVCacheConfigurator:
                 token_to_kv_pool = self._build_ascend_mla_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
                     is_dsa_model=is_dsa_model,
+                    max_num_requests=req_to_token_pool.size,
                 )
             else:
                 token_to_kv_pool = self._build_ascend_mha_kv_pool(
@@ -1300,9 +1301,9 @@ class KVCacheConfigurator:
                 if quant_method is not None and is_float4_e2m1fn_x2(
                     self.kv_cache_dtype
                 ):
-                    assert not enable_page_major, (
-                        "page-major KV layout is not supported with fp4 KV cache"
-                    )
+                    assert (
+                        not enable_page_major
+                    ), "page-major KV layout is not supported with fp4 KV cache"
                 token_to_kv_pool = self._build_mha_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
                     mha_pool_class=mha_pool_class,
@@ -1517,12 +1518,15 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_ascend_mla_kv_pool(
-        self, *, max_total_num_tokens: int, is_dsa_model: bool
+        self, *, max_total_num_tokens: int, is_dsa_model: bool, max_num_requests: int
     ) -> KVCache:
         from sglang.srt.hardware_backend.npu.memory_pool_npu import (
             NPUMLATokenToKVPool,
         )
         from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+        from sglang.srt.hardware_backend.npu.attention.glm53.compact_index import (
+            cache_options,
+        )
 
         is_arch35 = is_npu_arch35()
         use_compact_indexer_layout = (
@@ -1563,6 +1567,12 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            **cache_options(
+                self.model_config,
+                max_num_requests,
+                max_total_num_tokens,
+                self.pool_page_size,
+            ),
         )
         return token_to_kv_pool
 
@@ -1876,6 +1886,17 @@ class KVCacheConfigurator:
                         tail_extra_slots=(max_speculative_num_draft_tokens() or 0),
                         max_running_requests=(req_to_token_pool.req_to_token.shape[0]),
                     )
+                    if str(self.device).startswith("npu"):
+                        from sglang.srt.hardware_backend.npu.attention.glm53.compact_index import (
+                            cache_options,
+                        )
+
+                        extra_args["npu_pool_options"] = cache_options(
+                            self.model_config,
+                            req_to_token_pool.size,
+                            max_total_num_tokens,
+                            self.pool_page_size,
+                        )
         quant_method = self._build_mha_quant_method(
             num_layers=len(full_attention_layer_ids)
         )
@@ -2223,9 +2244,9 @@ class KVCacheConfigurator:
                 else:
                     additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
             else:
-                assert not get_exec().mamba.enable_mamba_extra_buffer_lazy, (
-                    "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
-                )
+                assert (
+                    not get_exec().mamba.enable_mamba_extra_buffer_lazy
+                ), "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
                 additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
         elif skip_decode_lock:
             # no_buffer under skip: add the base drop back so effective stays 3,
@@ -2589,9 +2610,9 @@ def calculate_mla_kv_cache_dim(
     # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
     # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
     if kv_cache_dtype == torch.float8_e4m3fn:
-        assert kv_lora_rank % quant_block_size == 0, (
-            f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
-        )
+        assert (
+            kv_lora_rank % quant_block_size == 0
+        ), f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
 
         return (
             kv_lora_rank

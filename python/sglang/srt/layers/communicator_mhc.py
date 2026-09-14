@@ -53,9 +53,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 def tp_all_gather_hidden_states(hidden_states, forward_batch):
-    assert get_attn_tp_context().input_scattered, (
-        "Input scattered guarantees same num tokens in TP group."
-    )
+    assert (
+        get_attn_tp_context().input_scattered
+    ), "Input scattered guarantees same num tokens in TP group."
     total_tokens = forward_batch.input_ids.shape[0]
     output = hidden_states.new_empty((total_tokens, hidden_states.shape[-1]))
     get_tp_group().all_gather_into_tensor(output, hidden_states)
@@ -78,6 +78,13 @@ class MHCState:
     @staticmethod
     def _resolve_out_norm(out_norm):
         if out_norm is None:
+            return None, None
+        if out_norm.weight.device.type == "npu" and (
+            hasattr(out_norm, "bias")
+            or getattr(out_norm, "cast_x_before_out_mul", False)
+            or getattr(out_norm, "override_orig_dtype", None) is not None
+            or getattr(out_norm, "variance_size_override", None) is not None
+        ):
             return None, None
         return out_norm.weight.data, out_norm.variance_epsilon
 
@@ -554,4 +561,74 @@ class MHCLayerCommunicator(LayerCommunicator):
 
         if get_attn_tp_context().input_scattered:
             return True
+        return False
+
+
+class AscendMHCLayerCommunicator(MHCLayerCommunicator):
+    """Keep attention batches compact, padding only token-sharded MoE inputs.
+
+    mHC parameters and normalization use the native MHCState. Each attention
+    TP group keeps its own residual, including when attention DP is enabled.
+    """
+
+    def prepare_attn(self, hidden_states, residual, forward_batch):
+        if self.is_first_layer:
+            hidden_states = hc_expand(hidden_states, self.mhc.hc_mult)
+        return self.mhc.attn_split(hidden_states, out_norm=self.input_layernorm)
+
+    def prepare_mlp(self, hidden_states, residual, forward_batch, cache=None):
+        hidden_states = attention_tensor_model_parallel_all_reduce(hidden_states)
+        hidden_states, residual = self.mhc.attn_to_mlp(
+            hidden_states, residual, out_norm=self.post_attention_layernorm
+        )
+        context = self._context
+        if self.layer_scatter_modes.mlp_mode == ScatterMode.SCATTERED:
+            tokens = hidden_states.shape[0]
+            chunk = (tokens + context.attn_tp_size - 1) // context.attn_tp_size
+            start = context.attn_tp_rank * chunk
+            valid = max(0, min(chunk, tokens - start))
+            if valid == chunk:
+                hidden_states = hidden_states.narrow(0, start, chunk)
+            else:
+                padded = hidden_states.new_zeros((chunk, hidden_states.shape[-1]))
+                if valid:
+                    padded[:valid].copy_(hidden_states.narrow(0, start, valid))
+                hidden_states = padded
+        elif context.attn_dp_size > 1:
+            from sglang.srt.layers.dp_attention import _dp_gather_via_all_reduce
+
+            gathered = get_global_dp_buffer()
+            _dp_gather_via_all_reduce(
+                gathered, hidden_states, forward_batch, is_partial=False
+            )
+            hidden_states = gathered
+        return hidden_states, residual
+
+    def postprocess_layer(self, hidden_states, residual, forward_batch):
+        context = self._context
+        if self.layer_scatter_modes.mlp_mode == ScatterMode.SCATTERED:
+            if context.attn_tp_size > 1 and residual.shape[0]:
+                chunk = hidden_states.shape[0]
+                gathered = hidden_states.new_zeros(
+                    (chunk * context.attn_tp_size, hidden_states.shape[-1])
+                )
+                gathered.narrow(0, context.attn_tp_rank * chunk, chunk).copy_(
+                    hidden_states
+                )
+                hidden_states = attention_tensor_model_parallel_all_reduce(gathered)[
+                    : residual.shape[0]
+                ]
+        elif context.attn_dp_size > 1:
+            local = hidden_states.new_empty(
+                (residual.shape[0], hidden_states.shape[-1])
+            )
+            dp_scatter(local, hidden_states, forward_batch)
+            hidden_states = local
+        hidden_states = self.mhc.mlp_combine(hidden_states, residual)
+        self.mhc.reset_aux()
+        if self.is_last_layer:
+            hidden_states = hc_contract(hidden_states, self.mhc.hc_mult)
+        return hidden_states, None
+
+    def should_use_reduce_scatter(self, forward_batch):
         return False

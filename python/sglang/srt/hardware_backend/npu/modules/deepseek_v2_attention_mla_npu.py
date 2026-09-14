@@ -374,7 +374,8 @@ def forward_dsa_prepare_npu(
 ):
     dynamic_scale = None
     mla_preprocess_used = (
-        is_mla_preprocess_enabled()
+        m.rotary_emb is not None
+        and is_mla_preprocess_enabled()
         and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
     )
     if mla_preprocess_used:
@@ -397,7 +398,7 @@ def forward_dsa_prepare_npu(
         )
     else:
         fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
-        if m.rotary_emb.is_neox_style:
+        if m.rotary_emb is None or m.rotary_emb.is_neox_style:
             q, latent_cache = fused_qkv_a_proj_out.split(
                 [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
             )
@@ -471,7 +472,9 @@ def forward_dsa_prepare_npu(
             perm_y=(1, 0, 2),
         )
 
-        if is_mla_preprocess_enabled() and not m.rotary_emb.is_neox_style:
+        if m.rotary_emb is None:
+            pass  # GLM-5.3 has no logical rotary dimensions.
+        elif is_mla_preprocess_enabled() and not m.rotary_emb.is_neox_style:
             # Match the half-layout RoPE outputs used by MLA preprocessing.
             q_pe, k_pe = _apply_interleaved_rope_with_half_output(
                 m.rotary_emb, positions, q_pe, k_pe
@@ -531,6 +534,11 @@ def forward_dsa_core_npu(
     # a trailing arg. None everywhere else.
     gate: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    # Model-level index sharing (including MTP seed buffers) uses [tokens, K].
+    # CANN sparse attention additionally requires a singleton index-head axis.
+    sparse_indices = (
+        topk_indices.unsqueeze(1) if topk_indices.ndim == 2 else topk_indices
+    )
     attn_output = m.attn_mqa(
         q_nope_out.contiguous(),
         k_nope.contiguous(),
@@ -539,7 +547,7 @@ def forward_dsa_core_npu(
         save_kv_cache=not mla_preprocess_used,
         q_rope=q_pe.contiguous(),
         k_rope=k_pe.contiguous(),
-        topk_indices=topk_indices,
+        topk_indices=sparse_indices,
     )
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 
@@ -572,7 +580,7 @@ def forward_dsa_core_npu(
     if not m.next_skip_topk:
         return output, None
     else:
-        return output, topk_indices
+        return output, sparse_indices.squeeze(1)
 
 
 def npu_mla_preprocess(

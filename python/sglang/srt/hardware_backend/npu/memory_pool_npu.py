@@ -548,6 +548,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         end_layer: Optional[int] = None,
         indexer_layer_ids: Optional[Sequence[int]] = None,
         kv_cache_dim: Optional[int] = None,
+        index_layout=None,
+        share_zero_rope: bool = False,
     ):
         super(MLATokenToKVPool, self).__init__(
             size=size,
@@ -602,6 +604,27 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             requested_kv_cache_dim if self.dsa_kv_cache_store_fp8 else kv_lora_rank
         )
         self.kr_cache_dim = 0 if self.dsa_kv_cache_store_fp8 else qk_rope_head_dim
+        # CANN sparse attention consumes physical 64-wide rotary lanes even
+        # for a model with zero logical RoPE. These lanes remain immutable zero.
+        self.zero_rope = (
+            index_head_dim is not None
+            and qk_rope_head_dim == 0
+            and not self.dsa_kv_cache_store_fp8
+        )
+        if self.zero_rope:
+            self.kr_cache_dim = 64
+        if (index_layout is not None or share_zero_rope) and not (
+            self.zero_rope
+            and index_head_dim == 128
+            and kv_lora_rank == 512
+            and self.page_size == 64
+            and not self.enable_sparsity_driven_kv_offload
+        ):
+            raise ValueError(
+                "Compact GLM caches require BF16 zero-RoPE DSA with latent width 512"
+            )
+        self._glm53_index_layout = index_layout
+        self.share_zero_rope = share_zero_rope and layer_num > 1
         self.index_k_scale_buffer = None
         self.indexer_hadamard_128 = None
 
@@ -626,7 +649,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 )
                 self.v_buffer = torch.zeros(
                     (
-                        layer_num,
+                        1 if self.share_zero_rope else layer_num,
                         self.size // self.page_size + 1,
                         self.page_size,
                         1,
@@ -639,12 +662,18 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     ),
                     device=self.device,
                 )
+                if self.share_zero_rope:
+                    self.v_buffer = self.v_buffer.expand(layer_num, -1, -1, -1, -1)
             self.index_k_buffer = None
             if self.index_head_dim is not None:
                 self.index_k_buffer = torch.zeros(
                     (
                         self.num_indexer_layers,
-                        self.size // self.page_size + 1,
+                        (
+                            index_layout.pages
+                            if index_layout is not None
+                            else self.size // self.page_size + 1
+                        ),
                         self.page_size,
                         1,
                         self.index_head_dim,
@@ -675,8 +704,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             for k_cache in self.k_buffer:
                 kv_size_bytes += get_tensor_size_bytes(k_cache)
         if getattr(self, "v_buffer", None) is not None:
-            for v_cache in self.v_buffer:
-                kv_size_bytes += get_tensor_size_bytes(v_cache)
+            kv_size_bytes += self.v_buffer.untyped_storage().nbytes()
         if getattr(self, "index_k_buffer", None) is not None:
             for index_k_cache in self.index_k_buffer:
                 kv_size_bytes += get_tensor_size_bytes(index_k_cache)
@@ -856,6 +884,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             loc.view(-1, 1),
             cache_k.view(-1, 1, self.kv_lora_rank),
         )
+        if self.zero_rope:
+            return
         torch_npu.npu_scatter_nd_update_(
             self.v_buffer[layer_id - self.start_layer].view(
                 -1, 1, self.qk_rope_head_dim
