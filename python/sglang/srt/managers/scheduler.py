@@ -3661,9 +3661,10 @@ class Scheduler(
         running_bs: int,
         beam_width: Optional[int] = None,
         running_batch: Optional[ScheduleBatch] = None,
+        reusing_req_slots: int = 0,
     ) -> int:
         pp_budget = get_parallel().pp_max_micro_batch_size - running_bs
-        available = self.req_to_token_pool.available_size()
+        available = self.req_to_token_pool.available_size() + reusing_req_slots
 
         active_batch = running_batch or self.running_batch
         available = max(
@@ -3747,8 +3748,8 @@ class Scheduler(
             return None, running_batch
 
         # Ignore the check if self.chunked_req is not None.
-        # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
-        # as the space for the chunked requests has just been released.
+        # A chunked continuation retains its request row and may proceed even
+        # when no rows remain for new requests.
         # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
         if (
@@ -3836,16 +3837,24 @@ class Scheduler(
             candidate_beam_width = (
                 req.beam_group.beam_width if req.beam_group is not None else None
             )
+            # Chunked continuations already own their request row. Counting
+            # them against free rows again marks a C-1 batch full and strands
+            # the final request until an existing decode request completes.
+            reusing_req_slots = sum(r.kv.holds_kv for r in adder.can_run_list)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
                 running_bs,
                 candidate_beam_width,
                 running_batch=running_batch,
+                reusing_req_slots=reusing_req_slots,
             ):
                 running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
                 # so we need to check if the available size for the actual available size.
-                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
+                if (
+                    len(adder.can_run_list) - reusing_req_slots
+                    >= self.req_to_token_pool.available_size()
+                ):
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
