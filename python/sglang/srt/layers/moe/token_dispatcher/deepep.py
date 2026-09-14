@@ -591,6 +591,14 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
         previous_event,
     ):
+        if self.quant_config.get("glm53_normal_hccl", False):
+            from deep_ep.utils import EventOverlap
+            from sglang.srt.hardware_backend.npu.moe.glm53_collectives import collective_dispatch
+
+            recv, scale, counts, self._glm53_collective_state = collective_dispatch(
+                self.group, x, topk_ids, topk_weights, self.num_experts
+            )
+            return (recv, scale), topk_ids, topk_weights, counts, EventOverlap()
         buffer = self._get_buffer()
         (
             num_tokens_per_rank,
@@ -669,6 +677,13 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         return hidden_states
 
     def _combine_core(self, x: torch.Tensor, previous_event):
+        if self.quant_config.get("glm53_normal_hccl", False):
+            from deep_ep.utils import EventOverlap
+            from sglang.srt.hardware_backend.npu.moe.glm53_collectives import collective_combine
+
+            output = collective_combine(self.group, x, self._glm53_collective_state)
+            self._glm53_collective_state = None
+            return output, EventOverlap()
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
         combined_x, _, event = buffer.combine(
