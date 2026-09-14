@@ -22,6 +22,9 @@ from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUW4A8Int8MoEMethod,
     NPUW8A8Int8MoEMethod,
 )
+from sglang.srt.hardware_backend.npu.quantization.w8a8_clamped_moe import (
+    NPUW8A8ClampedMoEMethod,
+)
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -89,7 +92,7 @@ class AscendRunnerCore(MoeRunnerCore):
 
         kernel = config.layer.w2_kernel
 
-        if isinstance(kernel, NPUMXFP8MoEMethod):
+        if isinstance(kernel, (NPUMXFP8MoEMethod, NPUW8A8ClampedMoEMethod)):
             # MXFP8 fuses gate/up + swiglu + requant into gmm1, so there is no
             # separate activation step — run() skips it. Left None on purpose so
             # that reaching for it fails loudly instead of silently applying an
@@ -159,7 +162,7 @@ class AscendRunnerCore(MoeRunnerCore):
 
         w13_kernel = self.config.layer.w13_kernel
 
-        if isinstance(w13_kernel, NPUMXFP8MoEMethod):
+        if isinstance(w13_kernel, (NPUMXFP8MoEMethod, NPUW8A8ClampedMoEMethod)):
             # --- w13 projection + activation, fused into one kernel ---
             # MXFP8 gmm1 returns activations already requantised for gmm2, so
             # there is no separate activation step to run.

@@ -203,6 +203,17 @@ class ModelSlimConfig(QuantizationConfig):
     def update_packed_modules_mapping(self, mapping: Dict[str, List[str]]) -> None:
         self.packed_modules_mapping.update(mapping)
 
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper):
+        # Retain checkpoint aliases: native NPU NextN constructs some modules
+        # with checkpoint prefixes, while the owning module uses model.decoder.
+        aliases = {
+            mapped: value
+            for name, value in self.quant_description.items()
+            if (mapped := hf_to_sglang_mapper._map_name(name)) is not None
+        }
+        self.quant_description = {**aliases, **self.quant_description}
+        self.ignore = hf_to_sglang_mapper.apply_list(self.ignore)
+
     def _quant_prefix_candidates(self, prefix: str) -> List[str]:
         """Return checkpoint-name variants without copying the large config.
 
@@ -213,10 +224,19 @@ class ModelSlimConfig(QuantizationConfig):
         boundary.
         """
         candidates = [prefix]
+        if ".self_attn.f_a_proj" in prefix or ".self_attn.f_b_proj" in prefix:
+            candidates.append(prefix.replace(".self_attn.", ".self_attn.forget_gate."))
         if ".mlp." in prefix:
             candidates.append(prefix.replace(".mlp.", ".block_sparse_moe."))
 
         for candidate in list(candidates):
+            # GLM multimodal checkpoints insert language_model *inside* model.
+            if candidate.startswith("model."):
+                candidates.append(
+                    "model.language_model." + candidate.removeprefix("model.")
+                )
+            if candidate.startswith("visual."):
+                candidates.append("model." + candidate)
             if candidate.startswith("language_model."):
                 candidates.append(candidate.removeprefix("language_model."))
             else:
@@ -293,6 +313,19 @@ class ModelSlimConfig(QuantizationConfig):
             if moe_schemes is None:
                 raise ValueError(f"No ModelSlim MoE scheme found for layer {prefix}")
             layer.w13_scheme, layer.w2_scheme = moe_schemes
+            if layer.moe_runner_config.swiglu_limit is not None:
+                from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+                    NPUW8A8Int8MoEMethod,
+                )
+                from sglang.srt.hardware_backend.npu.quantization.w8a8_clamped_moe import (
+                    NPUW8A8ClampedMoEMethod,
+                )
+
+                for scheme in moe_schemes:
+                    if isinstance(scheme.kernel, NPUW8A8Int8MoEMethod):
+                        scheme.kernel = NPUW8A8ClampedMoEMethod(
+                            layer.moe_runner_config.swiglu_limit
+                        )
             layer.w13_kernel, layer.w2_kernel = (
                 layer.w13_scheme.kernel,
                 layer.w2_scheme.kernel,
