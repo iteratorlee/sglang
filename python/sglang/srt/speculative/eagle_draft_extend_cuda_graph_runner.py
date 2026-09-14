@@ -143,11 +143,12 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.capture_forward_mode = self.forward_mode
         self.capture_hidden_mode = CaptureHiddenMode.LAST
 
-        self.capture_bs, _ = get_batch_sizes_to_capture(model_runner)
-
         # Static capture width: full tree width (num_draft_tokens), not
         # num_steps + 1 -- topk > 1 draft-extend overflows the buffers.
         self.captured_req_width = resolve_num_tokens_per_req(phase="draft_extend")
+        self.capture_bs, _ = get_batch_sizes_to_capture(
+            model_runner, captured_req_width=self.captured_req_width
+        )
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.captured_req_width
 
@@ -476,7 +477,12 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             self.draft_extend_attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=True
             )
-            self.deepep_adapter.capture(is_extend_in_batch=True)
+            low_latency_extend = str(self.model_runner.device).startswith(
+                "npu"
+            ) and getattr(
+                self.model_runner.model, "npu_draft_extend_low_latency", False
+            )
+            self.deepep_adapter.capture(is_extend_in_batch=not low_latency_extend)
             canary_ctx = (
                 c.with_active_single_forward_manager(0)
                 if (c := self.model_runner.canary_manager) is not None

@@ -189,6 +189,11 @@ class DeepseekModelNextN(nn.Module):
                     input_embeds = self.embed_tokens(input_ids)
             hidden_states = input_embeds
 
+            if getattr(self, "zero_position_embeddings", False):
+                hidden_states = hidden_states.masked_fill(
+                    positions.eq(0).unsqueeze(-1), 0
+                )
+
             if hidden_states.shape[0] > 0:
                 previous_hidden_states = forward_batch.spec_info.hidden_states
                 if self.rot_weight is not None:

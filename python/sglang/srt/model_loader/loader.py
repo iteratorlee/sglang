@@ -730,6 +730,13 @@ class DefaultModelLoader(BaseModelLoader):
         model: nn.Module,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
 
+        local_iterator = getattr(model, "get_local_weight_iterator", None)
+        if local_iterator is not None:
+            selected_weights = local_iterator(model_config.model_path)
+            if selected_weights is not None:
+                yield from selected_weights
+                return
+
         primary_weights = DefaultModelLoader.Source.init_new(model_config, model)
         yield from self._get_weights_iterator(primary_weights)
 
@@ -1059,6 +1066,9 @@ class DefaultModelLoader(BaseModelLoader):
                 # parameters onto device for processing and back off after.
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
+
+        if validator := getattr(model, "validate_weights_after_loading", None):
+            validator()
 
 
 class LayeredModelLoader(DefaultModelLoader):

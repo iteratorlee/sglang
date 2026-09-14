@@ -257,7 +257,11 @@ def _attn_tp_local_shard_bounds(
     if not sharded:
         return num_tokens_per_dp, 0
     parallel = get_parallel()
-    tokens_per_rank = num_tokens_per_dp // parallel.attn_tp_size
+    # Aligned batches are unchanged. Ascend GLM small graphs ceil-pad only
+    # the MoE slice, so trailing ranks may receive no real tokens.
+    tokens_per_rank = (
+        num_tokens_per_dp + parallel.attn_tp_size - 1
+    ) // parallel.attn_tp_size
     return tokens_per_rank, tokens_per_rank * parallel.attn_tp_rank
 
 
@@ -273,7 +277,7 @@ def compute_local_num_token_non_padded(
     The "global" scope is within the current DP rank; DP is handled via num_tokens_per_dp.
 
     ``num_tokens_per_dp`` is the padded bucket width for the DP group, so each rank
-    owns a contiguous ``chunk = num_tokens_per_dp // attn_tp_size`` slice: the local
+    owns a contiguous ``chunk = ceil(num_tokens_per_dp / attn_tp_size)`` slice: the local
     count is ``clamp(global - chunk * attn_tp_rank, 0, chunk)``. The padded bucket
     (not ``ceil(real / attn_tp_size)``) sets the chunk, so a trailing rank can own
     zero real tokens. ``sharded`` False returns the global count unchanged
@@ -1489,9 +1493,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 # branch handles decode rows padded to a 1-token extend.
                 if hybrid_ssm or self.seq_lens.shape[0] == 0:
                     dev = self.seq_lens.device
-                    assert self.seq_lens.shape[0] == 0, (
-                        "extend-idle conversion expects an empty rank"
-                    )
+                    assert (
+                        self.seq_lens.shape[0] == 0
+                    ), "extend-idle conversion expects an empty rank"
                     self.extend_num_tokens = num_tokens
                     self.extend_seq_lens = torch.tensor(
                         [num_tokens], dtype=torch.int32, device=dev

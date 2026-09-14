@@ -18,6 +18,7 @@ from __future__ import annotations
 import bisect
 import gc
 import logging
+import math
 from abc import abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, List, Sequence, Tuple
@@ -26,6 +27,7 @@ from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
+    get_parallel,
 )
 from sglang.srt.utils import (
     get_cuda_graph_batch_size_alignment,
@@ -73,7 +75,31 @@ def get_batch_sizes_to_capture(
     capture_bs = list(get_exec().graph.cuda_graph_config.decode.bs)
     num_max_requests = model_runner.req_to_token_pool.size
 
+    if (
+        str(model_runner.device).startswith("npu")
+        and getattr(model_runner.model, "requires_aligned_npu_mtp_graph", False)
+        and not get_parallel().enable_dp_attention
+        and not get_exec().overlap.enable_two_batch_overlap
+    ):
+        # The ordinary-residual MTP block needs whole TP token shards.
+        # Capture every legal request size, independently of the target's
+        # unaligned mHC batches; replay chooses the smallest fitting bucket.
+        tp = get_parallel().attn_tp_size
+        unit = tp // math.gcd(tp, captured_req_width)
+        limit = (num_max_requests + unit - 1) // unit * unit
+        return list(range(unit, limit + 1, unit)), []
+
     mul_base = get_cuda_graph_batch_size_alignment()
+    if (
+        str(model_runner.device).startswith("npu")
+        and getattr(model_runner.model, "supports_unaligned_npu_graph", False)
+        and not get_parallel().enable_dp_attention
+        and get_parallel().attn_cp_size == 1
+        and not get_exec().overlap.enable_two_batch_overlap
+    ):
+        # GLM's Ascend mHC communicator pads only the expert token slice;
+        # attention and recurrent-state rows retain their actual graph size.
+        mul_base = 1
     # TBO splits each request's rows across two micro-batches, so the
     # alignment constraint applies per request rather than per token row.
     alignment_width = captured_req_width
