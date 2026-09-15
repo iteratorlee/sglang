@@ -4,6 +4,8 @@ Retains the verified fallback for vendor dynamic-receive-size failures. This
 path is explicitly enabled for GLM W8A8 layers; decode still uses DeepEP LL.
 """
 
+import os
+
 import torch
 import torch.distributed as dist
 
@@ -51,6 +53,17 @@ def collective_combine(group, y, state):
     out = torch.zeros((world * tokens, width), device=y.device, dtype=torch.float32)
     if received:
         out.index_add_(0, rows, y[:received].float() * weights[:, None])
+    if (
+        os.getenv("SGLANG_GLM53_NORMAL_REDUCE_SCATTER", "0") == "1"
+        and world > 1
+        and tokens > 0
+    ):
+        # all_gather packed contiguous token blocks in group-rank order. Each
+        # rank only needs its block of the FP32 sum. Local accumulation is
+        # unchanged; HCCL may use a different reduction tree and rounding order.
+        local_out = torch.empty((tokens, width), device=y.device, dtype=torch.float32)
+        dist.reduce_scatter_tensor(local_out, out, op=dist.ReduceOp.SUM, group=group)
+        return local_out.to(y.dtype)
     dist.all_reduce(out, group=group)
     rank = dist.get_rank(group)
     return out.narrow(0, rank * tokens, tokens).to(y.dtype)
