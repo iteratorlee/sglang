@@ -6,6 +6,8 @@ Only the state update remains serial. The caller preserves the original path
 for decode, speculative state snapshots and other shapes.
 """
 
+import os
+
 import triton
 import triton.language as tl
 
@@ -152,7 +154,10 @@ def run_prepared_prefill(
         num_stages=3,
         multibuffer=False,
     )
-    _prepared_recurrent[(2, 1, 4)](
+    # BV32 exposes16 independent value/head programs instead of8. Keep the
+    # original arithmetic and FP32 state; smaller tiles failed packed oracles.
+    value_tile = 32 if os.getenv("SGLANG_GLM53_KDA_PREFILL_BV32", "0") == "1" else 64
+    _prepared_recurrent[(128 // value_tile, 1, 4)](
         normalized_q,
         normalized_k,
         v,
@@ -167,7 +172,7 @@ def run_prepared_prefill(
         track_indices is not None,
         4,
         128,
-        64,
+        value_tile,
         *state.stride(),
         num_warps=1,
         num_stages=3,
