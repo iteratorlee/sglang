@@ -85,8 +85,33 @@ def enabled(q, forward_batch):
         and not args.enable_two_batch_overlap
         and args.disable_overlap_schedule
         and args.quantization == "modelslim"
-        and args.disable_radix_cache
-        and args.disaggregation_mode == "null"
+        and (
+            (args.disable_radix_cache and args.disaggregation_mode == "null")
+            or _pd_prefill_enabled(args, forward_batch)
+        )
+    )
+
+
+def _pd_prefill_enabled(args, forward_batch):
+    """Explicit PD-P experiment; the existing null-mode policy is unchanged.
+
+    Absolute sequence ends preserve the original scorer's causal tiles even
+    after a prefix hit. Prefix-enabled experiments additionally require the
+    existing per-rank/layer/shape oracle; cache restoration itself is outside
+    this row-partition optimization's correctness contract.
+    """
+    return (
+        args.disaggregation_mode == "prefill"
+        and os.getenv("SGLANG_GLM53_PD_PREFILL_INDEX_TP", "0") == "1"
+        and args.dp_size == args.moe_dp_size == args.dwdp_size == 1
+        and args.attn_cp_size == 1
+        and not args.enable_prefill_cp
+        and forward_batch.forward_mode.is_extend_without_speculative()
+        and not forward_batch.forward_mode.is_mixed()
+        and (
+            args.disable_radix_cache
+            or bool(os.getenv("SGLANG_GLM53_PREFILL_INDEX_VERIFY_DIR"))
+        )
     )
 
 
