@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 
 from sglang.srt.runtime_context import get_exec
 
@@ -197,6 +198,30 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
     return backend
 
 
+def _glm53_npu_prefix_page_size(
+    model_config, device, physical_page_size, tree_page_size, enabled
+):
+    """Share the complete token span owned by one native KPool index page.
+
+    The NPU indexer stores 64 pooled rows on the first ordinary KV page of
+    each group of ``index_kpool`` token pages. Sharing only that first page
+    can otherwise reuse index rows belonging to a different suffix.
+    """
+    if not enabled or str(device).split(":", 1)[0] != "npu":
+        return tree_page_size
+    config = glm5_next_config(model_config)
+    if config is None:
+        return tree_page_size
+    kpool = getattr(config, "index_kpool", 1)
+    if type(kpool) is not int or kpool < 1:
+        raise ValueError("GLM NPU prefix cache requires a positive index_kpool")
+    if kpool == 1:
+        return tree_page_size
+    if physical_page_size != 64:
+        raise ValueError("GLM NPU KPool index-page mapping requires physical page64")
+    return math.lcm(tree_page_size, physical_page_size * kpool)
+
+
 def build_kv_cache(
     *,
     server_args: ServerArgs,
@@ -290,18 +315,40 @@ def build_kv_cache(
     if model_config.is_multimodal and uses_transformers_backend:
         effective_chunked_prefill_size = None
 
+    tree_page_size = (
+        page_size
+        if not get_parallel().dcp_enabled
+        else token_to_kv_pool_allocator.page_size
+    )
+    # This bounded native path uses the default device-resident FULL/MAMBA
+    # tree. Keep the physical allocator and every decode graph on page64.
+    glm53_prefix_page_size = _glm53_npu_prefix_page_size(
+        model_config,
+        req_to_token_pool.device,
+        token_to_kv_pool_allocator.page_size,
+        tree_page_size,
+        enabled=(
+            not disable_radix_cache
+            and is_hybrid_ssm
+            and get_disagg().disaggregation_mode == "prefill"
+            and get_exec().mamba.enable_mamba_extra_buffer
+            and not get_exec().mamba.enable_mamba_extra_buffer_lazy
+            and not enable_hierarchical_cache
+            and not get_memory().enable_session_radix_cache
+            and get_memory().radix_cache_backend is None
+            and not get_parallel().dcp_enabled
+            and get_parallel().attn_cp_size == 1
+            and get_parallel().dp_size == get_parallel().pp_size == 1
+        ),
+    )
+
     params = CacheInitParams(
         disable=disable_radix_cache,
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-        # When dcp enabled, kv_pool_allocator.page_size is page_size * dcp_size.
-        # TreeCache.page_size should keep the same as allocator.page_size to
-        # avoid kv page eviction conflicts.
-        page_size=(
-            page_size
-            if not get_parallel().dcp_enabled
-            else token_to_kv_pool_allocator.page_size
-        ),
+        # Normally this equals the physical (or DCP-widened) allocator page.
+        # GLM KPool sharing requires whole groups of those physical pages.
+        page_size=glm53_prefix_page_size,
         is_eagle=spec_algorithm.is_eagle(),
         tp_cache_group=(
             attn_tp_cpu_group if get_parallel().enable_dp_attention else tp_cpu_group
@@ -343,6 +390,18 @@ def build_kv_cache(
             tp_group=tp_group,
         )
     )
+
+    if glm53_prefix_page_size != tree_page_size:
+        if not isinstance(tree_cache, UnifiedRadixCache):
+            raise ValueError("GLM NPU KPool page sharing requires UnifiedRadixCache")
+        # ScheduleBatch must also donate checkpoints at this absolute grid,
+        # including continuations starting on a smaller physical page.
+        tree_cache.glm53_kpool_share_page_size = glm53_prefix_page_size
+        logger.info(
+            "GLM53 NPU prefix cache share page: %s tokens; physical KV page: %s",
+            glm53_prefix_page_size,
+            token_to_kv_pool_allocator.page_size,
+        )
 
     if (
         enable_hierarchical_cache or retraction_backup == "host_pool"

@@ -2885,6 +2885,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 len(req.prefix_indices)
                 + (req.extend_range.length // checkpoint_grid) * checkpoint_grid
             )
+            if (
+                getattr(self.tree_cache, "glm53_kpool_share_page_size", None)
+                == checkpoint_grid
+            ):
+                # Admission still uses physical page64. After a partially
+                # filled chunk, the continuation may start off the coarser
+                # index-sharing grid; donate an absolute tree boundary.
+                mamba_track_seqlen_aligned = (
+                    (len(req.prefix_indices) + req.extend_range.length)
+                    // checkpoint_grid
+                    * checkpoint_grid
+                )
 
             # A coarser checkpoint grid may not be a model-state boundary, so
             # force retrieval from the intermediate h state in that case.
@@ -2913,7 +2925,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 in (getattr(self.model_config.hf_config, "architectures", None) or ())
                 and get_parallel().dp_size == get_parallel().pp_size == 1
                 and get_parallel().attn_cp_size == get_parallel().dcp_size == 1
-                and checkpoint_grid == cache_chunk_size == state_chunk_size == 64
+                and cache_chunk_size == state_chunk_size == 64
+                and checkpoint_grid
+                in (64, getattr(self.tree_cache, "glm53_kpool_share_page_size", None))
                 and self.tree_cache.page_size == checkpoint_grid
                 and not req.output_ids
                 and req.extend_range.end == len(req.origin_input_ids)

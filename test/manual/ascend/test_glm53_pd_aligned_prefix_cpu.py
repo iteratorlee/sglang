@@ -500,16 +500,33 @@ class AlignedPrefixTests(unittest.TestCase):
         current = node(SCHEDULE, "_mamba_radix_cache_v2_req_prepare_for_extend")
         baseline = node(SCHEDULE, "_mamba_radix_cache_v2_req_prepare_for_extend", True)
         found = []
+        absolute_found = []
+        expected_absolute = ast.parse(
+            '''if getattr(self.tree_cache, "glm53_kpool_share_page_size", None) == checkpoint_grid:
+    mamba_track_seqlen_aligned = (
+        (len(req.prefix_indices) + req.extend_range.length)
+        // checkpoint_grid * checkpoint_grid
+    )
+'''
+        ).body[0]
+        case = self
 
         class RemoveOptIn(ast.NodeTransformer):
             def visit_If(self, n):
                 if FLAG in ast.unparse(n.test):
                     found.append(n)
                     return None
+                if "glm53_kpool_share_page_size" in ast.unparse(n.test):
+                    # Only this exact isolated assignment is allowed. A broader
+                    # guard, else clause, or extra side effect must fail scope.
+                    case.assertEqual(ast.dump(n), ast.dump(expected_absolute))
+                    absolute_found.append(n)
+                    return None
                 return self.generic_visit(n)
 
         stripped = RemoveOptIn().visit(copy.deepcopy(current))
         self.assertEqual(len(found), 1)
+        self.assertEqual(len(absolute_found), 1)
         self.assertEqual(ast.dump(stripped), ast.dump(baseline))
         before = ast.parse(text(SCHEDULE, True))
         after = ast.parse(text(SCHEDULE))
