@@ -111,6 +111,52 @@ def _prepared_recurrent(
         tl.store(pstate, state)
 
 
+def _bv16_b1_layout_ok(q, k, v, a, b, output, state, indices, starts,
+                       track_indices, track_lens):
+    """Conservative metadata-only guard for the measured B1 prepared path.
+
+    The production dispatcher rejects packed batches before entering this
+    wrapper. Keep that fallback: no grid-Y expansion and no device-value reads.
+    Slot validity/disjointness and relative tracking lengths remain the existing
+    caller-owned contract. Unsupported layouts keep the prior BV32/BV64 policy.
+    """
+    import torch
+
+    if (
+        q.ndim != 4
+        or q.shape[0] != 1
+        or q.shape[2:] != (4, 128)
+        or not 128 <= q.shape[1] <= 16384
+        or q.device.type != "npu"
+        or any(t.shape != q.shape for t in (k, v, a, output))
+        or b.shape != q.shape[:-1]
+        or any(t.dtype != torch.bfloat16 or t.device != q.device
+               or not t.is_contiguous() for t in (q, k, v, a, b, output))
+        or state.ndim != 4
+        or state.shape[1:] != (4, 128, 128)
+        or state.dtype != torch.float32
+        or state.device != q.device
+        or state.stride() not in ((65536, 16384, 128, 1),
+                                  (65536, 16384, 1, 128))
+        or indices.ndim != 1
+        or indices.numel() != 1
+        or starts.ndim != 1
+        or starts.numel() != 2
+        or indices.dtype not in (torch.int32, torch.int64)
+        or starts.dtype != torch.int32
+        or any(t.device != q.device or not t.is_contiguous()
+               for t in (indices, starts))
+        or (track_indices is None) != (track_lens is None)
+    ):
+        return False
+    if track_indices is not None:
+        if any(t.ndim != 1 or t.numel() != 1 or t.device != q.device
+               or t.dtype not in (torch.int32, torch.int64)
+               or not t.is_contiguous() for t in (track_indices, track_lens)):
+            return False
+    return True
+
+
 def run_prepared_prefill(
     *,
     q,
@@ -157,6 +203,12 @@ def run_prepared_prefill(
     # BV32 exposes16 independent value/head programs instead of8. Keep the
     # original arithmetic and FP32 state; smaller tiles failed packed oracles.
     value_tile = 32 if os.getenv("SGLANG_GLM53_KDA_PREFILL_BV32", "0") == "1" else 64
+    if (
+        os.getenv("SGLANG_GLM53_KDA_PREFILL_BV16", "0") == "1"
+        and _bv16_b1_layout_ok(q, k, v, a, b, output, state, indices, starts,
+                              track_indices, track_lens)
+    ):
+        value_tile = 16
     _prepared_recurrent[(128 // value_tile, 1, 4)](
         normalized_q,
         normalized_k,
