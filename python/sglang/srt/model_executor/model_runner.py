@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -921,6 +922,18 @@ class ModelRunner:
             register_state = getattr(self.model, "register_kv_pool_state", None)
             if register_state is not None:
                 register_state(self.token_to_kv_pool, self.req_to_token_pool)
+
+        if (
+            _is_npu
+            and not self.is_draft_worker
+            and get_disagg().disaggregation_mode == "decode"
+            and os.getenv("SGLANG_GLM53_PD_WARM_ALLOCATOR", "0") == "1"
+        ):
+            from sglang.srt.hardware_backend.npu.attention.glm53.pd_allocator_warmup import (
+                maybe_warm_pd_allocators,
+            )
+
+            maybe_warm_pd_allocators(self)
 
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup
