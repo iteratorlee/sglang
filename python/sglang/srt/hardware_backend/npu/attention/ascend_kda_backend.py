@@ -165,6 +165,8 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         *,
         intermediate=None,
         prefill=False,
+        track_indices=None,
+        track_lens=None,
     ):
         from sglang.srt.hardware_backend.npu.attention.glm53.kda_recurrent_npu import (
             glm_kda_varlen_recurrent_npu,
@@ -185,6 +187,8 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             cu_seqlens=starts,
             lower_bound=layer.lower_bound,
             prefill=prefill,
+            track_state_indices=track_indices,
+            track_state_lens=track_lens,
             intermediate_state=(
                 intermediate.transpose(-1, -2) if intermediate is not None else None
             ),
@@ -352,10 +356,19 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
         if self.glm_bounded_recurrence:
+            track_indices = track_lens = None
             if self.forward_metadata.has_mamba_track_mask:
-                raise NotImplementedError(
-                    "GLM bounded KDA currently requires --disable-radix-cache"
+                track_lens = forward_batch.mamba_track_aligned_lens()
+                if track_lens is None:
+                    raise RuntimeError("GLM KDA checkpoint boundary is unavailable")
+                track_indices = torch.where(
+                    forward_batch.mamba_track_mask,
+                    forward_batch.mamba_track_indices,
+                    0,
                 )
+            # Write directly into the native tracking slots at the same token
+            # boundary as conv tracking above. The final request state can lie
+            # beyond that boundary, so copying it after prefill is incorrect.
             return self._glm_recurrent(
                 layer,
                 q,
@@ -367,6 +380,8 @@ class AscendKDAAttnBackend(KDAAttnBackend):
                 cache_indices,
                 query_start_loc,
                 prefill=True,
+                track_indices=track_indices,
+                track_lens=track_lens,
             )
         g, beta, extend_A_log, extend_dt_bias = self._prepare_extend_gate_inputs(
             layer, a, b

@@ -26,6 +26,8 @@ def _glm_kda_varlen_recurrent_kernel(
     scale,
     lower_bound,
     intermediate,
+    track_indices,
+    track_lens,
     S0: tl.constexpr,
     S1: tl.constexpr,
     SK: tl.constexpr,
@@ -37,6 +39,7 @@ def _glm_kda_varlen_recurrent_kernel(
     MV: tl.constexpr,
     STEPS: tl.constexpr,
     SAVE_INTERMEDIATE: tl.constexpr,
+    TRACK_STATE: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -82,6 +85,19 @@ def _glm_kda_varlen_recurrent_kernel(
         if state_index > 0:
             b_h = tl.load(p_h0, mask=mask_h, other=0.0).to(tl.float32)
 
+        if TRACK_STATE:
+            track_index = tl.load(track_indices + i_n)
+            track_len = tl.load(track_lens + i_n)
+            p_track = (
+                h0_source
+                + track_index * S0
+                + i_hv * S1
+                + o_k[None, :] * SK
+                + o_v[:, None] * SV
+            )
+            if track_index > 0 and track_len == 0:
+                tl.store(p_track, b_h, mask=mask_h)
+
         for i in range(seq_len):
             b_q = tl.load(p_q + i * H * K, mask=mask_k, other=0.0).to(tl.float32)
             b_k = tl.load(p_k + i * H * K, mask=mask_k, other=0.0).to(tl.float32)
@@ -102,6 +118,9 @@ def _glm_kda_varlen_recurrent_kernel(
             b_v -= tl.sum(b_h * b_k[None, :], axis=1)
             b_v *= b_beta
             b_h += b_k[None, :] * b_v[:, None]
+            if TRACK_STATE:
+                if track_index > 0 and i + 1 == track_len:
+                    tl.store(p_track, b_h, mask=mask_h)
             if SAVE_INTERMEDIATE:
                 p_mid = (
                     intermediate
@@ -143,8 +162,19 @@ def glm_kda_varlen_recurrent_npu(
     scale: Optional[float] = None,
     intermediate_state: Optional[torch.Tensor] = None,
     prefill: bool = False,
+    track_state_indices: Optional[torch.Tensor] = None,
+    track_state_lens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Run a packed varlen KDA prefill and update each request state once."""
+    """Run packed varlen KDA and optionally checkpoint a prefill boundary.
+
+    Tracking lengths count consumed tokens relative to each sequence's extend
+    start. Destination zero disables that row (its length may be garbage).
+    The scheduler owns allocation: active destinations must be valid, distinct
+    slots, disjoint from every live source slot, and lengths must be in [0, T].
+    This contract avoids reading device metadata back to the host on each layer.
+    Checkpoints stay FP32 in the original strided state pool; the final source
+    state is still updated independently. Tracking is compiled out for decode.
+    """
 
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4 or a.ndim != 4:
         raise ValueError("GLM KDA varlen tensors must have shape [1,T,H,D]")
@@ -169,6 +199,30 @@ def glm_kda_varlen_recurrent_npu(
         raise ValueError("GLM KDA needs one state index per varlen sequence")
     if lower_bound is None or lower_bound >= 0:
         raise ValueError("GLM KDA requires a negative lower_bound")
+
+    if (track_state_indices is None) != (track_state_lens is None):
+        raise ValueError("GLM KDA prefix tracking needs both slots and lengths")
+    if track_state_indices is not None:
+        if not prefill or intermediate_state is not None:
+            raise ValueError("GLM KDA prefix checkpoints are prefill-only")
+        if (
+            initial_state_source.ndim != 4
+            or initial_state_source.shape[1:]
+            != (num_value_heads, key_dim, value_dim)
+            or initial_state_source.dtype != torch.float32
+            or initial_state_source.device != q.device
+            or initial_state_indices.device != q.device
+        ):
+            raise ValueError("GLM KDA prefix checkpoints need the native FP32 state pool")
+        for t in (track_state_indices, track_state_lens):
+            if (
+                t.ndim != 1
+                or t.numel() != initial_state_indices.numel()
+                or t.dtype not in (torch.int32, torch.int64)
+                or t.device != initial_state_indices.device
+                or not t.is_contiguous()
+            ):
+                raise ValueError("Invalid GLM KDA prefix checkpoint metadata")
 
     block_k = triton.next_power_of_2(key_dim)
     block_v = min(triton.next_power_of_2(value_dim), 64)
@@ -220,6 +274,8 @@ def glm_kda_varlen_recurrent_npu(
             output=output,
             scale=scale,
             lower_bound=lower_bound,
+            track_indices=track_state_indices,
+            track_lens=track_state_lens,
         )
     grid = (
         block_value_count,
@@ -245,6 +301,12 @@ def glm_kda_varlen_recurrent_npu(
             if intermediate_state is not None
             else initial_state_source
         ),
+        track_indices=(
+            track_state_indices
+            if track_state_indices is not None
+            else initial_state_indices
+        ),
+        track_lens=(track_state_lens if track_state_lens is not None else cu_seqlens),
         S0=initial_state_source.stride(0),
         S1=initial_state_source.stride(1),
         SK=initial_state_source.stride(2),
@@ -256,6 +318,7 @@ def glm_kda_varlen_recurrent_npu(
         MV=intermediate_state.stride(4) if intermediate_state is not None else 0,
         STEPS=intermediate_state.shape[1] if intermediate_state is not None else 0,
         SAVE_INTERMEDIATE=intermediate_state is not None,
+        TRACK_STATE=track_state_indices is not None,
         H=num_q_heads,
         HV=num_value_heads,
         K=key_dim,

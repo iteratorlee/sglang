@@ -60,6 +60,9 @@ def _prepared_recurrent(
     STATE,
     INDICES,
     STARTS,
+    TRACK_INDICES,
+    TRACK_LENS,
+    TRACK_STATE: tl.constexpr,
     H: tl.constexpr,
     D: tl.constexpr,
     BV: tl.constexpr,
@@ -78,6 +81,14 @@ def _prepared_recurrent(
     state = tl.zeros((BV, D), tl.float32)
     if slot > 0:
         state = tl.load(pstate).to(tl.float32)
+    if TRACK_STATE:
+        track_slot = tl.load(TRACK_INDICES + req)
+        track_len = tl.load(TRACK_LENS + req)
+        ptrack = (
+            STATE + track_slot * S0 + head * S1 + ks[None, :] * SK + vs[:, None] * SV
+        )
+        if track_slot > 0 and track_len == 0:
+            tl.store(ptrack, state)
     for i in range(eos - bos):
         row = (bos + i) * H + head
         q = tl.load(QN + row * D + ks)
@@ -89,6 +100,9 @@ def _prepared_recurrent(
         v -= tl.sum(state * k[None, :], axis=1)
         v *= beta
         state += k[None, :] * v[:, None]
+        if TRACK_STATE:
+            if track_slot > 0 and i + 1 == track_len:
+                tl.store(ptrack, state)
         out = tl.sum(state * q[None, :], axis=1)
         tl.store(OUT + row * D + vs, out.to(OUT.dtype.element_ty))
     if slot > 0:
@@ -96,7 +110,22 @@ def _prepared_recurrent(
 
 
 def run_prepared_prefill(
-    *, q, k, v, a, b, A_log, dt_bias, state, indices, starts, output, scale, lower_bound
+    *,
+    q,
+    k,
+    v,
+    a,
+    b,
+    A_log,
+    dt_bias,
+    state,
+    indices,
+    starts,
+    output,
+    scale,
+    lower_bound,
+    track_indices=None,
+    track_lens=None,
 ):
     import torch
 
@@ -133,6 +162,9 @@ def run_prepared_prefill(
         state,
         indices,
         starts,
+        track_indices if track_indices is not None else indices,
+        track_lens if track_lens is not None else starts,
+        track_indices is not None,
         4,
         128,
         64,
