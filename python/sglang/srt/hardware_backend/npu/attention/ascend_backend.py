@@ -860,14 +860,18 @@ class AscendAttnBackend(AttentionBackend):
             "this indicates a mismatch between indexer output and q layout."
         )
 
-        pad_size = num_tokens - current_tokens
-        padding = torch.full(
-            (pad_size, topk_indices.shape[1]),
+        # GLM KPool returns [tokens, 1, topk] while other indexers return
+        # [tokens, topk]. Preserve all trailing dimensions when TP padding
+        # the token axis. One final allocation also avoids a padding buffer
+        # followed by a second concatenation output.
+        padded = torch.full(
+            (num_tokens, *topk_indices.shape[1:]),
             -1,
             dtype=topk_indices.dtype,
             device=topk_indices.device,
         )
-        return torch.cat([topk_indices, padding], dim=0)
+        padded[:current_tokens].copy_(topk_indices)
+        return padded
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 0
