@@ -923,18 +923,6 @@ class ModelRunner:
             if register_state is not None:
                 register_state(self.token_to_kv_pool, self.req_to_token_pool)
 
-        if (
-            _is_npu
-            and not self.is_draft_worker
-            and get_disagg().disaggregation_mode == "decode"
-            and os.getenv("SGLANG_GLM53_PD_WARM_ALLOCATOR", "0") == "1"
-        ):
-            from sglang.srt.hardware_backend.npu.attention.glm53.pd_allocator_warmup import (
-                maybe_warm_pd_allocators,
-            )
-
-            maybe_warm_pd_allocators(self)
-
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup
         # forwards captured into the graph see the patched pool methods.
@@ -1102,6 +1090,21 @@ class ModelRunner:
         return self.sampling_prewarm_result
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
+        # The scheduler has initialized all target/draft attention backends.
+        # Keep their import-time Triton setup ahead of our first allocator JIT,
+        # while still warming on private scratch before any graph capture.
+        if (
+            _is_npu
+            and not self.is_draft_worker
+            and get_disagg().disaggregation_mode == "decode"
+            and os.getenv("SGLANG_GLM53_PD_WARM_ALLOCATOR", "0") == "1"
+        ):
+            from sglang.srt.hardware_backend.npu.attention.glm53.pd_allocator_warmup import (
+                maybe_warm_pd_allocators,
+            )
+
+            maybe_warm_pd_allocators(self)
+
         # from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
         # if get_moe_runner_backend().is_flashinfer_megamoe():

@@ -201,6 +201,23 @@ class WarmupContracts(unittest.TestCase):
 
         self.assertEqual(ast.dump(RemoveHook().visit(current)), ast.dump(baseline))
 
+    def test_warmup_runs_after_all_backend_imports_before_graph_capture(self):
+        runner = ast.parse((REPO / "python/sglang/srt/model_executor/model_runner.py").read_text())
+        cls = next(n for n in runner.body if isinstance(n, ast.ClassDef) and n.name == "ModelRunner")
+        methods = {n.name: n for n in cls.body if isinstance(n, ast.FunctionDef)}
+        self.assertNotIn(warm.FLAG, ast.unparse(methods["_init_post_memory_pool_components"]))
+        graph = methods["init_cuda_graphs"]
+        self.assertIsInstance(graph.body[0], ast.If)
+        self.assertIn(warm.FLAG, ast.unparse(graph.body[0].test))
+        self.assertIn("maybe_warm_pd_allocators(self)", ast.unparse(graph.body[0]))
+        self.assertIn("capture_cuda_graphs", ast.unparse(graph.body[1]))
+        scheduler = ast.parse((REPO / "python/sglang/srt/managers/scheduler.py").read_text())
+        cls = next(n for n in scheduler.body if isinstance(n, ast.ClassDef) and n.name == "Scheduler")
+        method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "init_model_worker")
+        calls = [ast.unparse(n.value.func) for n in method.body if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)]
+        self.assertLess(calls.index("self.init_memory_pools"), calls.index("self.init_all_attention_backends"))
+        self.assertLess(calls.index("self.init_all_attention_backends"), calls.index("self.init_all_cuda_graphs"))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
