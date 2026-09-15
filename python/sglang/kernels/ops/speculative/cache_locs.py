@@ -452,10 +452,13 @@ def assign_extend_cache_locs_uniform_func(
     draft_token_num tokens, e.g. spec target-verify prep). Computes end
     offsets inside the kernel, removing the eager `seq_lens + draft_token_num`
     add from the host critical path."""
-    if _is_cuda or _is_hip or _is_musa or _is_xpu:
+    if _is_cuda or _is_hip or _is_musa or _is_xpu or _is_npu:
+        # The NPU extension's cache_loc_update uses a fixed MAX_STEP DMA
+        # span, even when the caller allocates fewer draft slots. Reuse the
+        # bounded uniform gather so MTP reads/writes exactly its live width.
         out_cache_loc = torch.empty(
             (batch_size * draft_token_num,),
-            dtype=torch.int64,
+            dtype=torch.int32 if _is_npu else torch.int64,
             device=device,
         )
         assign_extend_cache_locs_uniform[(batch_size,)](
@@ -468,7 +471,7 @@ def assign_extend_cache_locs_uniform_func(
         )
         return out_cache_loc
 
-    # NPU / CPU platforms: fall back to the end_offset-tensor path.
+    # CPU platforms: fall back to the end_offset-tensor path.
     return assign_extend_cache_locs_func(
         req_pool_indices=req_pool_indices,
         req_to_token=req_to_token,
