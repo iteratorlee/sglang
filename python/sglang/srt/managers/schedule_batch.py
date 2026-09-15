@@ -54,6 +54,7 @@ ScheduleBatch -> ForwardBatch
 import copy
 import dataclasses
 import logging
+import os
 import re
 import sys
 from array import array
@@ -2894,6 +2895,40 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned:
                 # We want to track mamba_track_seqlen_aligned, and it's not the last position,
                 # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
+                mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
+
+            # A repeated prompt must recompute its last input token. A state
+            # recorded exactly at an aligned prompt end cannot be reused by
+            # that match. Opt in only on the GLM NPU PD-prefill path below;
+            # leave intermediate chunks, short tails and all decode modes alone.
+            if (
+                os.environ.get("SGLANG_GLM53_PD_PREFILL_REUSABLE_CHECKPOINT") == "1"
+                and str(self.device).split(":", 1)[0] == "npu"
+                and get_disagg().disaggregation_mode == "prefill"
+                and self.forward_mode == ForwardMode.EXTEND
+                and not self.tree_cache.disable
+                and get_exec().mamba.enable_mamba_extra_buffer
+                and not get_exec().mamba.enable_mamba_extra_buffer_lazy
+                and "Glm5NextForConditionalGeneration"
+                in (getattr(self.model_config.hf_config, "architectures", None) or ())
+                and get_parallel().dp_size == get_parallel().pp_size == 1
+                and get_parallel().attn_cp_size == get_parallel().dcp_size == 1
+                and checkpoint_grid == cache_chunk_size == state_chunk_size == 64
+                and self.tree_cache.page_size == checkpoint_grid
+                and not req.output_ids
+                and req.extend_range.end == len(req.origin_input_ids)
+                and mamba_track_seqlen_aligned == req.extend_range.end
+                and req.extend_range.start == len(req.prefix_indices)
+                and req.extend_range.start % checkpoint_grid == 0
+                and req.extend_range.length >= 2 * checkpoint_grid
+                and req._compute_max_prefix_len(len(req.origin_input_ids))
+                >= mamba_track_seqlen_aligned - checkpoint_grid
+            ):
+                mamba_track_seqlen_aligned -= checkpoint_grid
+                # +1 is the existing intermediate-state sentinel: both KDA
+                # and conv floor it to the same relative boundary. The tree
+                # consumes the exact aligned length assigned below, while the
+                # live request state still advances to the full prompt end.
                 mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
 
             # In lazy mode, skip the swap — the second ping-pong slot is not
