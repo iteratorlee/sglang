@@ -1196,6 +1196,26 @@ class Glm5NextForConditionalGeneration(nn.Module):
             self.config.rope_scaling or {}
         )
 
+    def register_kv_pool_state(self, token_to_kv_pool, req_to_token_pool):
+        from sglang.srt.hardware_backend.npu.attention.glm53.pd_state import (
+            prepare_glm53_pd_mamba_state,
+            register_glm53_kpool_state,
+        )
+        from sglang.srt.runtime_context import (
+            get_disagg,
+            max_speculative_num_draft_tokens,
+        )
+
+        register_glm53_kpool_state(
+            self, token_to_kv_pool, req_to_token_pool, parallel=get_parallel()
+        )
+        prepare_glm53_pd_mamba_state(
+            token_to_kv_pool,
+            req_to_token_pool,
+            mode=get_disagg().disaggregation_mode,
+            draft_tokens=max_speculative_num_draft_tokens(),
+        )
+
     def get_input_embeddings(self) -> nn.Embedding:
         if self.model is None:
             raise AttributeError(

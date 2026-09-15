@@ -35,6 +35,7 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
     validate_weights_after_loading = (
         Glm5NextForConditionalGeneration.validate_weights_after_loading
     )
+    register_kv_pool_state = Glm5NextForConditionalGeneration.register_kv_pool_state
 
     @classmethod
     def get_hf_to_sglang_mapper(cls, config) -> WeightsMapper:

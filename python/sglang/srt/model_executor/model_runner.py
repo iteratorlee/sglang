@@ -174,6 +174,7 @@ from sglang.srt.runtime_context import (
     assert_published,
     get_context,
     get_device,
+    get_disagg,
     get_exec,
     get_global_dwdp_manager,
     get_lora,
@@ -913,6 +914,13 @@ class ModelRunner:
         """Post-pool component wiring, split out of alloc_memory_pool so forks
         that build bespoke memory pools can reuse it after allocating them."""
         self.init_kv_index_translator()
+
+        # Model-owned request state must have its final addresses before graph
+        # capture and before the PD manager registers transfer buffers.
+        if _is_npu and get_disagg().disaggregation_mode != "null":
+            register_state = getattr(self.model, "register_kv_pool_state", None)
+            if register_state is not None:
+                register_state(self.token_to_kv_pool, self.req_to_token_pool)
 
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup

@@ -1031,6 +1031,10 @@ def _draft_entry_layer_ids(*, pool, num_entries: int) -> List[int]:
 
     if isinstance(pool, HybridLinearKVPool):
         ids = pool.get_kv_layer_ids()
+    elif hasattr(pool, "get_kv_layer_ids"):
+        # NPU MLA exposes separate K/V/index groups, potentially with only a
+        # subset of indexed layers or with a packed FP8 K/V record.
+        ids = pool.get_kv_layer_ids()
     else:
         # Pools register k0..k(L-1) then v0..v(L-1), so ids repeat once per
         # group; derive the group count rather than assuming MHA vs MLA.
@@ -1145,7 +1149,7 @@ def append_state_component(
 def get_dsa_tail_state_indices(pool, req_pool_idx: int, seq_len: int) -> List[int]:
     if getattr(pool, "use_dsa", False):
         pool = pool.full_kv_pool
-    if not pool.kpool_use_compress:
+    if not getattr(pool, "kpool_use_compress", False):
         return []
 
     pool_size = int(pool.index_kpool)
@@ -1477,15 +1481,28 @@ def setup_state_kv_args(
             # full-attention sub-pool rather than in the Mamba state above.
             if getattr(token_to_kv_pool, "use_dsa", False):
                 dsa_pool = token_to_kv_pool.full_kv_pool
-                dsa_ptrs, dsa_lens, dsa_item_lens = dsa_pool.get_state_buf_infos()
-                append_state_component(
-                    kv_args,
-                    StateType.DSA,
-                    dsa_ptrs,
-                    dsa_lens,
-                    dsa_item_lens,
-                )
-                append_dsa_tail(dsa_pool)
+                if isinstance(dsa_pool, NPUMLATokenToKVPool):
+                    # Its paged index cache already travels in the main KV
+                    # list. Only module-owned request tails are auxiliary.
+                    from sglang.srt.hardware_backend.npu.attention.glm53.pd_state import (
+                        combined_kpool_tail_infos,
+                    )
+
+                    append_state_component(
+                        kv_args,
+                        StateType.DSA_TAIL,
+                        *combined_kpool_tail_infos(dsa_pool, draft_token_to_kv_pool),
+                    )
+                else:
+                    dsa_ptrs, dsa_lens, dsa_item_lens = dsa_pool.get_state_buf_infos()
+                    append_state_component(
+                        kv_args,
+                        StateType.DSA,
+                        dsa_ptrs,
+                        dsa_lens,
+                        dsa_item_lens,
+                    )
+                    append_dsa_tail(dsa_pool)
             if isinstance(token_to_kv_pool, QSATokenToKVPool):
                 qsa_ptrs, qsa_lens, qsa_item_lens = (
                     token_to_kv_pool.get_qsa_pending_state_buf_infos()

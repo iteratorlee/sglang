@@ -3999,6 +3999,17 @@ class HybridLinearKVPool(KVCache):
     def get_kv_layer_ids(self):
         """Global layer ids aligned with the full-attention KV buffers."""
         layer_ids = list(self.full_attention_layer_id_mapping)
+        if self.use_dsa and _is_npu:
+            # NPU MLA exports K, V and index groups (including any scales) in
+            # the main KV list. Its dense full-attention ids need global ids.
+            dense_to_global = {
+                dense: global_id
+                for global_id, dense in self.full_attention_layer_id_mapping.items()
+            }
+            return [
+                dense_to_global[layer_id]
+                for layer_id in self.full_kv_pool.get_kv_layer_ids()
+            ]
         return layer_ids if self.use_mla else layer_ids * 2
 
     def get_state_buf_infos(self):

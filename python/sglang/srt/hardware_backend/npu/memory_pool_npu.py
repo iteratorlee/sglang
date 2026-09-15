@@ -810,8 +810,19 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     def get_kv_layer_ids(self):
         return (
-            list(range(self.start_layer, self.start_layer + self.layer_num)) * 2
+            list(range(self.start_layer, self.start_layer + self.layer_num))
+            * (1 if self.dsa_kv_cache_store_fp8 else 2)
             + self.get_state_layer_ids()
+        )
+
+    def get_compress_tail_buf_infos(self):
+        # GLM KPool owns these tensors in its target/NextN indexer modules.
+        # They are bound once, after the actual PD request pool is allocated.
+        buffers = getattr(self, "_glm53_kpool_tail_buffers", ())
+        return (
+            [buf.data_ptr() for buf in buffers],
+            [buf.nbytes for buf in buffers],
+            [buf[0].nbytes for buf in buffers],
         )
 
     def get_state_layer_ids(self):
