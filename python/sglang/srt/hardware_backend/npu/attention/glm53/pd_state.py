@@ -96,20 +96,20 @@ def register_glm53_kpool_state(model, token_pool, req_pool, *, parallel):
         parallel.tp_size == parallel.moe_ep_size == parallel.attn_tp_size == 16
         and not parallel.enable_dp_attention
     )
-    dp16 = (
-        parallel.tp_size == parallel.moe_ep_size == parallel.dp_size == 16
+    dp_attention = (
+        parallel.tp_size == parallel.moe_ep_size == 16
         and parallel.enable_dp_attention
-        and parallel.attn_dp_size == 16
-        and parallel.attn_tp_size == 1
+        and parallel.dp_size == parallel.attn_dp_size
+        and (parallel.attn_dp_size, parallel.attn_tp_size) in ((16, 1), (8, 2))
     )
     if not (
-        (tp16 or dp16)
+        (tp16 or dp_attention)
         and parallel.pp_size == 1
         and parallel.attn_cp_size == 1
     ):
         raise ValueError(
-            "GLM53 NPU PD state requires TP16/EP16/PP1/CP1 or DP16/EP16 "
-            "with attention TP1"
+            "GLM53 NPU PD state requires EP16/PP1/CP1 with TP16, "
+            "attention DP16/TP1, or attention DP8/TP2"
         )
     pool = getattr(token_pool, "full_kv_pool", token_pool)
     if not isinstance(pool, NPUMLATokenToKVPool):

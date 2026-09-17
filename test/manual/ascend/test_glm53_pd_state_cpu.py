@@ -286,6 +286,8 @@ PARALLEL = types.SimpleNamespace(
     pp_size=1,
     attn_cp_size=1,
     enable_dp_attention=False,
+    dp_size=1,
+    attn_dp_size=1,
 )
 
 
@@ -352,6 +354,25 @@ class TestGlm53PDState(unittest.TestCase):
             self.assertFalse(i._kpool_tail_score.array[3:].any())
             self.assertIs(i._kpool_mtp_tail_k, scratch)
         self.assertEqual(pool.full_kv_pool.tail_extra_slots, 0)
+
+    def test_dp_attention_preserves_registered_request_state(self):
+        for dp, attn_tp in ((16, 1), (8, 2)):
+            with self.subTest(dp=dp, attn_tp=attn_tp):
+                parallel = types.SimpleNamespace(**(vars(PARALLEL) | dict(
+                    enable_dp_attention=True, dp_size=dp,
+                    attn_dp_size=dp, attn_tp_size=attn_tp,
+                )))
+                m, indexers = model([0])
+                pool, requests = NPUPool(1), req_pool(9)
+                keys = indexers[0]._kpool_tail_k.array.copy()
+                scores = indexers[0]._kpool_tail_score.array.copy()
+                pd_state.register_glm53_kpool_state(m, pool, requests, parallel=parallel)
+                np.testing.assert_array_equal(indexers[0]._kpool_tail_k.array[:3], keys)
+                np.testing.assert_array_equal(indexers[0]._kpool_tail_score.array[:3], scores)
+                self.assertEqual(indexers[0]._kpool_tail_k.shape, (9, 4, 128))
+                ptrs = pool.get_compress_tail_buf_infos()[0]
+                pd_state.register_glm53_kpool_state(m, pool, requests, parallel=parallel)
+                self.assertEqual(ptrs, pool.get_compress_tail_buf_infos()[0])
 
     def test_registration_idempotent_and_replacement_rejected(self):
         m, indexers = model([0], rows=10)
@@ -469,7 +490,7 @@ class TestGlm53PDState(unittest.TestCase):
         ):
             m, indexers = model([0])
             parallel = types.SimpleNamespace(**(vars(PARALLEL) | change))
-            with self.assertRaisesRegex(ValueError, "TP16/EP16/PP1"):
+            with self.assertRaisesRegex(ValueError, "EP16/PP1/CP1"):
                 pd_state.register_glm53_kpool_state(
                     m, NPUPool(1), req_pool(49), parallel=parallel
                 )
