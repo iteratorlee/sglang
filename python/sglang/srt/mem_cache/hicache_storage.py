@@ -386,6 +386,10 @@ class HiCacheFile(HiCacheStorage):
         )
         attn_cp_rank = storage_config.attn_cp_rank
         attn_cp_size = storage_config.attn_cp_size
+        # MLA KV is replicated, but recurrent states in hybrid MLA models
+        # are sharded over attention TP. Never let one rank's checkpoint
+        # satisfy another rank's lookup (including same-shaped shards).
+        self._mamba_tp_suffix = f"_tp{tp_rank}of{tp_size}" if is_mla_model else ""
         model_name = "-".join(model_name.split("/")) if model_name else ""
         enable_pp = pp_size > 1
         self.config_suffix = f"_{model_name}"
@@ -444,6 +448,8 @@ class HiCacheFile(HiCacheStorage):
         )
 
     def _get_suffixed_key(self, key: str) -> str:
+        if key.endswith(".mamba"):
+            key += self._mamba_tp_suffix
         return key + self.config_suffix
 
     def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
