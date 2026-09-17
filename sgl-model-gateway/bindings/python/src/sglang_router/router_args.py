@@ -44,6 +44,8 @@ class RouterArgs:
     # PD-specific configuration
     mini_lb: bool = False
     test_external_dp_routing: bool = False
+    mini_lb_prefix_affinity: bool = False
+    mini_lb_prefix_affinity_length: int = 256
     pd_disaggregation: bool = False  # Enable PD disaggregated mode
     prefill_urls: List[tuple] = dataclasses.field(
         default_factory=list
@@ -377,6 +379,17 @@ class RouterArgs:
             f"--{prefix}test-external-dp-routing",
             action="store_true",
             help="(MiniLB only) Randomly assign routed_dp_rank / disagg_prefill_dp_rank per request and verify the response dp_rank matches.",
+        )
+        pd_group.add_argument(
+            f"--{prefix}mini-lb-prefix-affinity",
+            action="store_true",
+            help="Opt in to deterministic per-role DP routing for single /generate requests in a one-prefill/one-decode MiniLB deployment. No load balancing across hot prefixes.",
+        )
+        pd_group.add_argument(
+            f"--{prefix}mini-lb-prefix-affinity-length",
+            type=int,
+            default=RouterArgs.mini_lb_prefix_affinity_length,
+            help="Hash this many leading token IDs, or Unicode characters for text, for MiniLB prefix affinity (default: 256). Shorter inputs hash their entire content.",
         )
         pd_group.add_argument(
             f"--{prefix}pd-disaggregation",
@@ -1019,6 +1032,21 @@ class RouterArgs:
         return cls(**args_dict)
 
     def _validate_router_args(self):
+        if self.mini_lb_prefix_affinity:
+            if not self.mini_lb or not self.pd_disaggregation:
+                raise ValueError(
+                    "--mini-lb-prefix-affinity requires --mini-lb --pd-disaggregation"
+                )
+            if self.mini_lb_prefix_affinity_length <= 0:
+                raise ValueError("--mini-lb-prefix-affinity-length must be positive")
+            if len(self.prefill_urls) != 1 or len(self.decode_urls) != 1:
+                raise ValueError(
+                    "MiniLB prefix affinity requires exactly one prefill URL and one decode URL"
+                )
+            if self.test_external_dp_routing:
+                raise ValueError(
+                    "MiniLB prefix affinity cannot be combined with --test-external-dp-routing"
+                )
         # Validate configuration based on mode
         if self.pd_disaggregation:
             # Warn about policy usage in PD mode

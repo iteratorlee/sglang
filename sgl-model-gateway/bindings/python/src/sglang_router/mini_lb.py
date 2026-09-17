@@ -3,13 +3,14 @@ Minimal HTTP load balancer for prefill and decode servers for testing.
 """
 
 import asyncio
+import hashlib
 import ipaddress
 import logging
 import random
 import urllib
 import warnings
 from http import HTTPStatus
-from itertools import chain
+from itertools import chain, count
 from typing import Optional
 
 import aiohttp
@@ -48,13 +49,28 @@ class MiniLoadBalancer:
         self.prefill_bootstrap_ports = [url[1] for url in router_args.prefill_urls]
         self.decode_urls = router_args.decode_urls
         self.test_external_dp_routing = router_args.test_external_dp_routing
+        self.prefix_affinity = router_args.mini_lb_prefix_affinity
+        self.affinity_prefix_length = router_args.mini_lb_prefix_affinity_length
         self.prefill_dp_size = None
         self.decode_dp_size = None
+        self._dp_size_lock = asyncio.Lock()
+        # A fresh random starting point avoids predictable reuse across restarts;
+        # the counter guarantees distinct rooms within this router process.
+        self._affinity_rooms = (
+            count(random.getrandbits(62)) if self.prefix_affinity else None
+        )
 
     def _validate_router_args(self, router_args: RouterArgs):
-        logger.warning(
-            "\x1b[33mMiniLB is only for debugging purposes, it only supports random policy!\033[0m"
-        )
+        if router_args.mini_lb_prefix_affinity:
+            router_args._validate_router_args()
+            logger.warning(
+                "[MiniLB] Prefix affinity enabled: deterministic DP ranks, "
+                "no cache occupancy or load feedback; hot prefixes can queue."
+            )
+        else:
+            logger.warning(
+                "\x1b[33mMiniLB is only for debugging purposes, it only supports random policy!\033[0m"
+            )
 
         # NOTE: too many arguments unsupported, just validate some important ones
         if router_args.policy != "random":
@@ -75,6 +91,9 @@ class MiniLoadBalancer:
         uvicorn.run(app, host=self.host, port=self.port)
 
     async def _ensure_dp_sizes(self):
+        if self.prefix_affinity:
+            await self._ensure_affinity_dp_sizes()
+            return
         if self.prefill_dp_size is not None:
             return
         async with aiohttp.ClientSession() as session:
@@ -87,6 +106,124 @@ class MiniLoadBalancer:
         logger.info(
             f"[MiniLB] DP sizes: prefill={self.prefill_dp_size}, decode={self.decode_dp_size}"
         )
+
+    @staticmethod
+    def _dp_size_from_info(info):
+        if not isinstance(info, dict):
+            raise ValueError("server_info must be an object")
+        states = info.get("internal_states")
+        size = info.get("dp_size")
+        if size is None and isinstance(states, list):
+            size = len(states)
+        if type(size) is not int or size <= 0:
+            raise ValueError("server_info has no positive DP size")
+        if states is not None and (not isinstance(states, list) or len(states) != size):
+            raise ValueError("server_info DP size and internal_states disagree")
+        return size
+
+    async def _ensure_affinity_dp_sizes(self):
+        async with self._dp_size_lock:
+            if self.prefill_dp_size is not None and self.decode_dp_size is not None:
+                return
+            sizes = []
+            try:
+                async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=min(self.timeout, 30))
+                ) as session:
+                    for url in (self.prefill_urls[0], self.decode_urls[0]):
+                        async with session.get(f"{url}/server_info") as response:
+                            response.raise_for_status()
+                            sizes.append(self._dp_size_from_info(await response.json()))
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                logger.warning("[MiniLB] Prefix affinity DP discovery failed: %s", exc)
+                raise HTTPException(
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    detail="Prefix affinity DP discovery failed; retry when both workers are ready",
+                ) from exc
+            # Publish both only after both workers have supplied valid metadata.
+            self.prefill_dp_size, self.decode_dp_size = sizes
+            logger.info(
+                "[MiniLB] Prefix affinity DP sizes: prefill=%d, decode=%d",
+                self.prefill_dp_size,
+                self.decode_dp_size,
+            )
+
+    def _affinity_digest(self, request):
+        if any(
+            request.get(key) is not None
+            for key in (
+                "routed_dp_rank",
+                "data_parallel_rank",
+                "disagg_prefill_dp_rank",
+            )
+        ):
+            raise HTTPException(
+                400, "Prefix affinity assigns ranks; omit client DP rank fields"
+            )
+        sampling = request.get("sampling_params")
+        if sampling is not None and (
+            not isinstance(sampling, dict)
+            or sampling.get("n", 1) != 1
+            or sampling.get("beam_width", 1) != 1
+        ):
+            raise HTTPException(
+                400, "Prefix affinity requires one sample (n=1, no beam search)"
+            )
+        for field in ("extra_key", "cache_salt"):
+            if request.get(field) is not None and not isinstance(request[field], str):
+                raise HTTPException(400, f"Prefix affinity requires scalar {field}")
+        ids, text = request.get("input_ids"), request.get("text")
+        if (ids is None) == (text is None):
+            raise HTTPException(
+                400, "Prefix affinity requires exactly one of input_ids or text"
+            )
+        if ids is not None:
+            if (
+                not isinstance(ids, list)
+                or not ids
+                or any(
+                    type(token) is not int or not 0 <= token < 2**63 for token in ids
+                )
+            ):
+                raise HTTPException(
+                    400, "Prefix affinity requires one nonempty flat list of token IDs"
+                )
+            kind, prefix = "input_ids", ids[: self.affinity_prefix_length]
+        else:
+            if not isinstance(text, str) or not text:
+                raise HTTPException(
+                    400, "Prefix affinity requires one nonempty text string"
+                )
+            kind, prefix = "text", text[: self.affinity_prefix_length]
+        key = orjson.dumps(
+            [kind, prefix, request.get("extra_key"), request.get("cache_salt")]
+        )
+        return int.from_bytes(hashlib.sha256(key).digest()[:8], "big")
+
+    async def _prepare_affinity_requests(self, request, endpoint):
+        if endpoint != "generate":
+            raise HTTPException(400, "MiniLB prefix affinity supports only /generate")
+        digest = self._affinity_digest(request)
+        await self._ensure_dp_sizes()
+        p_rank = digest % self.prefill_dp_size
+        d_rank = digest % self.decode_dp_size
+        prefill_req, decode_req = request.copy(), request.copy()
+        # Remove nullable aliases too, so each body has one authoritative rank.
+        for body in (prefill_req, decode_req):
+            body.pop("data_parallel_rank", None)
+            body.pop("disagg_prefill_dp_rank", None)
+        prefill_req["routed_dp_rank"] = p_rank
+        decode_req["routed_dp_rank"] = d_rank
+        decode_req["disagg_prefill_dp_rank"] = p_rank
+        return prefill_req, decode_req
+
+    def new_bootstrap_room(self):
+        if not self.prefix_affinity:
+            return _generate_bootstrap_room()
+        room = next(self._affinity_rooms)
+        if room >= 2**63:
+            raise HTTPException(503, "Prefix affinity bootstrap room counter exhausted")
+        return room
 
     def _fork_dp_requests(self, request):
         p_rank = random.randint(0, self.prefill_dp_size - 1)
@@ -117,7 +254,11 @@ class MiniLoadBalancer:
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
         expected_decode_dp_rank = None
-        if self.test_external_dp_routing:
+        if self.prefix_affinity:
+            prefill_req, decode_req = await self._prepare_affinity_requests(
+                modified_request, endpoint
+            )
+        elif self.test_external_dp_routing:
             await self._ensure_dp_sizes()
             prefill_req, decode_req, expected_decode_dp_rank = self._fork_dp_requests(
                 modified_request
@@ -171,11 +312,17 @@ class MiniLoadBalancer:
     async def generate_stream(
         self, modified_request, prefill_server, decode_server, endpoint="generate"
     ):
-
         if self.test_external_dp_routing:
             warnings.warn("--test-external-dp-routing is not supported with streaming")
 
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
+
+        if self.prefix_affinity:
+            prefill_req, decode_req = await self._prepare_affinity_requests(
+                modified_request, endpoint
+            )
+        else:
+            prefill_req = decode_req = modified_request
 
         async def stream_results():
             async with aiohttp.ClientSession(
@@ -185,8 +332,8 @@ class MiniLoadBalancer:
             ) as session:
                 # Create the tasks for both prefill and decode requests
                 tasks = [
-                    session.post(f"{prefill_server}/{endpoint}", json=modified_request),
-                    session.post(f"{decode_server}/{endpoint}", json=modified_request),
+                    session.post(f"{prefill_server}/{endpoint}", json=prefill_req),
+                    session.post(f"{decode_server}/{endpoint}", json=decode_req),
                 ]
 
                 # Wait for both responses to complete. Since this is streaming, they return immediately.
@@ -359,6 +506,9 @@ async def get_model_info():
 
 @app.post("/generate")
 async def handle_generate_request(request_data: dict):
+    if lb.prefix_affinity:
+        # Validate before batch-shape inference and before either PD request.
+        lb._affinity_digest(request_data)
     prefill_server, bootstrap_port, decode_server = lb.select_pair()
 
     # Parse and transform prefill_server for bootstrap data
@@ -372,9 +522,7 @@ async def handle_generate_request(request_data: dict):
             {
                 "bootstrap_host": [hostname] * batch_size,
                 "bootstrap_port": [bootstrap_port] * batch_size,
-                "bootstrap_room": [
-                    _generate_bootstrap_room() for _ in range(batch_size)
-                ],
+                "bootstrap_room": [lb.new_bootstrap_room() for _ in range(batch_size)],
             }
         )
     else:
@@ -382,7 +530,7 @@ async def handle_generate_request(request_data: dict):
             {
                 "bootstrap_host": hostname,
                 "bootstrap_port": bootstrap_port,
-                "bootstrap_room": _generate_bootstrap_room(),
+                "bootstrap_room": lb.new_bootstrap_room(),
             }
         )
 

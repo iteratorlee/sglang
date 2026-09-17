@@ -306,6 +306,8 @@ class Router:
         fields_to_remove = [
             "mini_lb",
             "test_external_dp_routing",
+            "mini_lb_prefix_affinity",
+            "mini_lb_prefix_affinity_length",
             "oracle_wallet_path",
             "oracle_tns_alias",
             "oracle_connect_descriptor",
