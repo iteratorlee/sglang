@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from math import prod
 from typing import Literal
 
 import torch
@@ -11,9 +12,7 @@ import torch
 MambaTransferDirection = Literal["h2d", "d2h"]
 
 
-def _validate_indices(
-    device_indices: torch.Tensor, host_indices: torch.Tensor
-) -> None:
+def _validate_indices(device_indices: torch.Tensor, host_indices: torch.Tensor) -> None:
     if device_indices.ndim != 1 or host_indices.ndim != 1:
         raise ValueError("Mamba state transfer indices must be one-dimensional")
     if device_indices.numel() != host_indices.numel():
@@ -73,8 +72,47 @@ def _validate_component_layout(
             "Mamba state transfer does not convert dtype: "
             f"device={device_tensor.dtype}, host={host_tensor.dtype}"
         )
-    if not device_tensor.is_contiguous() or not host_tensor.is_contiguous():
-        raise ValueError("Mamba state transfer requires contiguous component buffers")
+    if not host_tensor.is_contiguous():
+        raise ValueError("Mamba state transfer requires contiguous host buffers")
+    # Ascend MTP exposes recurrent state with its last two axes transposed.
+    # The payload is still one dense physical span per slot. SDMA transfers
+    # opaque state bytes; it must neither transpose them nor materialize a
+    # contiguous copy of the entire device pool.
+    payload = prod(device_tensor.shape[2:])
+    if (
+        device_tensor.stride(1) != payload
+        or device_tensor.stride(0) != device_tensor.shape[1] * payload
+    ):
+        raise ValueError("Mamba state transfer requires packed layer/slot strides")
+    span = 1
+    for stride, size in sorted(
+        (stride, size)
+        for stride, size in zip(device_tensor.stride()[2:], device_tensor.shape[2:])
+        if size > 1
+    ):
+        if stride != span:
+            raise ValueError(
+                "Mamba state payload must be dense without overlapping or gapped axes"
+            )
+        span *= size
+
+
+def _physical_transfer_views(device_tensor, host_tensor):
+    """Expose dense state bytes in native transfer order, without allocation.
+
+    Host state is an opaque payload. The same physical order is serialized to
+    storage and restored into the original device view on H2D.
+    """
+    if device_tensor.is_contiguous():
+        return device_tensor, host_tensor
+    layers, slots = device_tensor.shape[:2]
+    payload = prod(device_tensor.shape[2:])
+    return (
+        device_tensor.as_strided(
+            (layers, slots, payload), (slots * payload, payload, 1)
+        ),
+        host_tensor.view(host_tensor.shape[0], layers, 1, payload),
+    )
 
 
 def _native_transfer_objects():
@@ -152,6 +190,9 @@ def transfer_mamba_state_components(
         TransferDirection.H2D if direction == "h2d" else TransferDirection.D2H
     )
     for device_tensor, host_tensor in pairs:
+        device_tensor, host_tensor = _physical_transfer_views(
+            device_tensor, host_tensor
+        )
         native_transfer(
             device_tensor,
             host_tensor,

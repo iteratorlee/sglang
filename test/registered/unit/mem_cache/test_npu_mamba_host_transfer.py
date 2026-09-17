@@ -40,6 +40,42 @@ class TestNpuMambaTransferContract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "payload shapes differ"):
             npu_mamba_io._validate_component_layout(device, wrong_payload)
 
+    def test_layout_contract_accepts_mtp_dense_inner_transpose(self):
+        raw = torch.arange(2 * 7 * 3 * 4 * 5, dtype=torch.float32).reshape(
+            2, 7, 3, 4, 5
+        )
+        device = raw.transpose(-1, -2)
+        host = torch.empty((9, 2, 1, 3, 5, 4), dtype=torch.float32)
+
+        self.assertFalse(device.is_contiguous())
+        self.assertEqual(device.stride()[:2], (7 * 3 * 4 * 5, 3 * 4 * 5))
+        npu_mamba_io._validate_component_layout(device, host)
+
+        device_view, host_view = npu_mamba_io._physical_transfer_views(device, host)
+        self.assertEqual(device_view.shape, (2, 7, 3 * 4 * 5))
+        self.assertEqual(host_view.shape, (9, 2, 1, 3 * 4 * 5))
+        self.assertEqual(device_view.data_ptr(), device.data_ptr())
+        self.assertEqual(host_view.data_ptr(), host.data_ptr())
+        self.assertTrue(device_view.is_contiguous())
+        self.assertTrue(host_view.is_contiguous())
+        self.assertTrue(torch.equal(device_view, raw.view(2, 7, -1)))
+
+    def test_layout_contract_rejects_gapped_inner_payload(self):
+        storage = torch.empty(41, dtype=torch.float32)
+        device = storage.as_strided((2, 5, 2, 2), (20, 4, 3, 1))
+        host = torch.empty((7, 2, 1, 2, 2), dtype=torch.float32)
+
+        with self.assertRaisesRegex(ValueError, "dense without overlapping or gapped"):
+            npu_mamba_io._validate_component_layout(device, host)
+
+    def test_layout_contract_rejects_slot_permuted_view(self):
+        packed = torch.empty((2, 10, 3, 4), dtype=torch.float32)
+        device = packed[:, ::2]
+        host = torch.empty((7, 2, 1, 3, 4), dtype=torch.float32)
+
+        with self.assertRaisesRegex(ValueError, "packed layer/slot strides"):
+            npu_mamba_io._validate_component_layout(device, host)
+
     def test_batched_dispatch_keeps_fp32_and_bf16_separate(self):
         temporal_device = torch.empty((2, 8, 3, 5), dtype=torch.float32)
         temporal_host = torch.empty((9, 2, 1, 3, 5), dtype=torch.float32)
@@ -138,9 +174,7 @@ class TestMambaPoolHostAscendDispatch(unittest.TestCase):
     def _pool_and_device():
         host = mamba_host.MambaPoolHost.__new__(mamba_host.MambaPoolHost)
         host.temporal_buffer = torch.empty((9, 2, 1, 3), dtype=torch.float32)
-        host.conv_buffer = [
-            torch.empty((9, 2, 1, 4, 7), dtype=torch.bfloat16)
-        ]
+        host.conv_buffer = [torch.empty((9, 2, 1, 4, 7), dtype=torch.bfloat16)]
         device = SimpleNamespace(
             mamba_cache=SimpleNamespace(
                 temporal=torch.empty((2, 8, 3), dtype=torch.float32),
