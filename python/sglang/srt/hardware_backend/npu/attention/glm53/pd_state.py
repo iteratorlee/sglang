@@ -92,14 +92,24 @@ def grow_kpool_request_state(indexer, num_req_slots):
 def register_glm53_kpool_state(model, token_pool, req_pool, *, parallel):
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 
-    if not (
+    tp16 = (
         parallel.tp_size == parallel.moe_ep_size == parallel.attn_tp_size == 16
+        and not parallel.enable_dp_attention
+    )
+    dp16 = (
+        parallel.tp_size == parallel.moe_ep_size == parallel.dp_size == 16
+        and parallel.enable_dp_attention
+        and parallel.attn_dp_size == 16
+        and parallel.attn_tp_size == 1
+    )
+    if not (
+        (tp16 or dp16)
         and parallel.pp_size == 1
         and parallel.attn_cp_size == 1
-        and not parallel.enable_dp_attention
     ):
         raise ValueError(
-            "GLM53 NPU PD state currently requires TP16/EP16/PP1 without DP/CP"
+            "GLM53 NPU PD state requires TP16/EP16/PP1/CP1 or DP16/EP16 "
+            "with attention TP1"
         )
     pool = getattr(token_pool, "full_kv_pool", token_pool)
     if not isinstance(pool, NPUMLATokenToKVPool):
