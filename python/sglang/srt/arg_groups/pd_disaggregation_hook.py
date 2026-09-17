@@ -11,6 +11,7 @@ from sglang.srt.arg_groups.overrides import (
     resolved_view,
     resolving_view,
 )
+from sglang.srt.disaggregation.glm53_decode_prefix import glm53_pd_decode_prefix_profile
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -87,10 +88,20 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "with --disaggregation-transfer-backend fake"
                 )
             if cfg.speculative_algorithm is not None:
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
-                    "with speculative decoding "
-                    f"(--speculative-algorithm {cfg.speculative_algorithm})"
+                glm53_profile = glm53_pd_decode_prefix_profile(
+                    cfg, model_config_of(server_args)
+                )
+                if glm53_profile is None:
+                    raise ValueError(
+                        "--disaggregation-decode-enable-radix-cache is incompatible "
+                        "with speculative decoding outside the validated GLM-5.3 "
+                        "Ascend DP8/TP2 EP16 EAGLE MTP profile "
+                        f"(--speculative-algorithm {cfg.speculative_algorithm})"
+                    )
+                logger.warning(
+                    "EXPERIMENTAL: enabling GLM-5.3 Ascend PD decode radix "
+                    "cache with EAGLE MTP; KDA/conv state remains authoritative "
+                    "from the prefill transfer"
                 )
 
             if resolved_view(server_args).enable_dp_attention:

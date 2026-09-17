@@ -33,6 +33,7 @@ import numpy as np
 import torch
 from torch.distributed import ProcessGroup
 
+from sglang.srt.arg_groups.overrides import resolved_view
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
@@ -44,6 +45,14 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodePrefixMatch,
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
+)
+from sglang.srt.disaggregation.glm53_decode_prefix import (
+    glm53_pd_decode_prefix_profile,
+    mark_glm53_pd_mamba_state_authoritative,
+    plan_glm53_pd_decode_prefix,
+    prepare_glm53_pd_rebootstrap,
+    validate_glm53_pd_decode_prefix_runtime,
+    write_glm53_cache_audit,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -104,11 +113,7 @@ from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_PROCESS_QUEUE,
     scheduler_stage_method,
 )
-from sglang.srt.runtime_context import (
-    get_disagg,
-    get_memory,
-    get_parallel,
-)
+from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
 from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -330,6 +335,9 @@ class DecodeRequest:
     hicache_restore_lock_receipt: Optional[DecLockRefParams] = None
     hicache_load_consumer_index: int = -1
     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
+    # Populated only for the strict GLM53 profile after the exact metadata sent
+    # to P is known, then emitted only after the matching transfer commits.
+    glm53_cache_audit: Optional[Dict[str, Any]] = None
 
     @property
     def seqlen(self) -> int:
@@ -389,6 +397,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.pp_size = scheduler.ps.pp_size
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
+        self.glm53_decode_prefix_profile = None
+        if get_disagg().disaggregation_decode_enable_radix_cache:
+            self.glm53_decode_prefix_profile = glm53_pd_decode_prefix_profile(
+                resolved_view(self.scheduler.server_args), self.scheduler.model_config
+            )
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
@@ -598,6 +611,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=getattr(self, "req_to_token_pool", None),
         )
+        if self.glm53_decode_prefix_profile is not None:
+            validate_glm53_pd_decode_prefix_runtime(
+                self.glm53_decode_prefix_profile,
+                tree_cache=self.tree_cache,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                req_to_token_pool=self.req_to_token_pool,
+                state_types=kv_args.state_types,
+                draft_token_to_kv_pool=self.draft_token_to_kv_pool,
+            )
 
         kv_args.ib_device = get_disagg().disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.ps.gpu_id
@@ -652,6 +674,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
+        if is_retracted and self.glm53_decode_prefix_profile is not None:
+            # CPU retraction backs up the target pool and active Mamba state,
+            # but not EAGLE's separate draft KV pool. Recompute all transferred
+            # state together on P so recycled shared page ids cannot expose
+            # stale draft history on D.
+            retraction_discard(
+                req,
+                self.tree_cache,
+                get_disagg().disaggregation_decode_retraction_backup,
+            )
+            prepare_glm53_pd_rebootstrap(req)
+            is_retracted = False
+            is_rebootstrap = True
+
         if is_retracted:
             req.retraction_mb_id = None
             self.retracted_queue.append(req)
@@ -683,7 +719,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.tree_cache,
             req,
             req.origin_input_ids,
-            cow_mamba=self.tree_cache.supports_mamba(),
+            # GLM53 PD receives the authoritative post-prompt KDA/conv state
+            # from P.  COW from the D radix checkpoint would be older and must
+            # never overwrite that transfer.
+            cow_mamba=(
+                self.tree_cache.supports_mamba()
+                and self.glm53_decode_prefix_profile is None
+            ),
             include_req=True,
         )
         # Keep aggregated scheduling semantics while preserving the SWA lock
@@ -692,7 +734,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         req.lock_receipt = self.tree_cache.inc_lock_ref(
             result.last_device_node
         ).to_dec_params()
-        return self._build_decode_prefix_match(req, result)
+        prefix_match = self._build_decode_prefix_match(req, result)
+        if self.glm53_decode_prefix_profile is not None:
+            plan = plan_glm53_pd_decode_prefix(
+                self.glm53_decode_prefix_profile,
+                prefix_match.prefix_indices,
+                self._pre_alloc_fill_len(req),
+            )
+            prefix_match.prefix_indices = plan.prefix_indices
+        return prefix_match
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
@@ -1350,6 +1400,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_len,
                 total_prefix_len,
             )
+            if self.glm53_decode_prefix_profile is not None:
+                # _pre_alloc assigned a fresh active Mamba slot.  The transfer
+                # below fills all live KDA/conv entries for that slot; suppress
+                # deferred radix COW/clear and discard any cached branching hint.
+                mark_glm53_pd_mamba_state_authoritative(decode_req.req)
             decode_req.prefix_match = prefix_match
             if self.scheduler.enable_decode_hicache:
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
@@ -1551,6 +1606,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 state_indices,
                 **metadata_kwargs,
             )
+            if self.glm53_decode_prefix_profile is not None:
+                decode_req.glm53_cache_audit = {
+                    "rid": decode_req.req.rid,
+                    "dp_rank": self.scheduler.ps.dp_rank,
+                    "tp_rank": self.tp_rank,
+                    "actual_prefix_len": total_prefix_len,
+                    "input_len": origin_input_len,
+                    "metadata_page_count": int(page_indices.size),
+                    "fresh_mamba": bool(decode_req.req.kv.holds_mamba)
+                    and decode_req.req.kv.mamba_cow_src_index is None
+                    and not decode_req.req.kv.mamba_needs_clear,
+                    "draft_present": self.draft_token_to_kv_pool is not None,
+                }
             if decode_req.is_rebootstrap:
                 self.kv_manager.submit_prefill_recompute(
                     decode_req.kv_receiver,
@@ -2271,6 +2339,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     float(output_token_sampling_logprobs[0].item())
                 )
 
+        if decode_req.glm53_cache_audit is not None:
+            try:
+                write_glm53_cache_audit(
+                    **decode_req.glm53_cache_audit,
+                    transfer_success=True,
+                )
+            except OSError:
+                logger.exception(
+                    "Failed to write GLM53 decode-prefix cache audit for rid=%s",
+                    decode_req.req.rid,
+                )
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
         decode_req.req.time_stats.set_wait_queue_entry_time()

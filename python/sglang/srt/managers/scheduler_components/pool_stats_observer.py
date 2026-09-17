@@ -248,8 +248,13 @@ class SchedulerPoolStatsObserver:
             self.tree_cache.supports_mamba() and self.tree_cache.is_tree_cache()
         )
         full_available_size = self.token_to_kv_pool_allocator.available_size()
+        # A hybrid model may use a token-only radix tree (GLM53 PD decode),
+        # while recurrent state stays request-scoped. Its FULL cache pages are
+        # still evictable and must enter the pool conservation equation.
         full_evictable_size = (
-            self.tree_cache.full_evictable_size() if is_mamba_radix_cache else 0
+            self.tree_cache.full_evictable_size()
+            if self.tree_cache.is_tree_cache()
+            else 0
         )
         mamba_available_size = self.req_to_token_pool.mamba_allocator.available_size()
         # `mamba_usage`/`mamba_num_used` track the ACTIVE bf16 pool occupancy (running

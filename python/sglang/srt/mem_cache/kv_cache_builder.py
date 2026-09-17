@@ -267,6 +267,15 @@ def build_kv_cache(
     disable_radix_cache = get_memory().disable_radix_cache or (
         model_config.is_multimodal and uses_transformers_backend
     )
+    from sglang.srt.disaggregation.glm53_decode_prefix import (
+        glm53_pd_decode_prefix_profile,
+    )
+
+    glm53_decode_prefix = (
+        glm53_pd_decode_prefix_profile(resolving_view(server_args), model_config)
+        if get_disagg().disaggregation_decode_enable_radix_cache
+        else None
+    )
     if disable_radix_cache and not get_memory().disable_radix_cache:
         logger.warning(
             "Radix cache is disabled for multimodal models with the "
@@ -305,7 +314,7 @@ def build_kv_cache(
                     "--disaggregation-decode-enable-radix-cache does not support "
                     "SWA-compress models (e.g. Gemma4 / MiMo-V2) yet."
                 )
-        if is_hybrid_ssm:
+        if is_hybrid_ssm and glm53_decode_prefix is None:
             raise ValueError(
                 "--disaggregation-decode-enable-radix-cache is incompatible "
                 "with Mamba/SSM models"
@@ -320,8 +329,9 @@ def build_kv_cache(
         if not get_parallel().dcp_enabled
         else token_to_kv_pool_allocator.page_size
     )
-    # This bounded native path uses the default device-resident FULL/MAMBA
-    # tree. Keep the physical allocator and every decode graph on page64.
+    # Keep the physical allocator and every decode graph on page64. P caches
+    # FULL/MAMBA together (including HiCache); D caches token pages only and
+    # always receives fresh post-prompt recurrent state from P.
     glm53_prefix_page_size = _glm53_npu_prefix_page_size(
         model_config,
         req_to_token_pool.device,
@@ -330,14 +340,20 @@ def build_kv_cache(
         enabled=(
             not disable_radix_cache
             and is_hybrid_ssm
-            and get_disagg().disaggregation_mode == "prefill"
-            and get_exec().mamba.enable_mamba_extra_buffer
-            and not get_exec().mamba.enable_mamba_extra_buffer_lazy
             and not get_memory().enable_session_radix_cache
             and get_memory().radix_cache_backend is None
             and not get_parallel().dcp_enabled
             and get_parallel().attn_cp_size == 1
-            and get_parallel().dp_size == get_parallel().pp_size == 1
+            and get_parallel().pp_size == 1
+            and (
+                glm53_decode_prefix is not None
+                or (
+                    get_disagg().disaggregation_mode == "prefill"
+                    and get_exec().mamba.enable_mamba_extra_buffer
+                    and not get_exec().mamba.enable_mamba_extra_buffer_lazy
+                    and get_parallel().dp_size == 1
+                )
+            )
         ),
     )
 
@@ -377,7 +393,7 @@ def build_kv_cache(
             params=params,
             is_hybrid_swa=is_hybrid_swa,
             full_tokens_per_layer=full_tokens_per_layer,
-            is_hybrid_ssm=is_hybrid_ssm,
+            is_hybrid_ssm=is_hybrid_ssm and glm53_decode_prefix is None,
             is_dsa=is_dsa,
             enable_hierarchical_cache=enable_hierarchical_cache,
             disable_radix_cache=disable_radix_cache,
