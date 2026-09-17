@@ -1,0 +1,107 @@
+---
+title: "GLM-5.3-Flash PD prefix cache on Ascend"
+---
+
+This branch supports GLM-5.3-Flash modelslim W8A8 with EAGLE MTP in the
+following bounded PD configuration. Each role uses 16 Ascend NPUs.
+
+| Role | Attention | MoE | Cache |
+| --- | --- | --- | --- |
+| Prefill | TP16 | EP16 | HBM, pinned host memory, local SSD files |
+| Decode | DP8/TP2 | EP16 | HBM prefix KV; fresh per-request recurrent state |
+
+Keep target and draft quantization as `modelslim`, EAGLE steps=3, topk=1,
+draft tokens=4, physical page size=64, and PP/DCP/attention-CP/node count=1.
+The D-side exception is checked against these settings before serving.
+The weight and operator implementations remain W8A8; caching does not
+convert model weights to BF16.
+
+## Prefill tiers
+
+Add these settings to the existing P deployment, with radix cache enabled:
+
+```bash
+export SGLANG_GLM53_PD_PREFILL_REUSABLE_CHECKPOINT=1
+export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=/your-local-ssd/glm53-cache-v1
+# Additional launch_server arguments:
+--enable-hierarchical-cache \
+--hicache-size 8 \
+--hicache-io-backend kernel_ascend \
+--hicache-mem-layout page_first_kv_split \
+--hicache-write-policy write_through \
+--hicache-storage-backend file \
+--hicache-storage-prefetch-policy wait_complete \
+--enable-cache-report
+```
+
+The example host budget is 8 GiB **per rank**, not for the entire server.
+Use a local SSD-backed directory. A container's `/tmp` or shared `/workspace`
+need not be SSD storage. Use a fresh directory after changing the model,
+packed draft layout, page ABI, or parallel configuration. File keys are not a
+complete serialization-ABI version identifier.
+
+The validated storage backend is `file`, with File `max_size` and
+`min_free_space` eviction controls unset. Bounded File eviction is not supported
+for these MLA plus TP-sharded Mamba sidecar files. NIXL and other L3 backends
+are outside this implementation's validated scope. Monitor storage usage and
+manage the dedicated cache directory separately.
+
+`GLM53MLAPoolHost` stores target and draft latent K plus index K. The radix and
+storage page is 256 tokens, owning four potentially noncontiguous physical
+64-token pages. Native SDMA retains page64 addressing. Zero-RoPE channels are
+immutable zeros and need no saved payload. KDA recurrent state stays FP32;
+conv state keeps its original dtype. Dense transposed MTP state is copied as
+opaque physical bytes without materializing the whole device pool.
+
+MLA KV files remain shared across attention TP ranks. Mamba checkpoint keys
+include TP rank and TP size to prevent shards from overwriting each other.
+The existing layer-completion events gate all target, draft, and state H2D
+loads before execution.
+
+## Decode prefix reuse
+
+Enable `--disaggregation-decode-enable-radix-cache` on D, with radix cache
+enabled and hierarchical cache disabled. Keep `--page-size 64`; the builder
+uses a logical256 FULL-only radix tree without changing attention kernels or
+graph allocation. Capture every useful local decode batch size. For total
+capacity32 across DP8, the tested graph list is `1 2 3 4`.
+
+D retains target/draft KV pages but always receives the current request's final
+KDA/conv state and DSA tail from P. It never restores an older D radix Mamba
+checkpoint over that state. EAGLE bigram matching leaves the final prompt token
+fresh: an exact N-token repeat aligned to256 reuses N-256 tokens and transfers
+four physical pages. Unaligned tail counts use ceiling division by64.
+
+Request completion/abort releases independent recurrent slots. Retraction uses
+the existing P rebootstrap protocol because generic CPU backup omits the
+separate draft KV pool. FULL-only tree pages still participate in the normal
+pool-conservation check; leak detection remains enabled.
+
+For opt-in diagnostics, set `SGLANG_GLM53_CACHE_AUDIT_DIR` on D. One per-process
+JSONL record after transfer commits reports the actual reused prefix, metadata
+page count, DP/TP ranks, fresh Mamba state and draft presence. This reports the
+transfer contract, not tensor-value hashes.
+
+## DP placement
+
+A prefix must return to the D rank that owns it. The Python MiniLB provides an
+optional `/generate` prefix-affinity mode; see the Python gateway README.
+It supports separate P/D rank assignments, one P URL and one D URL, text or
+flat token IDs, and streaming/nonstreaming requests. Run the repository's
+Python binding via `PYTHONPATH`; the image's installed 0.3.2 PD router does not
+supply the required independent P1/D8 rank preparation.
+
+Affinity hashes a leading prefix and cache namespace. It has no load or cache
+occupancy feedback, so one hot prefix can concentrate requests on a single
+rank. OpenAI endpoints, batched inputs and multiple samples are not supported
+by this opt-in MiniLB mode. Explicit client dual POST remains available through
+`routed_dp_rank` on each role and `disagg_prefill_dp_rank` on D.
+
+## Validation boundary
+
+Real NPU tests cover bit-exact target/draft/index and FP32/BF16 state roundtrips,
+including file persistence and remapped host/device pages. Full-model tests
+cover exact64k/128k reuse, partial/forked prefixes, actual Host and SSD hits,
+independent retrieval answers, MTP and graph execution. Cold greedy outputs
+already vary in the original cache-disabled deployment; this validation does
+not claim global output-token or whole-model bitwise determinism.
