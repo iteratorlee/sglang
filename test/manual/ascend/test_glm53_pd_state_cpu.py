@@ -356,7 +356,7 @@ class TestGlm53PDState(unittest.TestCase):
         self.assertEqual(pool.full_kv_pool.tail_extra_slots, 0)
 
     def test_dp_attention_preserves_registered_request_state(self):
-        for dp, attn_tp in ((16, 1), (8, 2)):
+        for dp, attn_tp in ((16, 1), (8, 2), (4, 4), (2, 8)):
             with self.subTest(dp=dp, attn_tp=attn_tp):
                 parallel = types.SimpleNamespace(**(vars(PARALLEL) | dict(
                     enable_dp_attention=True, dp_size=dp,
