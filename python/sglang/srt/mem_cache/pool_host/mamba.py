@@ -18,10 +18,11 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
 )
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_npu = is_npu()
 if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
@@ -33,6 +34,10 @@ if _is_cuda or _is_hip:
     from sglang.kernels.ops.mamba.transfer_mamba import (
         transfer_kv_mamba_lf_pf,
         transfer_kv_mamba_pf_lf,
+    )
+if _is_npu:
+    from sglang.srt.mem_cache.pool_host.npu_mamba_io import (
+        transfer_mamba_state_components,
     )
 
 logger = logging.getLogger(__name__)
@@ -110,27 +115,46 @@ class MambaPoolHost(HostKVCache):
             self.layout,
         )
 
-        self.temporal_device_ptrs = torch.tensor(
-            [
-                device_pool.mamba_cache.temporal[i].data_ptr()
-                for i in range(self.num_mamba_layers)
-            ],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
-        )
-        self.conv_device_ptrs = [
-            torch.tensor(
-                [conv_state[i].data_ptr() for i in range(self.num_mamba_layers)],
+        if _is_npu:
+            # Ascend's transfer_mamba_state consumes tensors directly. Avoid
+            # constructing unsupported/unneeded uint64 pointer tensors on NPU.
+            self.temporal_device_ptrs = None
+            self.conv_device_ptrs = [None] * len(device_pool.mamba_cache.conv)
+        else:
+            self.temporal_device_ptrs = torch.tensor(
+                [
+                    device_pool.mamba_cache.temporal[i].data_ptr()
+                    for i in range(self.num_mamba_layers)
+                ],
                 dtype=torch.uint64,
                 device=self.device_pool.device,
             )
-            for conv_state in device_pool.mamba_cache.conv
-        ]
+            self.conv_device_ptrs = [
+                torch.tensor(
+                    [conv_state[i].data_ptr() for i in range(self.num_mamba_layers)],
+                    dtype=torch.uint64,
+                    device=self.device_pool.device,
+                )
+                for conv_state in device_pool.mamba_cache.conv
+            ]
 
         self.kv_buffer = self.init_kv_buffer()
         self._init_write_back_staging_buffers()
         self.lock = threading.RLock()
         self.clear()
+
+    def destroy(self):
+        """Release NPU pinned host buffers after transfer threads have stopped."""
+        super().destroy()
+        if _is_npu:
+            # kv_buffer is only one owner; these named references otherwise keep
+            # torch_npu's pinned allocations alive after pool teardown.
+            self.temporal_buffer = None
+            self.conv_buffer = []
+            self.temporal_staging_buffer = None
+            self.conv_staging_buffers = []
+            self.temporal_device_ptrs = None
+            self.conv_device_ptrs = []
 
     def init_kv_buffer(self):
         _host_alloc = ALLOC_MEMORY_FUNCS[self.device_pool.device]
@@ -417,6 +441,25 @@ class MambaPoolHost(HostKVCache):
         *,
         is_draft: bool = False,
     ):
+        if io_backend == "kernel_ascend":
+            if not _is_npu:
+                raise RuntimeError("kernel_ascend Mamba transfer requires Ascend NPU")
+            # The native op transfers every Mamba layer in one submission. The
+            # hybrid layer mapper presents local layer 0 at the first Mamba
+            # layer; subsequent per-layer callbacks are intentionally no-ops.
+            if layer_id != 0:
+                return
+            transfer_mamba_state_components(
+                device_tensors=[
+                    device_pool.mamba_cache.temporal,
+                    *device_pool.mamba_cache.conv,
+                ],
+                host_tensors=[self.temporal_buffer, *self.conv_buffer],
+                device_indices=device_indices,
+                host_indices=host_indices,
+                direction="h2d",
+            )
+            return
         if self.layout in ["page_first", "page_first_direct"]:
             # no ssm state on conv-only models: nothing to transfer
             if self.temporal_state_elem_size > 0:
@@ -459,6 +502,20 @@ class MambaPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend="kernel"
     ):
+        if io_backend == "kernel_ascend":
+            if not _is_npu:
+                raise RuntimeError("kernel_ascend Mamba transfer requires Ascend NPU")
+            transfer_mamba_state_components(
+                device_tensors=[
+                    device_pool.mamba_cache.temporal,
+                    *device_pool.mamba_cache.conv,
+                ],
+                host_tensors=[self.temporal_buffer, *self.conv_buffer],
+                device_indices=device_indices,
+                host_indices=host_indices,
+                direction="d2h",
+            )
+            return
         if self.layout in ["page_first", "page_first_direct"]:
             # no ssm state on conv-only models: a 0-size batched memcpy errors
             if self.temporal_state_elem_size > 0:
