@@ -144,6 +144,14 @@ def build_kv_host_pool(
     kv_host_pool_cls = (
         MLATokenToKVPoolHost if use_mla else get_mha_host_pool_cls(kv_pool)
     )
+    if use_mla:
+        from sglang.srt.mem_cache.pool_host.glm53 import (
+            GLM53MLAPoolHost,
+            is_glm53_kpool,
+        )
+
+        if is_glm53_kpool(kv_pool):
+            kv_host_pool_cls = GLM53MLAPoolHost
     kwargs = {}
     if override_kv_cache_dim is not None:
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
@@ -818,7 +826,11 @@ def build_hybrid_mamba_stack(
         get_memory().hicache_ratio,
         mamba_host_size,
         allocator_type=_get_allocator_type(),
-        layout=get_memory().hicache_mem_layout,
+        layout=(
+            "page_first_direct"
+            if get_memory().hicache_mem_layout == "page_first_kv_split"
+            else get_memory().hicache_mem_layout
+        ),
     )
     entries = [
         build_pool_entry(

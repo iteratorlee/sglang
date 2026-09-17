@@ -333,7 +333,6 @@ def build_kv_cache(
             and get_disagg().disaggregation_mode == "prefill"
             and get_exec().mamba.enable_mamba_extra_buffer
             and not get_exec().mamba.enable_mamba_extra_buffer_lazy
-            and not enable_hierarchical_cache
             and not get_memory().enable_session_radix_cache
             and get_memory().radix_cache_backend is None
             and not get_parallel().dcp_enabled
