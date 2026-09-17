@@ -597,7 +597,7 @@ class AscendMHCLayerCommunicator(MHCLayerCommunicator):
         elif context.attn_dp_size > 1:
             from sglang.srt.layers.dp_attention import _dp_gather_via_all_reduce
 
-            gathered = get_global_dp_buffer()
+            gathered = get_global_dp_buffer(get_tp_group())
             _dp_gather_via_all_reduce(
                 gathered, hidden_states, forward_batch, is_partial=False
             )
