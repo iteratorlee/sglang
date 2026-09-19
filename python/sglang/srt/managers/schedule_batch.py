@@ -1134,6 +1134,8 @@ class Req(ReqDllmMixin):
         self.storage_prefetch_retry_pending = False
         self.storage_prefetch_retry_wait_polls = 0
         self.storage_prefetch_retry_attempts = 0
+        # Admission-time P prefetch: one attempt until admission/retract.
+        self.pd_prefill_jit_prefetch_issued = False
         # Receipt of the tree lock held on last_node (anchor, SWA boundary,
         # skipped components); every release replays it unchanged.
         self.lock_receipt: DecLockRefParams = DecLockRefParams()
@@ -1829,6 +1831,8 @@ class Req(ReqDllmMixin):
             return
 
     def reset_for_retract(self):
+        # Also used by optimistic P release/requeue and preemption.
+        self.pd_prefill_jit_prefetch_issued = False
         # Increment retraction count before resetting other state. We should not reset this
         # since we are tracking the total number of retractions for each request.
         self.retraction_count += 1

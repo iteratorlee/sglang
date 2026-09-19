@@ -417,6 +417,10 @@ def _accumulate_decode_moment(
     totals[5] += g
 
 
+_GLM53_PD_PREFILL_JIT_PREFETCH = (
+    os.environ.get("SGLANG_GLM53_PD_PREFILL_JIT_PREFETCH") == "1"
+)
+
 _is_npu = is_npu()
 _is_hip = is_hip()
 
@@ -3073,9 +3077,30 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
 
-    def _prefetch_kvcache(self, req: Req):
+    def _use_glm53_jit_prefetch(self) -> bool:
+        if not _GLM53_PD_PREFILL_JIT_PREFETCH:
+            return False
+        cache = self.tree_cache
+        return (
+            _is_npu
+            and self.disaggregation_mode == DisaggregationMode.PREFILL
+            and self.enable_hicache_storage
+            and type(cache).__name__ == "UnifiedRadixCache"
+            and type(cache).__module__ == "sglang.srt.mem_cache.unified_radix_cache"
+            and not cache.disable
+            and cache.is_mamba_enabled
+            and cache.host_memory_mode == "cache"
+            and cache.enable_storage
+            and "Glm5NextForConditionalGeneration"
+            in (getattr(self.model_config.hf_config, "architectures", None) or ())
+        )
+
+    def _prefetch_kvcache(self, req: Req, *, at_admission: bool = False):
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
+            # Preserve arrival/bootstrap metadata; defer only L3 I/O.
+            if self._use_glm53_jit_prefetch() and not at_admission:
+                return
             tree_cache = self.tree_cache
             buffer_mode = get_memory().hicache_host_memory_mode == "buffer_only"
             last_host_node = req.last_host_node
@@ -3126,6 +3151,8 @@ class Scheduler(
         missed. Pacing counts scheduling passes so TP ranks re-issue on the
         same pass; a sweep (the admission loop stops at the first
         unschedulable request) covers the whole queue."""
+        if self._use_glm53_jit_prefetch():
+            return  # The admission candidate gets one attempt per Req lifecycle.
         interval = get_memory().hicache_storage_prefetch_retry_poll_interval
         if interval <= 0 or not self.waiting_queue:
             return
@@ -3828,8 +3855,22 @@ class Scheduler(
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+        jit_prefetch = self._use_glm53_jit_prefetch()
+        jit_prefetch_owner = None
+        prefill_candidates = self.waiting_queue
+        if jit_prefetch:
+            # Keep the one attempted-but-unadmitted candidate ahead of
+            # new arrivals/requeues even if calc_priority reordered them.
+            jit_prefetch_owner = next(
+                (r for r in self.waiting_queue if r.pd_prefill_jit_prefetch_issued),
+                None,
+            )
+            if jit_prefetch_owner is not None:
+                prefill_candidates = [jit_prefetch_owner] + [
+                    r for r in self.waiting_queue if r is not jit_prefetch_owner
+                ]
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        for req in prefill_candidates:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -3863,9 +3904,33 @@ class Scheduler(
                 ):
                     break
 
+            if jit_prefetch:
+                # Slot gates above also cover P bootstrap/transfer users.
+                # budget_state covers input/chunk/total/Mamba budgets,
+                # including an existing chunk charged before this loop.
+                if (
+                    (jit_prefetch_owner is not None and req is not jit_prefetch_owner)
+                    or adder.budget_state() != AddReqResult.CONTINUE
+                    or (adder.prefill_max_requests is not None
+                        and len(adder.can_run_list) >= adder.prefill_max_requests)
+                ):
+                    break
+                if not req.pd_prefill_jit_prefetch_issued:
+                    # Mark even a full hit, too-short suffix or allocation
+                    # decline as attempted: all may safely compute once.
+                    req.pd_prefill_jit_prefetch_issued = True
+                    jit_prefetch_owner = req
+                    self._prefetch_kvcache(req, at_admission=True)
+                    if req.rid in self.tree_cache.ongoing_prefetch:
+                        # Yield before the first progress poll; best_effort
+                        # must not terminate a just-issued operation here.
+                        break
+
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
+                    if jit_prefetch:
+                        break  # Keep can_run_list; never prefetch later candidates.
                     # skip staging requests that are ongoing prefetch
                     continue
                 # Pop the L3-loaded span. Unified cache exposes its absolute
@@ -3912,6 +3977,9 @@ class Scheduler(
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+
+            if jit_prefetch and adder.can_run_list and req is adder.can_run_list[-1]:
+                jit_prefetch_owner = None
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
