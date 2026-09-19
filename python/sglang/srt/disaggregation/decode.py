@@ -1258,6 +1258,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if hisparse_req_budget <= 0:
                 break
 
+            # GLM-5's configured KV capacity covers local running slots. Requests
+            # on transfer/waiting queues already own KV too, so admitting beyond
+            # that limit can consume the headroom needed by running outputs.
+            if (
+                self.glm53_decode_prefix_profile is not None
+                and self._active_req_count(len(preallocated_reqs))
+                >= self.scheduler.max_running_requests
+            ):
+                break
+
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
             origin_input_len = self._rebootstrap_prefill_len(decode_req.req)
@@ -1334,18 +1344,33 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             required_tokens_for_request = (
                 required_alloc_tokens + self.num_reserved_decode_tokens
             )
+            minimum_full_allocatable_tokens = max(
+                required_tokens_for_request,
+                origin_input_len
+                - prefix_len
+                + min(
+                    decode_req.req.sampling_params.max_new_tokens,
+                    CLIP_MAX_NEW_TOKEN,
+                )
+                - retractable_tokens,
+            )
+            if (
+                self.glm53_decode_prefix_profile is not None
+                and minimum_full_allocatable_tokens <= full_allocatable_tokens
+            ):
+                full_allocatable_tokens = (
+                    self._materialize_radix_full_allocatable_tokens(
+                        minimum_allocatable_tokens=minimum_full_allocatable_tokens,
+                        retractable_tokens=retractable_tokens,
+                        count_retracted=True,
+                        extra_reserved_reqs=len(preallocated_reqs),
+                        hicache_reserved_tokens=reserved_restore_tokens,
+                        req=decode_req.req,
+                    )
+                )
 
             if (
-                max(
-                    required_tokens_for_request,
-                    origin_input_len
-                    - prefix_len
-                    + min(
-                        decode_req.req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKEN,
-                    )
-                    - retractable_tokens,
-                )
+                minimum_full_allocatable_tokens
                 > full_allocatable_tokens
             ):
                 if prefix_match is not None and prefix_match.l1_prefix_len > 0:
@@ -1722,6 +1747,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         extra_reserved_reqs: int = 0,
         reserved_tokens: Optional[int] = None,
         hicache_reserved_tokens: int = 0,
+        include_radix_evictable: bool = True,
     ) -> int:
         need_space_for_single_req = self._need_space_for_single_req(retractable_tokens)
         if reserved_tokens is None:
@@ -1741,13 +1767,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 available_size = logical_allocator.available_size()
         elif self._uses_swa_tail_prealloc():
             available_size = self.token_to_kv_pool_allocator.full_available_size()
-            if get_disagg().disaggregation_decode_enable_radix_cache:
+            if (
+                get_disagg().disaggregation_decode_enable_radix_cache
+                and include_radix_evictable
+            ):
                 available_size += self._radix_full_evictable()
         else:
             available_size = self.token_to_kv_pool_allocator.available_size()
             # Include evictable decode-radix cache entries in the budget -- they
             # can be freed on demand before allocation.
-            if get_disagg().disaggregation_decode_enable_radix_cache:
+            if (
+                get_disagg().disaggregation_decode_enable_radix_cache
+                and include_radix_evictable
+            ):
                 available_size += self._radix_full_evictable()
         allocatable_tokens = available_size - max(
             reserved_tokens, need_space_for_single_req
@@ -1769,6 +1801,64 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 allocatable_tokens -= full_required
 
         allocatable_tokens -= hicache_reserved_tokens
+        return allocatable_tokens
+
+    def _materialize_radix_full_allocatable_tokens(
+        self,
+        *,
+        minimum_allocatable_tokens: int,
+        retractable_tokens: Optional[int],
+        count_retracted: bool,
+        extra_reserved_reqs: int,
+        reserved_tokens: Optional[int] = None,
+        hicache_reserved_tokens: int = 0,
+        req: Optional[Req] = None,
+    ) -> int:
+        """Return allocatable FULL tokens after performing any required eviction.
+
+        This GLM-5 decode-radix path is called only after the optimistic budget
+        has passed. UnifiedRadixCache's FULL evictable ledger can be larger than
+        the capacity its current device-leaf walk can actually reclaim, so the
+        final admission decision must observe allocator capacity after eviction.
+        """
+        budget_args = dict(
+            retractable_tokens=retractable_tokens,
+            count_retracted=count_retracted,
+            extra_reserved_reqs=extra_reserved_reqs,
+            reserved_tokens=reserved_tokens,
+            hicache_reserved_tokens=hicache_reserved_tokens,
+            include_radix_evictable=False,
+        )
+        rid = req.rid if req is not None else None
+        allocatable_tokens = self._allocatable_token_budgets(**budget_args)
+        if allocatable_tokens >= minimum_allocatable_tokens:
+            if req is not None:
+                req.pd_radix_admission_warned = False
+            return allocatable_tokens
+
+        num_to_evict = minimum_allocatable_tokens - allocatable_tokens
+        available_before = self._radix_full_available()
+        reported_evictable = self._radix_full_evictable()
+        result = self.tree_cache.evict_for_alloc(
+            EvictParams(num_tokens=num_to_evict)
+        )
+        allocatable_tokens = self._allocatable_token_budgets(**budget_args)
+        if allocatable_tokens < minimum_allocatable_tokens:
+            if req is None or not getattr(req, "pd_radix_admission_warned", False):
+                logger.warning(
+                    "Decode preallocation admission eviction insufficient: "
+                    f"required_budget={minimum_allocatable_tokens}, "
+                    f"allocatable_after={allocatable_tokens}, "
+                    f"available_before={available_before}, "
+                    f"available_after={self._radix_full_available()}, "
+                    f"evicted={result.num_tokens_evicted}/{num_to_evict}, "
+                    f"reported_evictable={reported_evictable}, req={rid}. "
+                    "Keeping the request queued."
+                )
+                if req is not None:
+                    req.pd_radix_admission_warned = True
+        elif req is not None:
+            req.pd_radix_admission_warned = False
         return allocatable_tokens
 
     def _swa_tail_allocatable_token_budget(
