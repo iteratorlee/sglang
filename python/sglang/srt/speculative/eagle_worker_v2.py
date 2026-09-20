@@ -1271,6 +1271,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     ),
                 )
 
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.attention.glm53.accepted_state import (
+                prewarm_kpool_tail_commit_graphs,
+            )
+
+            prewarm_kpool_tail_commit_graphs(self._target_worker.model_runner)
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,

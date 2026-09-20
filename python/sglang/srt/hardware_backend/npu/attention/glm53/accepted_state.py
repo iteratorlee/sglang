@@ -1,8 +1,24 @@
 """Commit only accepted speculative KPool tails, alongside native KDA rollback."""
 
+import logging
 import os
+import time
 
 import torch
+
+logger = logging.getLogger(__name__)
+
+
+def _kpool_indexers(model):
+    layers = getattr(getattr(model, "model", None), "layers", ())
+    indexers = [
+        getattr(getattr(layer, "self_attn", None), "indexer", None) for layer in layers
+    ]
+    return [
+        indexer
+        for indexer in indexers
+        if indexer is not None and hasattr(indexer, "_kpool_mtp_tail_k")
+    ]
 
 
 def _copy_tails(indexers, requests, accepted):
@@ -40,15 +56,50 @@ class _TailCommitGraph:
         self.graph.replay()
 
 
+def prewarm_kpool_tail_commit_graphs(runner):
+    """Capture every admissible raw batch size before serving requests.
+
+    The ordinary target/draft graphs do not include the post-verify commit.
+    Capturing this auxiliary graph on a DP rank's first smaller batch stalls
+    all EP peers. Negative destination and step indices mask every state
+    load/store in speculative_state_scatter_npu; only private index tensors
+    are changed while these graphs warm and capture.
+    """
+    if (
+        os.getenv("SGLANG_GLM53_MTP_COMMIT_GRAPH", "1") != "1"
+        or runner.is_draft_worker
+        or runner.decode_cuda_graph_runner is None
+    ):
+        return None
+    indexers = _kpool_indexers(runner.model)
+    if not indexers:
+        return None
+    backend = runner.attn_backend
+    if getattr(backend, "_glm53_tail_commit_prewarmed", False):
+        return None
+    capture_bs = runner.decode_cuda_graph_runner.capture_bs
+    max_bs = min(int(runner.max_running_requests), max(capture_bs))
+    if max_bs < 1:
+        raise ValueError("KPool commit warmup requires a positive local capacity")
+    if any(indexer._kpool_mtp_tail_k.shape[0] < max_bs for indexer in indexers):
+        raise ValueError("KPool commit warmup exceeds speculative scratch capacity")
+    device = indexers[0]._kpool_tail_k.device
+    started = time.monotonic()
+    graphs = {}
+    for batch_size in range(1, max_bs + 1):
+        requests = torch.full((batch_size,), -1, dtype=torch.int32, device=device)
+        accepted = torch.full_like(requests, -1)
+        graphs[batch_size] = _TailCommitGraph(indexers, requests, accepted)
+    torch.npu.synchronize()
+    backend._glm53_tail_commit_graphs = graphs
+    backend._glm53_tail_commit_prewarmed = True
+    summary = dict(batch_sizes=list(graphs), elapsed_s=time.monotonic() - started)
+    logger.info("GLM53 MTP tail commit graph startup warmup: %s", summary)
+    return summary
+
+
 def commit_kpool_tails(backend, model, accepted, requests):
-    indexers = [
-        getattr(layer.self_attn, "indexer", None) for layer in model.model.layers
-    ]
-    indexers = [
-        indexer
-        for indexer in indexers
-        if indexer is not None and hasattr(indexer, "_kpool_mtp_tail_k")
-    ]
+    indexers = _kpool_indexers(model)
     if not indexers or not accepted.numel():
         return
     if requests is None:
@@ -57,9 +108,9 @@ def commit_kpool_tails(backend, model, accepted, requests):
     accepted = accepted.to(torch.int32)
     if os.getenv("SGLANG_GLM53_MTP_COMMIT_GRAPH", "1") != "1":
         return _copy_tails(indexers, requests, accepted)
-    graphs = getattr(backend, "_glm53_tail_commit_graphs", None)
-    if graphs is None:
-        graphs = backend._glm53_tail_commit_graphs = {}
-    if accepted.numel() not in graphs:
-        graphs[accepted.numel()] = _TailCommitGraph(indexers, requests, accepted)
-    graphs[accepted.numel()].replay(requests, accepted)
+    graph = getattr(backend, "_glm53_tail_commit_graphs", {}).get(accepted.numel())
+    if graph is None:
+        # Graph-disabled and previously unseen runtime states remain correct
+        # without a device-wide synchronize/capture in the request path.
+        return _copy_tails(indexers, requests, accepted)
+    graph.replay(requests, accepted)
