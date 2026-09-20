@@ -46,6 +46,9 @@ class RouterArgs:
     test_external_dp_routing: bool = False
     mini_lb_prefix_affinity: bool = False
     mini_lb_prefix_affinity_length: int = 256
+    mini_lb_prefix_affinity_decode_capacity: int = 0
+    mini_lb_session_affinity: bool = False
+    mini_lb_session_affinity_idle_timeout_secs: float = 7200.0
     pd_disaggregation: bool = False  # Enable PD disaggregated mode
     prefill_urls: List[tuple] = dataclasses.field(
         default_factory=list
@@ -390,6 +393,29 @@ class RouterArgs:
             type=int,
             default=RouterArgs.mini_lb_prefix_affinity_length,
             help="Hash this many leading token IDs, or Unicode characters for text, for MiniLB prefix affinity (default: 256). Shorter inputs hash their entire content.",
+        )
+        pd_group.add_argument(
+            f"--{prefix}mini-lb-prefix-affinity-decode-capacity",
+            type=int,
+            default=RouterArgs.mini_lb_prefix_affinity_decode_capacity,
+            help=(
+                "Soft per-DP in-flight reservation capacity for bounded MiniLB "
+                "decode prefix affinity. Zero keeps legacy affinity unchanged. "
+                "When an affinity rank reaches this value, route to a least-"
+                "reserved rank below capacity; if every rank is full, retain "
+                "affinity for liveness."
+            ),
+        )
+        pd_group.add_argument(
+            f"--{prefix}mini-lb-session-affinity",
+            action="store_true",
+            help="Keep X-SGLang-Session-ID on one decode DP until X-SGLang-Session-End=1; balance new sessions under the decode affinity capacity.",
+        )
+        pd_group.add_argument(
+            f"--{prefix}mini-lb-session-affinity-idle-timeout-secs",
+            type=float,
+            default=RouterArgs.mini_lb_session_affinity_idle_timeout_secs,
+            help="Expire inactive session bindings after this interval; active requests never expire.",
         )
         pd_group.add_argument(
             f"--{prefix}pd-disaggregation",
@@ -1032,6 +1058,34 @@ class RouterArgs:
         return cls(**args_dict)
 
     def _validate_router_args(self):
+        if self.mini_lb_session_affinity:
+            if (
+                not self.mini_lb_prefix_affinity
+                or self.mini_lb_prefix_affinity_decode_capacity <= 0
+            ):
+                raise ValueError(
+                    "--mini-lb-session-affinity requires prefix affinity and a positive decode capacity"
+                )
+            if not 0 < self.mini_lb_session_affinity_idle_timeout_secs < float("inf"):
+                raise ValueError(
+                    "session affinity idle timeout must be finite and positive"
+                )
+            if not 0 < self.request_timeout_secs < float("inf"):
+                raise ValueError(
+                    "session affinity request timeout must be finite and positive"
+                )
+        if self.mini_lb_prefix_affinity_decode_capacity < 0:
+            raise ValueError(
+                "--mini-lb-prefix-affinity-decode-capacity must be nonnegative"
+            )
+        if (
+            self.mini_lb_prefix_affinity_decode_capacity > 0
+            and not self.mini_lb_prefix_affinity
+        ):
+            raise ValueError(
+                "--mini-lb-prefix-affinity-decode-capacity requires "
+                "--mini-lb-prefix-affinity"
+            )
         if self.mini_lb_prefix_affinity:
             if not self.mini_lb or not self.pd_disaggregation:
                 raise ValueError(

@@ -16,15 +16,129 @@ from typing import Optional
 import aiohttp
 import orjson
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from sglang_router.router_args import RouterArgs
+from sglang_router.session_affinity import SessionAffinity, SessionReservation
 
 logger = logging.getLogger(__name__)
 
 AIOHTTP_STREAM_READ_CHUNK_SIZE = (
     1024 * 64
 )  # 64KB, to prevent aiohttp's "Chunk too big" error
+
+
+class _SessionStreamStatus:
+    """Observe native SSE completion without changing forwarded bytes.
+
+    HTTP 200 alone does not distinguish application errors or a truncated SSE
+    stream. Bound the observer's memory even for a malformed upstream response.
+    """
+
+    def __init__(self):
+        self.pending = b""
+        self.data = []
+        self.frame_size = 0
+        self.failed = False
+        self.done = False
+        self.finished = False
+
+    def feed(self, chunk):
+        if self.failed:
+            return
+        self.pending += chunk
+        while b"\n" in self.pending:
+            line, self.pending = self.pending.split(b"\n", 1)
+            line = line.removesuffix(b"\r")
+            self.frame_size += len(line)
+            if self.frame_size > 8 * 1024 * 1024:
+                self.failed = True
+                break
+            if line.startswith(b"data:"):
+                self.data.append(line[5:].lstrip(b" "))
+            elif not line:
+                if self.data:
+                    self._event(b"\n".join(self.data))
+                self.data = []
+                self.frame_size = 0
+        if self.frame_size + len(self.pending) > 8 * 1024 * 1024:
+            self.failed = True
+        if self.failed:
+            self.pending = b""
+            self.data = []
+
+    def _event(self, data):
+        if self.done:
+            self.failed = True
+            return
+        if data == b"[DONE]":
+            self.done = True
+            return
+        if self.finished:
+            self.failed = True
+            return
+        try:
+            obj = orjson.loads(data)
+            if not isinstance(obj, dict) or "error" in obj:
+                self.failed = True
+                return
+            reason = obj.get("meta_info", {}).get("finish_reason")
+            if reason is not None:
+                if not isinstance(reason, dict) or reason.get("type") not in (
+                    "length",
+                    "stop",
+                ):
+                    self.failed = True
+                else:
+                    self.finished = True
+        except (ValueError, TypeError, AttributeError):
+            self.failed = True
+
+    @property
+    def successful(self):
+        return (
+            self.done
+            and self.finished
+            and not self.failed
+            and not self.pending.strip()
+            and not self.data
+        )
+
+
+class _DecodeReservation:
+    """An event-loop-local, idempotently released D-rank reservation."""
+
+    __slots__ = ("_owner", "rank", "_released")
+
+    def __init__(self, owner, rank):
+        self._owner = owner
+        self.rank = rank
+        self._released = False
+
+    def release(self):
+        if self._released:
+            return False
+        self._released = True
+        self._owner._release_decode_reservation(self.rank)
+        return True
+
+
+class _ReservationStreamingResponse(StreamingResponse):
+    """Keep a D reservation until streaming completion or disconnect."""
+
+    def __init__(self, *args, decode_reservation, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._decode_reservation = decode_reservation
+
+    async def __call__(self, scope, receive, send):
+        try:
+            return await super().__call__(scope, receive, send)
+        except BaseException:
+            if isinstance(self._decode_reservation, SessionReservation):
+                self._decode_reservation.mark_failed()
+            raise
+        finally:
+            self._decode_reservation.release()
 
 
 def maybe_wrap_ipv6_address(address: str) -> str:
@@ -51,18 +165,42 @@ class MiniLoadBalancer:
         self.test_external_dp_routing = router_args.test_external_dp_routing
         self.prefix_affinity = router_args.mini_lb_prefix_affinity
         self.affinity_prefix_length = router_args.mini_lb_prefix_affinity_length
+        self.affinity_decode_capacity = (
+            router_args.mini_lb_prefix_affinity_decode_capacity
+        )
+        self.session_affinity_enabled = router_args.mini_lb_session_affinity
+        self.session_affinity_idle_timeout = (
+            router_args.mini_lb_session_affinity_idle_timeout_secs
+        )
+        self._session_affinity = None
         self.prefill_dp_size = None
         self.decode_dp_size = None
         self._dp_size_lock = asyncio.Lock()
+        self._decode_inflight_reservations = []
+        self._decode_reservation_total = 0
+        self._decode_reservation_overrides = 0
+        self._decode_reservation_all_full_fallbacks = 0
         # A fresh random starting point avoids predictable reuse across restarts;
         # the counter guarantees distinct rooms within this router process.
         self._affinity_rooms = (
             count(random.getrandbits(62)) if self.prefix_affinity else None
         )
+        if self.affinity_decode_capacity:
+            logger.warning(
+                "[MiniLB] Bounded decode affinity enabled: capacity=%d, "
+                "router-local in-flight reservations only; all-full falls back "
+                "to affinity.",
+                self.affinity_decode_capacity,
+            )
 
     def _validate_router_args(self, router_args: RouterArgs):
-        if router_args.mini_lb_prefix_affinity:
+        if (
+            router_args.mini_lb_prefix_affinity
+            or router_args.mini_lb_prefix_affinity_decode_capacity
+            or router_args.mini_lb_session_affinity
+        ):
             router_args._validate_router_args()
+        if router_args.mini_lb_prefix_affinity:
             logger.warning(
                 "[MiniLB] Prefix affinity enabled: deterministic DP ranks, "
                 "no cache occupancy or load feedback; hot prefixes can queue."
@@ -142,6 +280,8 @@ class MiniLoadBalancer:
                 ) from exc
             # Publish both only after both workers have supplied valid metadata.
             self.prefill_dp_size, self.decode_dp_size = sizes
+            if self.affinity_decode_capacity:
+                self._decode_inflight_reservations = [0] * self.decode_dp_size
             logger.info(
                 "[MiniLB] Prefix affinity DP sizes: prefill=%d, decode=%d",
                 self.prefill_dp_size,
@@ -200,22 +340,139 @@ class MiniLoadBalancer:
         )
         return int.from_bytes(hashlib.sha256(key).digest()[:8], "big")
 
-    async def _prepare_affinity_requests(self, request, endpoint):
+    def _reserve_decode_rank(self, affinity_rank, digest):
+        """Select and reserve one valid D rank without yielding the event loop.
+
+        The capacity is deliberately soft: when every rank is at capacity, the
+        original affinity rank is retained. This preserves liveness and prefix
+        behavior during bursts while making the overload visible in the local
+        reservation counters.
+        """
+        counts = self._decode_inflight_reservations
+        if len(counts) != self.decode_dp_size:
+            raise HTTPException(
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                detail="Bounded decode affinity is not initialized",
+            )
+        if not 0 <= affinity_rank < len(counts):
+            raise HTTPException(
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                detail="Affinity selected an invalid decode DP rank",
+            )
+
+        selected_rank = affinity_rank
+        if counts[affinity_rank] >= self.affinity_decode_capacity:
+            eligible = [
+                rank
+                for rank, inflight in enumerate(counts)
+                if inflight < self.affinity_decode_capacity
+            ]
+            if eligible:
+                minimum = min(counts[rank] for rank in eligible)
+                least_reserved = [rank for rank in eligible if counts[rank] == minimum]
+                # Rotate deterministic ties by the affinity key. Repeated hot
+                # prefixes still spread because every reservation updates counts
+                # atomically before the next backend await.
+                selected_rank = least_reserved[digest % len(least_reserved)]
+                self._decode_reservation_overrides += 1
+            else:
+                self._decode_reservation_all_full_fallbacks += 1
+
+        counts[selected_rank] += 1
+        self._decode_reservation_total += 1
+        return selected_rank, _DecodeReservation(self, selected_rank)
+
+    def _release_decode_reservation(self, rank):
+        counts = self._decode_inflight_reservations
+        if not 0 <= rank < len(counts) or counts[rank] <= 0:
+            logger.error(
+                "[MiniLB] Invalid decode reservation release: rank=%s counts=%s",
+                rank,
+                counts,
+            )
+            return
+        counts[rank] -= 1
+        if self._session_affinity is not None:
+            self._session_affinity.changed.set()
+
+    def decode_affinity_snapshot(self):
+        return {
+            "enabled": bool(self.affinity_decode_capacity),
+            "capacity": self.affinity_decode_capacity,
+            "inflight_by_rank": list(self._decode_inflight_reservations),
+            "total_reservations": self._decode_reservation_total,
+            "overrides": self._decode_reservation_overrides,
+            "all_full_fallbacks": self._decode_reservation_all_full_fallbacks,
+        }
+
+    def _session_state(self):
+        if self._session_affinity is None:
+            self._session_affinity = SessionAffinity(
+                self._decode_inflight_reservations,
+                self.affinity_decode_capacity,
+                self.session_affinity_idle_timeout,
+                self.timeout,
+            )
+        return self._session_affinity
+
+    def session_context(self, headers):
+        session_id = headers.get("x-sglang-session-id")
+        ending = headers.get("x-sglang-session-end")
+        if not self.session_affinity_enabled:
+            return None
+        if session_id is None:
+            if ending is not None:
+                raise HTTPException(400, "Session end requires a session ID")
+            return None  # Legacy callers retain the original cap2 policy.
+        if ending not in (None, "0", "1"):
+            raise HTTPException(400, "X-SGLang-Session-End must be 0 or 1")
+        try:
+            SessionAffinity.key(session_id, {})
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return session_id, ending == "1"
+
+    async def _prepare_affinity_requests(self, request, endpoint, session_context=None):
         if endpoint != "generate":
             raise HTTPException(400, "MiniLB prefix affinity supports only /generate")
         digest = self._affinity_digest(request)
         await self._ensure_dp_sizes()
         p_rank = digest % self.prefill_dp_size
         d_rank = digest % self.decode_dp_size
+        decode_reservation = None
         prefill_req, decode_req = request.copy(), request.copy()
         # Remove nullable aliases too, so each body has one authoritative rank.
         for body in (prefill_req, decode_req):
             body.pop("data_parallel_rank", None)
             body.pop("disagg_prefill_dp_rank", None)
         prefill_req["routed_dp_rank"] = p_rank
+        if session_context is not None:
+            if not self.session_affinity_enabled:
+                raise HTTPException(400, "Session affinity is disabled")
+            session_id, final = session_context
+            try:
+                decode_reservation = await self._session_state().reserve(
+                    session_id,
+                    request,
+                    d_rank,
+                    final=final,
+                )
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+            except TimeoutError as exc:
+                raise HTTPException(503, str(exc)) from exc
+            selected = decode_reservation.rank
+            self._decode_reservation_total += 1
+            self._decode_reservation_overrides += int(selected != d_rank)
+            d_rank = selected
+        elif self.affinity_decode_capacity:
+            # There is no await between observing counts and incrementing the
+            # selected rank, so concurrent asyncio requests cannot overselect a
+            # stale minimum within this router process.
+            d_rank, decode_reservation = self._reserve_decode_rank(d_rank, digest)
         decode_req["routed_dp_rank"] = d_rank
         decode_req["disagg_prefill_dp_rank"] = p_rank
-        return prefill_req, decode_req
+        return prefill_req, decode_req, decode_reservation
 
     def new_bootstrap_room(self):
         if not self.prefix_affinity:
@@ -249,14 +506,24 @@ class MiniLoadBalancer:
         )
 
     async def generate(
-        self, modified_request, prefill_server, decode_server, endpoint
+        self,
+        modified_request,
+        prefill_server,
+        decode_server,
+        endpoint,
+        session_context=None,
     ) -> ORJSONResponse:
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
         expected_decode_dp_rank = None
+        decode_reservation = None
         if self.prefix_affinity:
-            prefill_req, decode_req = await self._prepare_affinity_requests(
-                modified_request, endpoint
+            (
+                prefill_req,
+                decode_req,
+                decode_reservation,
+            ) = await self._prepare_affinity_requests(
+                modified_request, endpoint, session_context
             )
         elif self.test_external_dp_routing:
             await self._ensure_dp_sizes()
@@ -267,64 +534,95 @@ class MiniLoadBalancer:
             prefill_req = modified_request
             decode_req = modified_request
 
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(
-                total=self.timeout
-            )  # Add timeout for request reliability
-        ) as session:
-            tasks = [
-                session.post(f"{prefill_server}/{endpoint}", json=prefill_req),
-                session.post(f"{decode_server}/{endpoint}", json=decode_req),
-            ]
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(
+                    total=self.timeout
+                )  # Add timeout for request reliability
+            ) as session:
+                tasks = [
+                    session.post(f"{prefill_server}/{endpoint}", json=prefill_req),
+                    session.post(f"{decode_server}/{endpoint}", json=decode_req),
+                ]
 
-            # Wait for both responses to complete. Prefill should end first.
-            prefill_response, decode_response = await asyncio.gather(*tasks)
+                # Wait for both responses to complete. Prefill should end first.
+                prefill_response, decode_response = await asyncio.gather(*tasks)
 
-            if "return_logprob" in modified_request:
-                prefill_json = await prefill_response.json()
-                ret_json = await decode_response.json()
+                if "return_logprob" in modified_request:
+                    prefill_json = await prefill_response.json()
+                    ret_json = await decode_response.json()
 
-                # merge `meta_info.input_token_logprobs` from prefill to decode
-                if "meta_info" in ret_json:
-                    if "input_token_logprobs" in ret_json["meta_info"]:
-                        ret_json["meta_info"]["input_token_logprobs"] = (
-                            prefill_json["meta_info"]["input_token_logprobs"]
-                            + ret_json["meta_info"]["input_token_logprobs"]
+                    # merge `meta_info.input_token_logprobs` from prefill to decode
+                    if "meta_info" in ret_json:
+                        if "input_token_logprobs" in ret_json["meta_info"]:
+                            ret_json["meta_info"]["input_token_logprobs"] = (
+                                prefill_json["meta_info"]["input_token_logprobs"]
+                                + ret_json["meta_info"]["input_token_logprobs"]
+                            )
+                else:
+                    ret_json = await decode_response.json()
+
+                if expected_decode_dp_rank is not None:
+                    actual = ret_json.get("meta_info", {}).get("dp_rank")
+                    if actual != expected_decode_dp_rank:
+                        return ORJSONResponse(
+                            content={
+                                "error": f"DP rank mismatch: expected {expected_decode_dp_rank}, got {actual}"
+                            },
+                            status_code=500,
                         )
-            else:
-                ret_json = await decode_response.json()
 
-            if expected_decode_dp_rank is not None:
-                actual = ret_json.get("meta_info", {}).get("dp_rank")
-                if actual != expected_decode_dp_rank:
-                    return ORJSONResponse(
-                        content={
-                            "error": f"DP rank mismatch: expected {expected_decode_dp_rank}, got {actual}"
-                        },
-                        status_code=500,
-                    )
-
-            return ORJSONResponse(
-                content=ret_json,
-                status_code=decode_response.status,
-            )
+                headers = None
+                if isinstance(decode_reservation, SessionReservation):
+                    if (
+                        prefill_response.status == decode_response.status == 200
+                        and "error" not in ret_json
+                    ):
+                        decode_reservation.mark_successful()
+                    headers = {
+                        "X-SGLang-Session-Affinity": "1",
+                        "X-SGLang-Decode-DP": str(decode_reservation.rank),
+                    }
+                return ORJSONResponse(
+                    content=ret_json,
+                    status_code=decode_response.status,
+                    headers=headers,
+                )
+        finally:
+            if decode_reservation is not None:
+                decode_reservation.release()
 
     async def generate_stream(
-        self, modified_request, prefill_server, decode_server, endpoint="generate"
+        self,
+        modified_request,
+        prefill_server,
+        decode_server,
+        endpoint="generate",
+        session_context=None,
     ):
         if self.test_external_dp_routing:
             warnings.warn("--test-external-dp-routing is not supported with streaming")
 
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
+        decode_reservation = None
         if self.prefix_affinity:
-            prefill_req, decode_req = await self._prepare_affinity_requests(
-                modified_request, endpoint
+            (
+                prefill_req,
+                decode_req,
+                decode_reservation,
+            ) = await self._prepare_affinity_requests(
+                modified_request, endpoint, session_context
             )
         else:
             prefill_req = decode_req = modified_request
 
         async def stream_results():
+            stream_status = (
+                _SessionStreamStatus()
+                if isinstance(decode_reservation, SessionReservation)
+                else None
+            )
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(
                     total=self.timeout
@@ -350,6 +648,8 @@ class MiniLoadBalancer:
                     first_prefill_chunk_json = orjson.loads(first_prefill_chunk)
 
                     async for chunk in decode_response.content:
+                        if stream_status is not None:
+                            stream_status.feed(chunk)
                         # Note: This is inefficient
                         # merge prefill input_token_logprobs, output_token_logprobs to decode
                         decoded_chunk = chunk.decode("utf-8")
@@ -373,12 +673,38 @@ class MiniLoadBalancer:
                     async for chunk in decode_response.content.iter_chunked(
                         AIOHTTP_STREAM_READ_CHUNK_SIZE
                     ):
+                        if stream_status is not None:
+                            stream_status.feed(chunk)
                         yield chunk
+                if isinstance(decode_reservation, SessionReservation):
+                    if (
+                        prefill_response.status == decode_response.status == 200
+                        and stream_status.successful
+                    ):
+                        decode_reservation.mark_successful()
 
-        return StreamingResponse(
-            stream_results(),
-            media_type="text/event-stream",
-        )
+        if decode_reservation is None:
+            return StreamingResponse(
+                stream_results(),
+                media_type="text/event-stream",
+            )
+        try:
+            return _ReservationStreamingResponse(
+                stream_results(),
+                media_type="text/event-stream",
+                decode_reservation=decode_reservation,
+                headers=(
+                    {
+                        "X-SGLang-Session-Affinity": "1",
+                        "X-SGLang-Decode-DP": str(decode_reservation.rank),
+                    }
+                    if isinstance(decode_reservation, SessionReservation)
+                    else None
+                ),
+            )
+        except BaseException:
+            decode_reservation.release()
+            raise
 
 
 app = FastAPI()
@@ -442,14 +768,14 @@ async def get_server_info():
 
     # Return format expected by bench_one_batch_server.py
     if all_internal_states:
-        return {
+        result = {
             "internal_states": all_internal_states,
             "prefill": prefill_infos,
             "decode": decode_infos,
         }
     else:
         # Fallback with dummy data if no internal states found
-        return {
+        result = {
             "internal_states": [
                 {
                     "last_gen_throughput": 0.0,
@@ -459,6 +785,12 @@ async def get_server_info():
             "prefill": prefill_infos,
             "decode": decode_infos,
         }
+    if lb.affinity_decode_capacity:
+        result["mini_lb_decode_affinity"] = lb.decode_affinity_snapshot()
+    if lb.session_affinity_enabled:
+        await lb._ensure_dp_sizes()
+        result["mini_lb_session_affinity"] = lb._session_state().snapshot()
+    return result
 
 
 async def _get_model_info_impl():
@@ -505,7 +837,8 @@ async def get_model_info():
 
 
 @app.post("/generate")
-async def handle_generate_request(request_data: dict):
+async def handle_generate_request(request_data: dict, request: Request = None):
+    session_context = lb.session_context(request.headers if request is not None else {})
     if lb.prefix_affinity:
         # Validate before batch-shape inference and before either PD request.
         lb._affinity_digest(request_data)
@@ -536,11 +869,19 @@ async def handle_generate_request(request_data: dict):
 
     if request_data.get("stream", False):
         return await lb.generate_stream(
-            modified_request, prefill_server, decode_server, "generate"
+            modified_request,
+            prefill_server,
+            decode_server,
+            "generate",
+            session_context=session_context,
         )
     else:
         return await lb.generate(
-            modified_request, prefill_server, decode_server, "generate"
+            modified_request,
+            prefill_server,
+            decode_server,
+            "generate",
+            session_context=session_context,
         )
 
 

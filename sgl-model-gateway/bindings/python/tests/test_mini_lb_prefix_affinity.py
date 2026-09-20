@@ -93,6 +93,7 @@ class Backend:
 class ConfigTests(unittest.TestCase):
     def test_flags_parse_and_default_is_off(self):
         self.assertFalse(RouterArgs().mini_lb_prefix_affinity)
+        self.assertEqual(RouterArgs().mini_lb_prefix_affinity_decode_capacity, 0)
         args = parse_router_args(
             [
                 "--mini-lb",
@@ -100,6 +101,8 @@ class ConfigTests(unittest.TestCase):
                 "--mini-lb-prefix-affinity",
                 "--mini-lb-prefix-affinity-length",
                 "256",
+                "--mini-lb-prefix-affinity-decode-capacity",
+                "4",
                 "--prefill",
                 "http://prefill:31194",
                 "8998",
@@ -110,6 +113,7 @@ class ConfigTests(unittest.TestCase):
         args._validate_router_args()
         self.assertTrue(args.mini_lb_prefix_affinity)
         self.assertEqual(args.mini_lb_prefix_affinity_length, 256)
+        self.assertEqual(args.mini_lb_prefix_affinity_decode_capacity, 4)
 
     def test_invalid_flag_combinations_fail_at_startup(self):
         for updates in (
@@ -120,6 +124,11 @@ class ConfigTests(unittest.TestCase):
             dict(prefill_urls=[]),
             dict(decode_urls=["http://d1", "http://d2"]),
             dict(test_external_dp_routing=True),
+            dict(mini_lb_prefix_affinity_decode_capacity=-1),
+            dict(
+                mini_lb_prefix_affinity=False,
+                mini_lb_prefix_affinity_decode_capacity=4,
+            ),
         ):
             with self.subTest(updates=updates), self.assertRaises(ValueError):
                 mini_lb.MiniLoadBalancer(make_args(**updates))
