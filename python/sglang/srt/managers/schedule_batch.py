@@ -980,6 +980,7 @@ class Req(ReqDllmMixin):
         multi_item_delimiter_indices: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        disagg_decode_dp_rank: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -1296,6 +1297,7 @@ class Req(ReqDllmMixin):
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank
+        self.disagg_decode_dp_rank: Optional[int] = disagg_decode_dp_rank
 
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.

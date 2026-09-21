@@ -351,6 +351,11 @@ class GenerateReqInput:
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[Union[List[str], str]] = None
 
+    # Router-only hint for the final decode attention-DP rank. The generic
+    # request API accepts any nonnegative rank; topology checks belong to the
+    # opt-in GLM53 scheduler profile.
+    disagg_decode_dp_rank: Optional[Union[List[int], int]] = None
+
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
         if isinstance(self.rid, list):
@@ -538,6 +543,11 @@ class GenerateReqInput:
             self.token_ids_logprob = None
         if self.return_sampling_mask is None:
             self.return_sampling_mask = False
+        if self.disagg_decode_dp_rank is not None and (
+            type(self.disagg_decode_dp_rank) is not int
+            or self.disagg_decode_dp_rank < 0
+        ):
+            raise ValueError("disagg_decode_dp_rank must be a nonnegative integer.")
         for field_name in ("extra_key", "cache_salt"):
             value = getattr(self, field_name)
             if value is not None and not isinstance(value, str):
@@ -571,6 +581,7 @@ class GenerateReqInput:
         self._normalize_extra_key(num)
         self._normalize_cache_salt(num)
         self._normalize_bootstrap_params(num)
+        self._normalize_disagg_decode_dp_rank(num)
 
     def _expand_inputs(self, num):
         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
@@ -831,6 +842,28 @@ class GenerateReqInput:
         else:
             raise ValueError("cache_salt should be a list or a string.")
 
+    def _normalize_disagg_decode_dp_rank(self, num):
+        """Normalize the Gateway's destination-rank hint for a batch."""
+        value = self.disagg_decode_dp_rank
+        if value is None:
+            return
+        if type(value) is int:
+            if value < 0:
+                raise ValueError(
+                    "disagg_decode_dp_rank must be a nonnegative integer."
+                )
+            self.disagg_decode_dp_rank = [value] * num
+            return
+        if not isinstance(value, list) or len(value) != self.batch_size:
+            raise ValueError(
+                "The length of disagg_decode_dp_rank must equal the batch size."
+            )
+        if any(type(rank) is not int or rank < 0 for rank in value):
+            raise ValueError(
+                "Every disagg_decode_dp_rank must be a nonnegative integer."
+            )
+        self.disagg_decode_dp_rank = value * self.parallel_sample_num
+
     def _normalize_bootstrap_params(self, num):
         """Normalize bootstrap parameters for batch processing."""
         # Normalize bootstrap_host
@@ -974,6 +1007,11 @@ class GenerateReqInput:
                 if self.multi_item_delimiter_indices is not None
                 else None
             ),
+            disagg_decode_dp_rank=(
+                self.disagg_decode_dp_rank[i]
+                if isinstance(self.disagg_decode_dp_rank, list)
+                else self.disagg_decode_dp_rank
+            ),
         )
         cache[i] = sub
         return sub
@@ -1077,6 +1115,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[str] = None
+
+    # Gateway-only final destination attention-DP rank. Keep this trailing and
+    # optional so a new decoder accepts older, shorter array-like payloads.
+    disagg_decode_dp_rank: Optional[int] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)

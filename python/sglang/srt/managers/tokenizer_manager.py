@@ -1447,6 +1447,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 num_items_assigned=obj.num_items_assigned,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                 encoder_urls=obj.encoder_urls,
+                disagg_decode_dp_rank=obj.disagg_decode_dp_rank,
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
