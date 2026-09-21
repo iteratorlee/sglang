@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Callable
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.load_snapshot import (
     DisaggregationMetrics,
+    KVCapacityMetrics,
     LoadSnapshot,
     LoRAMetrics,
     MemoryMetrics,
@@ -127,9 +128,8 @@ class SchedulerLoadInquirer:
             )
 
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
-        num_used_tokens, kv_token_usage = (
-            self.pool_stats_observer.get_pool_stats().get_kv_token_stats()
-        )
+        pool_stats = self.pool_stats_observer.get_pool_stats()
+        num_used_tokens, kv_token_usage = pool_stats.get_kv_token_stats()
         num_total_tokens = num_used_tokens + sum(
             req.seqlen for queue in pending_token_queues for req in queue
         )
@@ -211,12 +211,57 @@ class SchedulerLoadInquirer:
             prealloc_ready=decode_prealloc_ready,
         )
 
+        # These values are already maintained by SchedulerPoolStatsObserver on
+        # the host.  In particular, do not derive free capacity as
+        # max_total_num_tokens - num_used_tokens: cached-but-evictable KV and
+        # hybrid pool constraints make that quantity ambiguous.
+        request_slots_available = None
+        try:
+            request_slots_available = int(
+                self.pool_stats_observer.req_to_token_pool.available_size()
+            )
+        except (AttributeError, TypeError, ValueError):
+            # Some lightweight/non-standard observers do not expose the request
+            # pool.  Keep the section useful and omit this optional counter.
+            pass
+
+        kv_capacity = KVCapacityMetrics(
+            full_available_tokens=int(pool_stats.full_available_size),
+            full_evictable_tokens=int(pool_stats.full_evictable_size),
+            swa_available_tokens=(
+                int(pool_stats.swa_available_size)
+                if pool_stats.is_hybrid_swa
+                and pool_stats.swa_available_size is not None
+                else None
+            ),
+            swa_evictable_tokens=(
+                int(pool_stats.swa_evictable_size)
+                if pool_stats.is_hybrid_swa
+                and pool_stats.swa_evictable_size is not None
+                else None
+            ),
+            mamba_available_slots=(
+                int(pool_stats.mamba_available_size)
+                if pool_stats.is_hybrid_ssm
+                and pool_stats.mamba_available_size is not None
+                else None
+            ),
+            mamba_evictable_slots=(
+                int(pool_stats.mamba_evictable_size)
+                if pool_stats.is_hybrid_ssm
+                and pool_stats.mamba_evictable_size is not None
+                else None
+            ),
+            request_slots_available=request_slots_available,
+        )
+
         totals = self.get_decode_moment_totals()
         decode_moments = list(totals) if totals[0] > 0 else None
 
         return LoadSnapshot(
             dp_rank=int(self.ps.dp_rank) if self.ps.dp_rank is not None else 0,
             timestamp=time.time(),
+            snapshot_monotonic_s=time.monotonic(),
             num_running_reqs=num_running_reqs,
             num_waiting_reqs=num_waiting_reqs,
             num_waiting_uncached_tokens=self.get_num_waiting_uncached_tokens(),
@@ -235,6 +280,7 @@ class SchedulerLoadInquirer:
             lora=lora,
             disaggregation=disaggregation,
             queues=queues,
+            kv_capacity=kv_capacity,
             total_prefill_uncached_tokens=self.get_total_prefill_uncached_tokens(),
             total_prefill_busy_us=self.get_total_prefill_busy_us(),
             decode_moments=decode_moments,

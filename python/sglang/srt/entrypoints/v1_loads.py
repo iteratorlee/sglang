@@ -106,7 +106,8 @@ async def get_loads(
     Query Parameters:
         dp_rank: Filter to specific DP rank (optional)
         include: Comma-separated sections to include (optional)
-                 Options: core, memory, spec, lora, disagg, queues, all
+                 Options: core, memory, spec, lora, disagg, queues,
+                 kv_capacity, all
                  Default: all
         format: Response format - 'json' (default) or 'prometheus'
 
@@ -143,6 +144,9 @@ async def get_loads(
 
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        # Same-host companion for each load's snapshot_monotonic_s.  The
+        # Gateway must not subtract monotonic clocks sampled on other hosts.
+        "server_monotonic_s": time.monotonic(),
         "version": __version__,
         "accelerator": _accelerator_name(),
         "num_accelerators": _num_accelerators_per_dp_rank(

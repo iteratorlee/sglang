@@ -182,10 +182,35 @@ class QueueMetrics(msgspec.Struct, array_like=True):
     prealloc_ready: int
 
 
+class KVCapacityMetrics(msgspec.Struct, omit_defaults=True):
+    """Host-side KV/request capacity counters from the scheduler observer.
+
+    Available and evictable capacity deliberately remain separate.  Evictable
+    prefix-cache tokens are not necessarily safe admission headroom for one
+    request: eviction is page-granular and may be constrained by protected
+    cache nodes and other pool ends.
+    """
+
+    full_available_tokens: int
+    full_evictable_tokens: int
+    swa_available_tokens: Optional[int] = None
+    swa_evictable_tokens: Optional[int] = None
+    mamba_available_slots: Optional[int] = None
+    mamba_evictable_slots: Optional[int] = None
+    request_slots_available: Optional[int] = None
+
+
 # LoadSnapshot's nested sub-struct fields; every other struct field is a flat
 # scalar returned under "core".
 _SECTION_FIELDS = frozenset(
-    {"memory", "speculative", "lora", "disaggregation", "queues"}
+    {
+        "memory",
+        "speculative",
+        "lora",
+        "disaggregation",
+        "queues",
+        "kv_capacity",
+    }
 )
 
 
@@ -193,6 +218,9 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     """Per-DP-rank load metrics: the SHM/zmq wire format and the /v1/loads source."""
 
     timestamp: float = 0.0
+    # Comparable across processes on the same host.  Unlike ``timestamp``, this
+    # is immune to wall-clock adjustments; it must not be compared across hosts.
+    snapshot_monotonic_s: float = 0.0
     dp_rank: int = 0
     num_running_reqs: int = 0
     num_waiting_reqs: int = 0
@@ -220,9 +248,19 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     lora: Optional[LoRAMetrics] = None
     disaggregation: Optional[DisaggregationMetrics] = None
     queues: Optional[QueueMetrics] = None
+    kv_capacity: Optional[KVCapacityMetrics] = None
 
     VALID_SECTIONS = frozenset(
-        {"core", "memory", "spec", "lora", "disagg", "queues", "all"}
+        {
+            "core",
+            "memory",
+            "spec",
+            "lora",
+            "disagg",
+            "queues",
+            "kv_capacity",
+            "all",
+        }
     )
 
     def to_dict(self, include: Optional[set[str]] = None) -> dict:
@@ -246,10 +284,18 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
             ("lora", "lora", self.lora),
             ("disaggregation", "disagg", self.disaggregation),
             ("queues", "queues", self.queues),
+            ("kv_capacity", "kv_capacity", self.kv_capacity),
         ):
             if section is None or (not include_all and include_name not in include):
                 continue
-            load[field] = msgspec.structs.asdict(section)
+            section_dict = msgspec.structs.asdict(section)
+            if field == "kv_capacity":
+                section_dict = {
+                    key: value
+                    for key, value in section_dict.items()
+                    if value is not None
+                }
+            load[field] = section_dict
 
         return load
 

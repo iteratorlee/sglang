@@ -7,7 +7,10 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import msgspec
+
 from sglang.srt.managers.load_snapshot import (
+    KVCapacityMetrics,
     LoadSnapshot,
     ShmLoadSnapshotReader,
     ShmLoadSnapshotWriter,
@@ -111,6 +114,95 @@ class TestShmRoundTrip(CustomTestCase):
             writer.close()
             if os.path.exists(path):
                 os.unlink(path)
+
+    def test_capacity_section_round_trip_and_filtering(self):
+        path = _temp_path()
+        writer = ShmLoadSnapshotWriter(path, dp_size=1, dp_rank=0)
+        reader = ShmLoadSnapshotReader(path, dp_size=1)
+        try:
+            writer.write(
+                LoadSnapshot(
+                    dp_rank=0,
+                    snapshot_monotonic_s=42.25,
+                    kv_capacity=KVCapacityMetrics(
+                        full_available_tokens=520640,
+                        full_evictable_tokens=8192,
+                        mamba_available_slots=6,
+                        mamba_evictable_slots=0,
+                        request_slots_available=1,
+                    ),
+                )
+            )
+            load = reader.read(0)
+            self.assertIsNotNone(load)
+            self.assertEqual(load.snapshot_monotonic_s, 42.25)
+            self.assertEqual(load.kv_capacity.full_available_tokens, 520640)
+
+            core = load.to_dict({"core"})
+            self.assertEqual(core["snapshot_monotonic_s"], 42.25)
+            self.assertNotIn("kv_capacity", core)
+
+            capacity_only = load.to_dict({"kv_capacity"})
+            self.assertEqual(
+                capacity_only["kv_capacity"],
+                {
+                    "full_available_tokens": 520640,
+                    "full_evictable_tokens": 8192,
+                    "mamba_available_slots": 6,
+                    "mamba_evictable_slots": 0,
+                    "request_slots_available": 1,
+                },
+            )
+            self.assertNotIn("swa_available_tokens", capacity_only["kv_capacity"])
+            without_request_slots = LoadSnapshot(
+                kv_capacity=KVCapacityMetrics(
+                    full_available_tokens=1024,
+                    full_evictable_tokens=256,
+                )
+            ).to_dict({"kv_capacity"})
+            self.assertNotIn(
+                "request_slots_available",
+                without_request_slots["kv_capacity"],
+            )
+        finally:
+            reader.close()
+            writer.close()
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def test_capacity_wire_is_backward_compatible(self):
+        # A new decoder accepts a legacy map without either new field.
+        legacy_payload = msgspec.msgpack.encode(
+            {"timestamp": 1.5, "dp_rank": 2, "num_running_reqs": 7}
+        )
+        decoded = msgspec.msgpack.decode(legacy_payload, type=LoadSnapshot)
+        self.assertEqual(decoded.snapshot_monotonic_s, 0.0)
+        self.assertIsNone(decoded.kv_capacity)
+
+        # LoadSnapshot is map-shaped and the old reader's default behavior is
+        # to ignore unknown fields, so new payloads remain readable during a
+        # rolling Python/native Gateway upgrade.
+        class LegacyLoadSnapshot(msgspec.Struct, omit_defaults=True):
+            timestamp: float = 0.0
+            dp_rank: int = 0
+            num_running_reqs: int = 0
+
+        new_payload = msgspec.msgpack.encode(
+            LoadSnapshot(
+                timestamp=2.5,
+                snapshot_monotonic_s=11.0,
+                dp_rank=4,
+                num_running_reqs=9,
+                kv_capacity=KVCapacityMetrics(
+                    full_available_tokens=1024,
+                    full_evictable_tokens=256,
+                ),
+            )
+        )
+        legacy = msgspec.msgpack.decode(new_payload, type=LegacyLoadSnapshot)
+        self.assertEqual(legacy.timestamp, 2.5)
+        self.assertEqual(legacy.dp_rank, 4)
+        self.assertEqual(legacy.num_running_reqs, 9)
 
     def test_multi_rank_write_read_all(self):
         path = _temp_path()

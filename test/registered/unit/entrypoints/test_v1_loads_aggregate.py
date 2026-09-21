@@ -117,6 +117,23 @@ class TestLoadsResponse(CustomTestCase):
         self.assertEqual(response["loads"][0]["num_running_reqs"], 3)
         self.assertEqual(response["loads"][0]["num_waiting_reqs"], 2)
 
+    def test_response_reports_same_host_monotonic_clock(self):
+        manager = _FakeHttpTokenizerManager(
+            [LoadSnapshot(dp_rank=0, snapshot_monotonic_s=120.25)]
+        )
+        self.addCleanup(manager.restore)
+
+        with mock.patch.object(v1_loads.time, "monotonic", return_value=123.5):
+            response = asyncio.run(get_loads(tokenizer_manager=manager))
+
+        self.assertEqual(response["server_monotonic_s"], 123.5)
+        self.assertEqual(response["loads"][0]["snapshot_monotonic_s"], 120.25)
+        self.assertEqual(
+            response["server_monotonic_s"]
+            - response["loads"][0]["snapshot_monotonic_s"],
+            3.25,
+        )
+
 
 class TestLoadsAcceleratorField(CustomTestCase):
     def test_accelerator_metadata_reported_in_json(self):
