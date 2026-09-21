@@ -2,7 +2,11 @@
 //!
 //! Provides worker lifecycle operations and fan-out request utilities.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::response::{IntoResponse, Response};
 use futures::{
@@ -10,6 +14,7 @@ use futures::{
     stream::{self, StreamExt},
 };
 use http::StatusCode;
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::{
     sync::{watch, Mutex},
@@ -25,6 +30,154 @@ use crate::{
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONCURRENT: usize = 32;
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct KVCapacitySnapshot {
+    pub full_available_tokens: usize,
+    pub full_evictable_tokens: usize,
+    pub swa_available_tokens: Option<usize>,
+    pub swa_evictable_tokens: Option<usize>,
+    pub mamba_available_slots: Option<usize>,
+    pub mamba_evictable_slots: Option<usize>,
+    pub request_slots_available: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct QueueLoadSnapshot {
+    pub waiting: usize,
+    pub grammar: usize,
+    pub paused: usize,
+    pub retracted: usize,
+    pub prealloc_ready: usize,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct DisaggregationLoadSnapshot {
+    pub prefill_bootstrap_queue_reqs: usize,
+    pub prefill_inflight_queue_reqs: usize,
+    pub decode_prealloc_queue_reqs: usize,
+    pub decode_transfer_queue_reqs: usize,
+    pub decode_retracted_queue_reqs: usize,
+}
+
+fn observed_now() -> Instant {
+    Instant::now()
+}
+
+fn monotonic_source_age(server: f64, sampled: f64) -> Option<Duration> {
+    if !server.is_finite()
+        || !sampled.is_finite()
+        || server <= 0.0
+        || sampled <= 0.0
+        || server < sampled
+    {
+        return None;
+    }
+
+    // Validate each absolute value as well as the difference. Otherwise two
+    // unrepresentably large, nearly equal floats can subtract to zero and be
+    // mistaken for a fresh snapshot.
+    Duration::try_from_secs_f64(server).ok()?;
+    Duration::try_from_secs_f64(sampled).ok()?;
+    Duration::try_from_secs_f64(server - sampled).ok()
+}
+
+/// Typed view of one SRT DP rank returned by `/v1/loads`.
+///
+/// Source age is derived only from the two monotonic samples in one SRT
+/// response. `observed_at` then adds gateway residence time; no monotonic
+/// values are compared across hosts.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct DPLoadSnapshot {
+    pub timestamp: f64,
+    pub snapshot_monotonic_s: Option<f64>,
+    pub dp_rank: usize,
+    pub num_running_reqs: usize,
+    pub num_waiting_reqs: usize,
+    pub num_waiting_uncached_tokens: usize,
+    pub num_used_tokens: usize,
+    pub num_total_tokens: usize,
+    pub num_active_tokens: usize,
+    pub num_prealloc_ready_tokens: usize,
+    pub max_total_num_tokens: usize,
+    pub max_running_requests: usize,
+    pub cache_hit_rate: f64,
+    pub disaggregation: Option<DisaggregationLoadSnapshot>,
+    pub queues: Option<QueueLoadSnapshot>,
+    pub kv_capacity: Option<KVCapacitySnapshot>,
+    #[serde(skip, default = "observed_now")]
+    pub observed_at: Instant,
+    #[serde(skip, default)]
+    pub age_at_observation: Option<Duration>,
+}
+
+impl Default for DPLoadSnapshot {
+    fn default() -> Self {
+        Self {
+            timestamp: 0.0,
+            snapshot_monotonic_s: None,
+            dp_rank: 0,
+            num_running_reqs: 0,
+            num_waiting_reqs: 0,
+            num_waiting_uncached_tokens: 0,
+            num_used_tokens: 0,
+            num_total_tokens: 0,
+            num_active_tokens: 0,
+            num_prealloc_ready_tokens: 0,
+            max_total_num_tokens: 0,
+            max_running_requests: 0,
+            cache_hit_rate: 0.0,
+            disaggregation: None,
+            queues: None,
+            kv_capacity: None,
+            observed_at: Instant::now(),
+            age_at_observation: None,
+        }
+    }
+}
+
+impl DPLoadSnapshot {
+    pub fn is_fresh(&self, max_age: Duration) -> bool {
+        self.age_at_observation
+            .is_some_and(|age| age.saturating_add(self.observed_at.elapsed()) <= max_age)
+    }
+
+    pub fn sampled_at_estimate(&self) -> Option<Instant> {
+        self.age_at_observation
+            .and_then(|age| self.observed_at.checked_sub(age))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct LoadsEnvelope {
+    #[serde(default)]
+    server_monotonic_s: Option<f64>,
+    loads: Vec<DPLoadSnapshot>,
+}
+
+#[derive(Clone)]
+struct PhysicalWorkerGroup {
+    base_url: String,
+    api_key: Option<String>,
+    virtual_workers: Vec<(String, Option<usize>)>,
+}
+
+pub const PD_TOKEN_AFFINITY_ENV: &str = "SGLANG_GATEWAY_PD_TOKEN_AFFINITY";
+
+pub fn pd_token_affinity_enabled() -> bool {
+    std::env::var(PD_TOKEN_AFFINITY_ENV)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
 
 /// Result of a fan-out request to a single worker
 struct WorkerResponse {
@@ -163,36 +316,22 @@ impl WorkerManager {
     ) -> WorkerLoadsResult {
         let workers = worker_registry.get_all();
         let total_workers = workers.len();
-
-        let futures: Vec<_> = workers
+        let snapshots = Self::get_all_worker_load_snapshots(worker_registry, client).await;
+        let loads: Vec<_> = workers
             .iter()
-            .map(|worker| {
-                let url = worker.url().to_string();
-                let api_key = worker.api_key().clone();
-                let worker_type = match worker.worker_type() {
+            .map(|worker| WorkerLoadInfo {
+                worker: worker.url().to_string(),
+                worker_type: match worker.worker_type() {
                     WorkerType::Regular => None,
                     WorkerType::Prefill { .. } => Some("prefill".to_string()),
                     WorkerType::Decode => Some("decode".to_string()),
-                };
-                let is_http = matches!(worker.connection_mode(), ConnectionMode::Http);
-                let client = client.clone();
-
-                async move {
-                    let load = if is_http {
-                        Self::parse_load_response(&client, &url, api_key.as_deref()).await
-                    } else {
-                        -1
-                    };
-                    WorkerLoadInfo {
-                        worker: url,
-                        worker_type,
-                        load,
-                    }
-                }
+                },
+                load: snapshots
+                    .get(worker.url())
+                    .map(|snapshot| snapshot.num_total_tokens as isize)
+                    .unwrap_or(-1),
             })
             .collect();
-
-        let loads = future::join_all(futures).await;
         let successful = loads.iter().filter(|l| l.load >= 0).count();
         let failed = loads.iter().filter(|l| l.load < 0).count();
 
@@ -204,29 +343,107 @@ impl WorkerManager {
         }
     }
 
-    async fn parse_load_response(
+    fn physical_worker_groups(worker_registry: &WorkerRegistry) -> Vec<PhysicalWorkerGroup> {
+        let mut groups: HashMap<String, PhysicalWorkerGroup> = HashMap::new();
+        for worker in worker_registry.get_all() {
+            if !matches!(worker.connection_mode(), ConnectionMode::Http) {
+                continue;
+            }
+            let base_url = worker.base_url().to_string();
+            let group = groups
+                .entry(base_url.clone())
+                .or_insert_with(|| PhysicalWorkerGroup {
+                    base_url,
+                    api_key: worker.api_key().clone(),
+                    virtual_workers: Vec::new(),
+                });
+            group
+                .virtual_workers
+                .push((worker.url().to_string(), worker.dp_rank()));
+        }
+        groups.into_values().collect()
+    }
+
+    fn parse_load_payload(
+        payload: Value,
+        request_rtt: Duration,
+    ) -> Result<Vec<DPLoadSnapshot>, String> {
+        let mut envelope: LoadsEnvelope = serde_json::from_value(payload)
+            .map_err(|e| format!("invalid /v1/loads payload: {e}"))?;
+        let observed_at = Instant::now();
+        for snapshot in &mut envelope.loads {
+            snapshot.observed_at = observed_at;
+            snapshot.age_at_observation = envelope
+                .server_monotonic_s
+                .zip(snapshot.snapshot_monotonic_s)
+                .and_then(|(server, sampled)| monotonic_source_age(server, sampled))
+                .map(|source_age| source_age.saturating_add(request_rtt));
+        }
+        Ok(envelope.loads)
+    }
+
+    async fn fetch_physical_loads(
         client: &reqwest::Client,
-        url: &str,
+        base_url: &str,
         api_key: Option<&str>,
-    ) -> isize {
-        let load_url = format!("{}/v1/loads?include=core", url);
+    ) -> Result<Vec<DPLoadSnapshot>, String> {
+        // `all` is forward-compatible: old SRT does not know the new
+        // `kv_capacity` section, while an updated SRT includes it in `all`.
+        let load_url = format!("{}/v1/loads?include=all", base_url);
         let mut req = client.get(&load_url).timeout(REQUEST_TIMEOUT);
         if let Some(key) = api_key {
             req = req.bearer_auth(key);
         }
-
-        match req.send().await {
-            Ok(r) if r.status().is_success() => match r.json::<Value>().await {
-                Ok(json) => json
-                    .get("aggregate")
-                    .and_then(|a| a.get("total_tokens"))
-                    .and_then(|v| v.as_i64())
-                    .map(|n| n as isize)
-                    .unwrap_or(-1),
-                _ => -1,
-            },
-            _ => -1,
+        let request_started = Instant::now();
+        let response = req
+            .send()
+            .await
+            .map_err(|e| format!("load request to {base_url} failed: {e}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "load request to {base_url} returned {}",
+                response.status()
+            ));
         }
+        let payload = response
+            .json::<Value>()
+            .await
+            .map_err(|e| format!("load response from {base_url} is not JSON: {e}"))?;
+        Self::parse_load_payload(payload, request_started.elapsed())
+    }
+
+    pub async fn get_all_worker_load_snapshots(
+        worker_registry: &WorkerRegistry,
+        client: &reqwest::Client,
+    ) -> HashMap<String, DPLoadSnapshot> {
+        let groups = Self::physical_worker_groups(worker_registry);
+        let futures = groups.into_iter().map(|group| {
+            let client = client.clone();
+            async move {
+                let result =
+                    Self::fetch_physical_loads(&client, &group.base_url, group.api_key.as_deref())
+                        .await;
+                (group, result)
+            }
+        });
+
+        let mut snapshots = HashMap::new();
+        for (group, result) in future::join_all(futures).await {
+            let physical_snapshots = match result {
+                Ok(loads) => loads,
+                Err(error) => {
+                    warn!(base_url = %group.base_url, %error, "Failed to fetch worker load snapshot");
+                    continue;
+                }
+            };
+            for (worker_url, dp_rank) in group.virtual_workers {
+                let rank = dp_rank.unwrap_or(0);
+                if let Some(snapshot) = physical_snapshots.iter().find(|s| s.dp_rank == rank) {
+                    snapshots.insert(worker_url, snapshot.clone());
+                }
+            }
+        }
+        snapshots
     }
 
     pub async fn get_engine_metrics(
@@ -274,6 +491,8 @@ pub struct LoadMonitor {
     interval: Duration,
     tx: watch::Sender<HashMap<String, isize>>,
     rx: watch::Receiver<HashMap<String, isize>>,
+    snapshot_tx: watch::Sender<HashMap<String, DPLoadSnapshot>>,
+    snapshot_rx: watch::Receiver<HashMap<String, DPLoadSnapshot>>,
     monitor_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
@@ -285,6 +504,7 @@ impl LoadMonitor {
         interval_secs: u64,
     ) -> Self {
         let (tx, rx) = watch::channel(HashMap::new());
+        let (snapshot_tx, snapshot_rx) = watch::channel(HashMap::new());
 
         Self {
             worker_registry,
@@ -293,6 +513,8 @@ impl LoadMonitor {
             interval: Duration::from_secs(interval_secs),
             tx,
             rx,
+            snapshot_tx,
+            snapshot_rx,
             monitor_handle: Arc::new(Mutex::new(None)),
         }
     }
@@ -314,9 +536,18 @@ impl LoadMonitor {
         let client = self.client.clone();
         let interval = self.interval;
         let tx = self.tx.clone();
+        let snapshot_tx = self.snapshot_tx.clone();
 
         let handle = tokio::spawn(async move {
-            Self::monitor_loop(worker_registry, policy_registry, client, interval, tx).await;
+            Self::monitor_loop(
+                worker_registry,
+                policy_registry,
+                client,
+                interval,
+                tx,
+                snapshot_tx,
+            )
+            .await;
         });
 
         *handle_guard = Some(handle);
@@ -335,31 +566,37 @@ impl LoadMonitor {
         self.rx.clone()
     }
 
+    pub fn subscribe_snapshots(&self) -> watch::Receiver<HashMap<String, DPLoadSnapshot>> {
+        self.snapshot_rx.clone()
+    }
+
     async fn monitor_loop(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
         client: reqwest::Client,
         interval: Duration,
         tx: watch::Sender<HashMap<String, isize>>,
+        snapshot_tx: watch::Sender<HashMap<String, DPLoadSnapshot>>,
     ) {
         let mut interval_timer = tokio::time::interval(interval);
+        let detailed_feedback_enabled = pd_token_affinity_enabled();
 
         loop {
             interval_timer.tick().await;
 
+            // Preserve the old zero-overhead behavior unless either an existing
+            // power-of-two policy or the opt-in PD feedback path consumes loads.
             let power_of_two_policies = policy_registry.get_all_power_of_two_policies();
-
-            if power_of_two_policies.is_empty() {
-                debug!("No PowerOfTwo policies found, skipping load fetch");
+            if power_of_two_policies.is_empty() && !detailed_feedback_enabled {
                 continue;
             }
 
-            let result = WorkerManager::get_all_worker_loads(&worker_registry, &client).await;
-
-            let mut loads = HashMap::new();
-            for load_info in result.loads {
-                loads.insert(load_info.worker, load_info.load);
-            }
+            let snapshots =
+                WorkerManager::get_all_worker_load_snapshots(&worker_registry, &client).await;
+            let loads: HashMap<String, isize> = snapshots
+                .iter()
+                .map(|(worker, snapshot)| (worker.clone(), snapshot.num_total_tokens as isize))
+                .collect();
 
             if !loads.is_empty() {
                 debug!(
@@ -371,6 +608,7 @@ impl LoadMonitor {
                     policy.update_loads(&loads);
                 }
                 let _ = tx.send(loads);
+                let _ = snapshot_tx.send(snapshots);
             } else {
                 warn!("No loads fetched from workers");
             }
@@ -380,6 +618,119 @@ impl LoadMonitor {
     pub async fn is_running(&self) -> bool {
         let handle_guard = self.monitor_handle.lock().await;
         handle_guard.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_current_srt_loads_array_and_capacity() {
+        let payload = serde_json::json!({
+            "timestamp": "2026-09-21T00:00:00Z",
+            "server_monotonic_s": 100.25,
+            "loads": [{
+                "snapshot_monotonic_s": 100.0,
+                "dp_rank": 3,
+                "num_running_reqs": 7,
+                "num_total_tokens": 131072,
+                "num_active_tokens": 120000,
+                "max_total_num_tokens": 532736,
+                "queues": {"waiting": 2, "prealloc_ready": 1},
+                "disaggregation": {
+                    "decode_prealloc_queue_reqs": 2,
+                    "decode_transfer_queue_reqs": 1
+                },
+                "kv_capacity": {
+                    "full_available_tokens": 390000,
+                    "full_evictable_tokens": 4096,
+                    "mamba_available_slots": 12,
+                    "request_slots_available": 9
+                }
+            }]
+        });
+
+        let loads = WorkerManager::parse_load_payload(payload, Duration::from_millis(10)).unwrap();
+        assert_eq!(loads.len(), 1);
+        let load = &loads[0];
+        assert_eq!(load.dp_rank, 3);
+        assert_eq!(load.num_running_reqs, 7);
+        assert_eq!(load.queues.as_ref().unwrap().waiting, 2);
+        let capacity = load.kv_capacity.as_ref().unwrap();
+        assert_eq!(capacity.full_available_tokens, 390000);
+        assert_eq!(capacity.request_slots_available, Some(9));
+        let age = load.age_at_observation.unwrap();
+        assert!(age >= Duration::from_millis(260));
+        assert!(age < Duration::from_millis(300));
+    }
+
+    #[test]
+    fn invalid_or_missing_monotonic_contract_is_stale_without_panicking() {
+        assert_eq!(monotonic_source_age(f64::NAN, 1.0), None);
+        assert_eq!(monotonic_source_age(2.0, f64::INFINITY), None);
+        assert_eq!(monotonic_source_age(1e308, 1e308), None);
+
+        for payload in [
+            serde_json::json!({"loads": [{"dp_rank": 0}]}),
+            serde_json::json!({
+                "server_monotonic_s": 9.0,
+                "loads": [{"dp_rank": 0, "snapshot_monotonic_s": 10.0}]
+            }),
+            serde_json::json!({
+                "server_monotonic_s": 1e308,
+                "loads": [{"dp_rank": 0, "snapshot_monotonic_s": 1.0}]
+            }),
+            serde_json::json!({
+                "server_monotonic_s": 0.0,
+                "loads": [{"dp_rank": 0, "snapshot_monotonic_s": 0.0}]
+            }),
+            serde_json::json!({
+                "server_monotonic_s": -1.0,
+                "loads": [{"dp_rank": 0, "snapshot_monotonic_s": -2.0}]
+            }),
+        ] {
+            let loads = WorkerManager::parse_load_payload(payload, Duration::ZERO).unwrap();
+            assert_eq!(loads.len(), 1);
+            assert_eq!(loads[0].age_at_observation, None);
+            assert!(!loads[0].is_fresh(Duration::from_secs(3)));
+            assert!(loads[0].sampled_at_estimate().is_none());
+        }
+    }
+
+    #[test]
+    fn groups_virtual_dp_workers_by_physical_url() {
+        use crate::core::{DPAwareWorkerBuilder, WorkerType};
+
+        let registry = WorkerRegistry::new();
+        for rank in 0..4 {
+            registry.register(Arc::new(
+                DPAwareWorkerBuilder::new("http://decode:30001", rank, 4)
+                    .worker_type(WorkerType::Decode)
+                    .build(),
+            ));
+        }
+        registry.register(Arc::new(
+            DPAwareWorkerBuilder::new("http://prefill:30000", 0, 1)
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: None,
+                })
+                .build(),
+        ));
+
+        let mut groups = WorkerManager::physical_worker_groups(&registry);
+        groups.sort_by(|a, b| a.base_url.cmp(&b.base_url));
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].base_url, "http://decode:30001");
+        assert_eq!(groups[0].virtual_workers.len(), 4);
+        assert_eq!(groups[1].base_url, "http://prefill:30000");
+        assert_eq!(groups[1].virtual_workers.len(), 1);
+    }
+
+    #[test]
+    fn rejects_obsolete_aggregate_only_shape() {
+        let payload = serde_json::json!({"aggregate": {"total_tokens": 10}});
+        assert!(WorkerManager::parse_load_payload(payload, Duration::ZERO).is_err());
     }
 }
 

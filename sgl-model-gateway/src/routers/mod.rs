@@ -9,6 +9,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use serde_json::Value;
 
 use crate::protocols::{
     chat::ChatCompletionRequest,
@@ -88,6 +89,19 @@ pub trait RouterTrait: Send + Sync + Debug {
             "Generate endpoint not implemented",
         )
             .into_response()
+    }
+
+    /// Route a native generate request while retaining fields newer than the
+    /// gateway's `openai-protocol` crate. Implementations that do not need the
+    /// extensions keep the existing typed behavior.
+    async fn route_generate_raw(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &GenerateRequest,
+        _raw_body: &Value,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_generate(headers, body, model_id).await
     }
 
     /// Route a chat completion request

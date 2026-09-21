@@ -3,12 +3,12 @@
 //! This module provides a unified abstraction for routing policies that work
 //! across both regular and prefill-decode (PD) routing modes.
 
-use std::{fmt::Debug, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
 use async_trait::async_trait;
 use smg_mesh::OptionalMeshSyncManager;
 
-use crate::core::{HashRing, Worker};
+use crate::core::{DPLoadSnapshot, HashRing, Worker};
 
 mod bucket;
 mod cache_aware;
@@ -73,7 +73,7 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Update worker load information
     ///
     /// This is called periodically with current load information for load-aware policies.
-    fn update_loads(&self, _loads: &std::collections::HashMap<String, isize>) {
+    fn update_loads(&self, _loads: &HashMap<String, isize>) {
         // Default: no-op for policies that don't use load information
     }
 
@@ -171,6 +171,18 @@ pub struct SelectWorkerInfo<'a> {
     /// Pre-computed hash ring for O(log n) consistent hashing
     /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds
     pub hash_ring: Option<Arc<HashRing>>,
+    /// Latest per-DP SRT snapshots keyed by the virtual worker URL.
+    pub load_snapshots: Option<&'a HashMap<String, DPLoadSnapshot>>,
+    /// In-flight gateway reservations keyed by virtual worker URL.
+    pub local_reservations: Option<&'a HashMap<String, usize>>,
+    /// Tokens reserved after the corresponding SRT snapshot was sampled.
+    pub post_snapshot_reserved_tokens: Option<&'a HashMap<String, usize>>,
+    /// Requests reserved after the corresponding SRT snapshot was sampled.
+    pub post_snapshot_reserved_requests: Option<&'a HashMap<String, usize>>,
+    /// Conservative KV demand used for admission checks.
+    pub estimated_tokens: usize,
+    /// Per-worker in-flight request cap for bounded affinity.
+    pub soft_cap: Option<usize>,
 }
 
 #[cfg(test)]

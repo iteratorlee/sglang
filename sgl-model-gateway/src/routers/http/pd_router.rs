@@ -1,4 +1,12 @@
-use std::{borrow::Cow, sync::Arc, time::Instant};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use axum::{
@@ -7,11 +15,13 @@ use axum::{
     http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
+use dashmap::DashMap;
 use futures_util::StreamExt;
 use memchr::memmem;
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
+use tokio::sync::watch;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
 
@@ -19,8 +29,8 @@ use super::pd_types::api_path;
 use crate::{
     config::types::RetryConfig,
     core::{
-        is_retryable_status, HashRing, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry,
-        WorkerType, UNKNOWN_MODEL_ID,
+        is_retryable_status, pd_token_affinity_enabled, DPLoadSnapshot, HashRing, RetryExecutor,
+        Worker, WorkerLoadGuard, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
     },
     observability::{
         events::{self, Event},
@@ -54,6 +64,105 @@ pub struct PDRouter {
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
     pub enable_igw: bool,
+    pd_token_affinity: bool,
+    load_snapshots: watch::Receiver<HashMap<String, DPLoadSnapshot>>,
+    reservations: Arc<PDReservationTable>,
+}
+
+#[derive(Debug)]
+struct ReservationRecord {
+    id: u64,
+    created_at: Instant,
+    tokens: usize,
+}
+
+#[derive(Debug, Default)]
+struct PDReservationTable {
+    next_id: AtomicU64,
+    entries: DashMap<String, Arc<Mutex<Vec<ReservationRecord>>>>,
+}
+
+#[derive(Debug)]
+struct PDReservationLease {
+    entry: Arc<Mutex<Vec<ReservationRecord>>>,
+    id: u64,
+}
+
+#[derive(Debug, Default)]
+struct PDReservationPair {
+    _decode: Option<PDReservationLease>,
+}
+
+impl Drop for PDReservationLease {
+    fn drop(&mut self) {
+        let mut records = self.entry.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = records.iter().position(|record| record.id == self.id) {
+            records.swap_remove(index);
+        }
+    }
+}
+
+impl PDReservationTable {
+    fn try_reserve(
+        &self,
+        worker_url: &str,
+        tokens: usize,
+        soft_cap: Option<usize>,
+    ) -> Option<PDReservationLease> {
+        let entry = self
+            .entries
+            .entry(worker_url.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(Vec::new())))
+            .clone();
+        let mut records = entry.lock().unwrap_or_else(|e| e.into_inner());
+        if soft_cap.is_some_and(|cap| records.len() >= cap) {
+            return None;
+        }
+
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        records.push(ReservationRecord {
+            id,
+            created_at: Instant::now(),
+            tokens,
+        });
+        drop(records);
+        Some(PDReservationLease { entry, id })
+    }
+
+    fn views(
+        &self,
+        snapshots: &HashMap<String, DPLoadSnapshot>,
+    ) -> (
+        HashMap<String, usize>,
+        HashMap<String, usize>,
+        HashMap<String, usize>,
+    ) {
+        let mut active = HashMap::new();
+        let mut post_snapshot_tokens = HashMap::new();
+        let mut post_snapshot_requests = HashMap::new();
+        for item in self.entries.iter() {
+            let records = item.value().lock().unwrap_or_else(|e| e.into_inner());
+            if records.is_empty() {
+                continue;
+            }
+            active.insert(item.key().clone(), records.len());
+            let sampled_at = snapshots
+                .get(item.key())
+                .and_then(DPLoadSnapshot::sampled_at_estimate);
+            let tokens = records
+                .iter()
+                .filter(|record| sampled_at.is_none_or(|sampled_at| record.created_at > sampled_at))
+                .map(|record| record.tokens)
+                .sum();
+            let requests = records
+                .iter()
+                .filter(|record| sampled_at.is_none_or(|sampled_at| record.created_at > sampled_at))
+                .count();
+            post_snapshot_tokens.insert(item.key().clone(), tokens);
+            post_snapshot_requests.insert(item.key().clone(), requests);
+        }
+        (active, post_snapshot_tokens, post_snapshot_requests)
+    }
 }
 
 struct PreparedWorkerRequest<'a> {
@@ -68,6 +177,8 @@ struct PDRequestContext<'a> {
     is_stream: bool,
     return_logprob: bool,
     request_text: Option<String>,
+    tokens: Option<Arc<[u32]>>,
+    estimated_tokens: usize,
     model_id: Option<&'a str>,
     headers: Option<HeaderMap>,
 }
@@ -178,6 +289,12 @@ impl PDRouter {
     }
 
     pub async fn new(ctx: &Arc<crate::app_context::AppContext>) -> Result<Self, String> {
+        let load_snapshots = if let Some(monitor) = ctx.load_monitor.as_ref() {
+            monitor.subscribe_snapshots()
+        } else {
+            let (_tx, rx) = watch::channel(HashMap::new());
+            rx
+        };
         Ok(PDRouter {
             worker_registry: Arc::clone(&ctx.worker_registry),
             policy_registry: Arc::clone(&ctx.policy_registry),
@@ -185,6 +302,9 @@ impl PDRouter {
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
             enable_igw: ctx.router_config.enable_igw,
+            pd_token_affinity: pd_token_affinity_enabled(),
+            load_snapshots,
+            reservations: Arc::new(PDReservationTable::default()),
         })
     }
 
@@ -211,6 +331,58 @@ impl PDRouter {
         None
     }
 
+    fn get_generate_tokens(req: &GenerateRequest) -> Option<Arc<[u32]>> {
+        let InputIds::Single(ids) = req.input_ids.as_ref()? else {
+            return None;
+        };
+        ids.iter()
+            .copied()
+            .map(u32::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .ok()
+            .map(Arc::from)
+    }
+
+    fn get_generate_estimated_tokens(req: &GenerateRequest) -> usize {
+        let input_tokens = match req.input_ids.as_ref() {
+            Some(InputIds::Single(ids)) => ids.len(),
+            Some(InputIds::Batch(ids)) => ids.iter().map(Vec::len).sum(),
+            None => 0,
+        };
+        let output_tokens = req
+            .sampling_params
+            .as_ref()
+            .and_then(|params| params.max_new_tokens)
+            .unwrap_or(0) as usize;
+        input_tokens.saturating_add(output_tokens)
+    }
+
+    async fn route_generate_value(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &GenerateRequest,
+        raw_body: &Value,
+        model_id: Option<&str>,
+    ) -> Response {
+        let request_text = if self.policies_need_request_text() {
+            body.text.clone()
+        } else {
+            None
+        };
+        let context = PDRequestContext {
+            route: "/generate",
+            batch_size: Self::get_generate_batch_size(body),
+            is_stream: body.stream,
+            return_logprob: body.return_logprob.unwrap_or(false),
+            request_text,
+            tokens: Self::get_generate_tokens(body),
+            estimated_tokens: Self::get_generate_estimated_tokens(body),
+            model_id,
+            headers: headers.cloned(),
+        };
+        self.execute_dual_dispatch(headers, raw_body, context).await
+    }
+
     fn get_chat_batch_size(req: &ChatCompletionRequest) -> Option<usize> {
         if let Some(n) = req.n {
             if n > 1 {
@@ -234,6 +406,7 @@ impl PDRouter {
     const BOOTSTRAP_PORT_KEY: &'static str = "bootstrap_port";
     const BOOTSTRAP_ROOM_KEY: &'static str = "bootstrap_room";
     const DISAGG_PREFILL_DP_RANK_KEY: &'static str = "disagg_prefill_dp_rank";
+    const DISAGG_DECODE_DP_RANK_KEY: &'static str = "disagg_decode_dp_rank";
 
     fn inject_bootstrap_into_value(
         mut original: Value,
@@ -311,11 +484,34 @@ impl PDRouter {
             );
         };
 
+        obj.remove(Self::DISAGG_DECODE_DP_RANK_KEY);
         obj.insert(
             Self::DISAGG_PREFILL_DP_RANK_KEY.to_string(),
             Value::from(prefill_dp_rank as u64),
         );
         Ok(Cow::Owned(decode_request))
+    }
+
+    fn inject_decode_dp_rank_for_prefill<'a>(
+        prefill_request: Cow<'a, Value>,
+        decode_worker: &dyn Worker,
+    ) -> Result<Cow<'a, Value>, String> {
+        let Some(decode_dp_rank) = decode_worker.dp_rank() else {
+            return Ok(prefill_request);
+        };
+        let mut prefill_request = prefill_request.into_owned();
+        let Some(obj) = prefill_request.as_object_mut() else {
+            return Err(
+                "Failed to insert disagg_decode_dp_rank because request body is not an object"
+                    .to_string(),
+            );
+        };
+        obj.remove(Self::DISAGG_PREFILL_DP_RANK_KEY);
+        obj.insert(
+            Self::DISAGG_DECODE_DP_RANK_KEY.to_string(),
+            Value::from(decode_dp_rank as u64),
+        );
+        Ok(Cow::Owned(prefill_request))
     }
 
     async fn prepare_worker_request<'a>(
@@ -352,8 +548,10 @@ impl PDRouter {
         prefill: &dyn Worker,
         decode: &dyn Worker,
     ) -> Result<(PreparedWorkerRequest<'a>, PreparedWorkerRequest<'a>), String> {
+        let prefill_json_request =
+            Self::inject_decode_dp_rank_for_prefill(Cow::Borrowed(json_request), decode)?;
         let prefill_request =
-            Self::prepare_worker_request(route, prefill, Cow::Borrowed(json_request)).await?;
+            Self::prepare_worker_request(route, prefill, prefill_json_request).await?;
         let decode_json_request =
             Self::inject_prefill_dp_rank_for_decode(Cow::Borrowed(json_request), prefill)?;
         let decode_request =
@@ -394,11 +592,14 @@ impl PDRouter {
                     let shared_request = Arc::clone(&shared_request);
                     let context = context.clone();
                     async move {
-                        let (prefill, decode) = match self
+                        let (prefill, decode, reservations) = match self
                             .select_pd_pair(
                                 context.request_text.as_deref(),
+                                context.tokens.as_deref(),
+                                context.estimated_tokens,
                                 context.model_id,
                                 context.headers.as_ref(),
+                                true,
                             )
                             .await
                         {
@@ -440,6 +641,8 @@ impl PDRouter {
                                 start_time,
                             )
                             .await;
+                        let response =
+                            crate::core::AttachedBody::wrap_response(response, reservations);
 
                         let status = response.status();
                         let outcomes_already_recorded = response
@@ -972,9 +1175,12 @@ impl PDRouter {
     async fn select_pd_pair(
         &self,
         request_text: Option<&str>,
+        tokens: Option<&[u32]>,
+        estimated_tokens: usize,
         model_id: Option<&str>,
         headers: Option<&HeaderMap>,
-    ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
+        reserve: bool,
+    ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>, PDReservationPair), String> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
         debug!(
@@ -1012,50 +1218,99 @@ impl PDRouter {
             .worker_registry
             .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
 
-        let prefill = Self::pick_worker_by_policy_arc(
-            &prefill_workers,
-            &*prefill_policy,
-            request_text,
-            headers,
-            hash_ring.clone(),
-            "prefill",
-        )
-        .await?;
+        let attempts = decode_workers.len().saturating_mul(2).max(1);
+        for _ in 0..attempts {
+            let snapshots = if self.pd_token_affinity {
+                self.load_snapshots.borrow().clone()
+            } else {
+                HashMap::new()
+            };
+            let (
+                local_reservations,
+                post_snapshot_reserved_tokens,
+                post_snapshot_reserved_requests,
+            ) = self.reservations.views(&snapshots);
+            let policy_tokens = if self.pd_token_affinity { tokens } else { None };
 
-        let decode = Self::pick_worker_by_policy_arc(
-            &decode_workers,
-            &*decode_policy,
-            request_text,
-            headers,
-            hash_ring,
-            "decode",
-        )
-        .await?;
+            let prefill = Self::pick_worker_by_policy_arc(
+                &prefill_workers,
+                &*prefill_policy,
+                request_text,
+                policy_tokens,
+                headers,
+                hash_ring.clone(),
+                &snapshots,
+                &local_reservations,
+                &post_snapshot_reserved_tokens,
+                &post_snapshot_reserved_requests,
+                estimated_tokens,
+                None,
+                "prefill",
+            )
+            .await?;
+            let decode = Self::pick_worker_by_policy_arc(
+                &decode_workers,
+                &*decode_policy,
+                request_text,
+                policy_tokens,
+                headers,
+                hash_ring.clone(),
+                &snapshots,
+                &local_reservations,
+                &post_snapshot_reserved_tokens,
+                &post_snapshot_reserved_requests,
+                estimated_tokens,
+                self.pd_token_affinity.then_some(2),
+                "decode",
+            )
+            .await?;
 
-        // Record worker selection metrics (Layer 3)
-        let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
-        Metrics::record_worker_selection(
-            metrics_labels::WORKER_PREFILL,
-            metrics_labels::CONNECTION_HTTP,
-            model,
-            prefill_policy.name(),
-        );
-        Metrics::record_worker_selection(
-            metrics_labels::WORKER_DECODE,
-            metrics_labels::CONNECTION_HTTP,
-            model,
-            decode_policy.name(),
-        );
+            let reservations = if reserve && self.pd_token_affinity {
+                let Some(decode_lease) =
+                    self.reservations
+                        .try_reserve(decode.url(), estimated_tokens, Some(2))
+                else {
+                    continue;
+                };
+                PDReservationPair {
+                    _decode: Some(decode_lease),
+                }
+            } else {
+                PDReservationPair::default()
+            };
 
-        Ok((prefill, decode))
+            let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
+            Metrics::record_worker_selection(
+                metrics_labels::WORKER_PREFILL,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                prefill_policy.name(),
+            );
+            Metrics::record_worker_selection(
+                metrics_labels::WORKER_DECODE,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                decode_policy.name(),
+            );
+            return Ok((prefill, decode, reservations));
+        }
+
+        Err("PD capacity changed while reserving a worker pair".to_string())
     }
 
     async fn pick_worker_by_policy_arc(
         workers: &[Arc<dyn Worker>],
         policy: &dyn LoadBalancingPolicy,
         request_text: Option<&str>,
+        tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
         hash_ring: Option<Arc<HashRing>>,
+        load_snapshots: &HashMap<String, DPLoadSnapshot>,
+        local_reservations: &HashMap<String, usize>,
+        post_snapshot_reserved_tokens: &HashMap<String, usize>,
+        post_snapshot_reserved_requests: &HashMap<String, usize>,
+        estimated_tokens: usize,
+        soft_cap: Option<usize>,
         worker_type: &str,
     ) -> Result<Arc<dyn Worker>, String> {
         if workers.is_empty() {
@@ -1067,7 +1322,16 @@ impl PDRouter {
 
         let available_workers: Vec<Arc<dyn Worker>> = workers
             .iter()
-            .filter(|w| w.is_available())
+            .filter(|worker| {
+                if !worker.is_available() {
+                    return false;
+                }
+                let local = local_reservations.get(worker.url()).copied().unwrap_or(0);
+                if soft_cap.is_some_and(|cap| local >= cap) {
+                    return false;
+                }
+                true
+            })
             .cloned()
             .collect();
 
@@ -1083,9 +1347,15 @@ impl PDRouter {
                 &available_workers,
                 &SelectWorkerInfo {
                     request_text,
-                    tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
+                    tokens,
                     headers,
                     hash_ring,
+                    load_snapshots: Some(load_snapshots),
+                    local_reservations: Some(local_reservations),
+                    post_snapshot_reserved_tokens: Some(post_snapshot_reserved_tokens),
+                    post_snapshot_reserved_requests: Some(post_snapshot_reserved_requests),
+                    estimated_tokens,
+                    soft_cap,
                 },
             )
             .await
@@ -1461,15 +1731,16 @@ impl RouterTrait for PDRouter {
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
 
         // Select a random worker pair using the policy
-        let (prefill, decode) = match self.select_pd_pair(None, None, None).await {
-            Ok(pair) => pair,
-            Err(e) => {
-                return error::service_unavailable(
-                    "no_healthy_worker_pair",
-                    format!("No healthy worker pair available: {}", e),
-                );
-            }
-        };
+        let (prefill, decode, _reservations) =
+            match self.select_pd_pair(None, None, 0, None, None, false).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    return error::service_unavailable(
+                        "no_healthy_worker_pair",
+                        format!("No healthy worker pair available: {}", e),
+                    );
+                }
+            };
 
         let prefill_url = Self::worker_endpoint_url(prefill.as_ref(), "health_generate");
         let decode_url = Self::worker_endpoint_url(decode.as_ref(), "health_generate");
@@ -1565,28 +1836,23 @@ impl RouterTrait for PDRouter {
         body: &GenerateRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let is_stream = body.stream;
-        let return_logprob = body.return_logprob.unwrap_or(false);
-
-        let request_text = if self.policies_need_request_text() {
-            body.text.as_deref().map(|s| s.to_string())
-        } else {
-            None
+        let raw_body = match serde_json::to_value(body) {
+            Ok(body) => body,
+            Err(error) => return Self::handle_serialization_error(error),
         };
+        self.route_generate_value(headers, body, &raw_body, model_id)
+            .await
+    }
 
-        let batch_size = Self::get_generate_batch_size(body);
-
-        let context = PDRequestContext {
-            route: "/generate",
-            batch_size,
-            is_stream,
-            return_logprob,
-            request_text,
-            model_id,
-            headers: headers.cloned(),
-        };
-
-        self.execute_dual_dispatch(headers, body, context).await
+    async fn route_generate_raw(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &GenerateRequest,
+        raw_body: &Value,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_generate_value(headers, body, raw_body, model_id)
+            .await
     }
 
     async fn route_chat(
@@ -1613,6 +1879,8 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
+            tokens: None,
+            estimated_tokens: 0,
             model_id,
             headers: headers.cloned(),
         };
@@ -1647,6 +1915,8 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
+            tokens: None,
+            estimated_tokens: 0,
             model_id,
             headers: headers.cloned(),
         };
@@ -1673,6 +1943,8 @@ impl RouterTrait for PDRouter {
             is_stream: false,
             return_logprob: false,
             request_text: req_text,
+            tokens: None,
+            estimated_tokens: 0,
             model_id,
             headers: headers.cloned(),
         };
@@ -1723,6 +1995,7 @@ mod tests {
         let policy_registry =
             Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
 
+        let (_load_tx, load_snapshots) = watch::channel(HashMap::new());
         PDRouter {
             worker_registry,
             policy_registry,
@@ -1730,6 +2003,9 @@ mod tests {
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
             enable_igw: false,
+            pd_token_affinity: false,
+            load_snapshots,
+            reservations: Arc::new(PDReservationTable::default()),
         }
     }
 
@@ -1815,10 +2091,12 @@ mod tests {
         router.worker_registry.register(Arc::from(healthy_worker));
         router.worker_registry.register(Arc::from(decode_worker));
 
-        let result = router.select_pd_pair(None, None, None).await;
+        let result = router
+            .select_pd_pair(None, None, 0, None, None, false)
+            .await;
 
         assert!(result.is_ok());
-        let (prefill, _decode) = result.unwrap();
+        let (prefill, _decode, _reservations) = result.unwrap();
 
         assert_eq!(prefill.url(), "http://healthy");
         assert!(prefill.is_healthy());
@@ -1828,7 +2106,9 @@ mod tests {
     async fn test_empty_worker_lists() {
         let router = create_test_pd_router();
 
-        let result = router.select_pd_pair(None, None, None).await;
+        let result = router
+            .select_pd_pair(None, None, 0, None, None, false)
+            .await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No prefill workers available"));
@@ -1865,6 +2145,12 @@ mod tests {
         let request = json!({
             "prompt": "shared prefix",
             "max_tokens": 8,
+            "rid": "cc-request-1",
+            "cache_salt": "cc-session-7",
+            "routed_dp_rank": 99,
+            "data_parallel_rank": 98,
+            "disagg_prefill_dp_rank": 97,
+            "disagg_decode_dp_rank": 96,
             "bootstrap_host": "prefill",
             "bootstrap_port": 8998,
             "bootstrap_room": 1234,
@@ -1879,15 +2165,23 @@ mod tests {
             prefill_request.endpoint_url,
             "http://prefill:30000/v1/completions"
         );
-        assert_eq!(prefill_request.body["data_parallel_rank"], 2);
+        assert_eq!(prefill_request.body["routed_dp_rank"], 2);
+        assert_eq!(prefill_request.body["disagg_decode_dp_rank"], 1);
+        assert!(prefill_request.body.get("data_parallel_rank").is_none());
         assert!(prefill_request.body.get("disagg_prefill_dp_rank").is_none());
+        assert_eq!(prefill_request.body["rid"], "cc-request-1");
+        assert_eq!(prefill_request.body["cache_salt"], "cc-session-7");
 
         assert_eq!(
             decode_request.endpoint_url,
             "http://decode:30001/v1/completions"
         );
-        assert_eq!(decode_request.body["data_parallel_rank"], 1);
+        assert_eq!(decode_request.body["routed_dp_rank"], 1);
+        assert!(decode_request.body.get("data_parallel_rank").is_none());
         assert_eq!(decode_request.body["disagg_prefill_dp_rank"], 2);
+        assert!(decode_request.body.get("disagg_decode_dp_rank").is_none());
+        assert_eq!(decode_request.body["rid"], "cc-request-1");
+        assert_eq!(decode_request.body["cache_salt"], "cc-session-7");
         assert_eq!(decode_request.body["bootstrap_room"], 1234);
         assert!(matches!(prefill_request.body, Cow::Owned(_)));
         assert!(matches!(decode_request.body, Cow::Owned(_)));
@@ -1955,6 +2249,58 @@ mod tests {
 
         assert_eq!(prefill_worker.load(), 0);
         assert_eq!(decode_worker.load(), 0);
+    }
+
+    #[test]
+    fn test_decode_reservation_cap_is_atomic_and_raii() {
+        let table = PDReservationTable::default();
+        let first = table
+            .try_reserve("http://decode:30001@0", 129_024, Some(2))
+            .unwrap();
+        let second = table
+            .try_reserve("http://decode:30001@0", 129_024, Some(2))
+            .unwrap();
+        assert!(table
+            .try_reserve("http://decode:30001@0", 129_024, Some(2))
+            .is_none());
+
+        let (active, tokens, requests) = table.views(&HashMap::new());
+        assert_eq!(active["http://decode:30001@0"], 2);
+        assert_eq!(tokens["http://decode:30001@0"], 258_048);
+        assert_eq!(requests["http://decode:30001@0"], 2);
+
+        drop(first);
+        let replacement = table
+            .try_reserve("http://decode:30001@0", 129_024, Some(2))
+            .unwrap();
+        drop((second, replacement));
+        assert!(table.views(&HashMap::new()).0.is_empty());
+    }
+
+    #[test]
+    fn test_generate_token_ids_and_extension_fields_contract() {
+        let raw = json!({
+            "input_ids": [11, 12, 13, 14],
+            "sampling_params": {"max_new_tokens": 1024},
+            "rid": "cc-rid",
+            "cache_salt": "tenant-a",
+            "routed_dp_rank": 7,
+            "disagg_prefill_dp_rank": 6,
+            "disagg_decode_dp_rank": 5
+        });
+        let typed: GenerateRequest = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(
+            PDRouter::get_generate_tokens(&typed).as_deref(),
+            Some([11, 12, 13, 14].as_slice())
+        );
+        assert_eq!(PDRouter::get_generate_estimated_tokens(&typed), 1028);
+
+        // openai-protocol 1.0.0 drops these unknown fields. The /generate
+        // raw-body path must therefore remain the source sent to P and D.
+        let typed_json = serde_json::to_value(&typed).unwrap();
+        assert!(typed_json.get("cache_salt").is_none());
+        assert_eq!(raw["cache_salt"], "tenant-a");
+        assert_eq!(raw["routed_dp_rank"], 7);
     }
 
     #[tokio::test]

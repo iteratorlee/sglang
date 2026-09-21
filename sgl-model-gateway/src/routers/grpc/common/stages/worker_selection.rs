@@ -175,6 +175,7 @@ impl WorkerSelectionStage {
                     tokens,
                     headers,
                     hash_ring,
+                    ..Default::default()
                 },
             )
             .await?;
@@ -246,6 +247,7 @@ impl WorkerSelectionStage {
             tokens,
             headers,
             hash_ring,
+            ..Default::default()
         };
         let prefill_idx = policy.select_worker(&available_prefill, &info).await?;
         let decode_idx = policy.select_worker(&available_decode, &info).await?;

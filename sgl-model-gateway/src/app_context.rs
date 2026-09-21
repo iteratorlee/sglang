@@ -462,7 +462,11 @@ impl AppContextBuilder {
                 .expect("policy_registry must be set")
                 .clone(),
             client.clone(),
-            config.worker_startup_check_interval_secs,
+            if crate::core::pd_token_affinity_enabled() {
+                1
+            } else {
+                config.worker_startup_check_interval_secs
+            },
         )));
         self
     }

@@ -29,10 +29,15 @@
 //!
 //! prefix_hash trades optimal cache utilization for predictable O(log n) performance.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use super::{LoadBalancingPolicy, SelectWorkerInfo};
-use crate::{core::Worker, observability::metrics::Metrics};
+use crate::{
+    core::{DPLoadSnapshot, Worker, WorkerType},
+    observability::metrics::Metrics,
+};
+
+const LOAD_SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(3);
 
 /// Configuration for the PrefixHash load balancing policy
 #[derive(Debug, Clone)]
@@ -126,6 +131,88 @@ impl PrefixHashPolicy {
         (worker_load as f64) <= threshold
     }
 
+    fn snapshot_for<'a>(
+        worker: &dyn Worker,
+        info: &'a SelectWorkerInfo<'_>,
+    ) -> Option<&'a DPLoadSnapshot> {
+        info.load_snapshots?
+            .get(worker.url())
+            .filter(|snapshot| snapshot.is_fresh(LOAD_SNAPSHOT_MAX_AGE))
+    }
+
+    fn local_reservations(worker: &dyn Worker, info: &SelectWorkerInfo<'_>) -> usize {
+        info.local_reservations
+            .and_then(|loads| loads.get(worker.url()))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn effective_load(worker: &dyn Worker, info: &SelectWorkerInfo<'_>) -> usize {
+        let local = worker.load().max(Self::local_reservations(worker, info));
+        let Some(snapshot) = Self::snapshot_for(worker, info) else {
+            return local;
+        };
+        let runnable_waiting = snapshot
+            .queues
+            .as_ref()
+            .map(|queues| queues.waiting)
+            .unwrap_or(snapshot.num_waiting_reqs);
+        let stage_pressure = match worker.worker_type() {
+            WorkerType::Prefill { .. } => snapshot
+                .disaggregation
+                .as_ref()
+                .map(|load| load.prefill_bootstrap_queue_reqs + load.prefill_inflight_queue_reqs)
+                .unwrap_or(0),
+            WorkerType::Decode => snapshot
+                .disaggregation
+                .as_ref()
+                .map(|load| {
+                    load.decode_prealloc_queue_reqs
+                        + load.decode_transfer_queue_reqs
+                        + load.decode_retracted_queue_reqs
+                })
+                .unwrap_or(0),
+            WorkerType::Regular => 0,
+        };
+        let post_snapshot_tokens = info
+            .post_snapshot_reserved_tokens
+            .and_then(|loads| loads.get(worker.url()))
+            .copied()
+            .unwrap_or(0);
+        let post_snapshot_requests = info
+            .post_snapshot_reserved_requests
+            .and_then(|loads| loads.get(worker.url()))
+            .copied()
+            .unwrap_or(0);
+        let capacity_pressure = snapshot.kv_capacity.as_ref().map_or(0, |capacity| {
+            let demand = info.estimated_tokens.saturating_add(post_snapshot_tokens);
+            let token_pressure = if demand > capacity.full_available_tokens {
+                let deficit = demand - capacity.full_available_tokens;
+                1usize.saturating_add(deficit / info.estimated_tokens.max(1))
+            } else {
+                0
+            };
+            let slot_pressure = usize::from(
+                capacity
+                    .request_slots_available
+                    .is_some_and(|slots| slots <= post_snapshot_requests),
+            );
+            token_pressure.saturating_add(slot_pressure)
+        });
+
+        local
+            .max(snapshot.num_running_reqs)
+            .saturating_add(runnable_waiting)
+            .saturating_add(stage_pressure)
+            .saturating_add(capacity_pressure)
+    }
+
+    fn under_soft_cap(worker: &dyn Worker, info: &SelectWorkerInfo<'_>) -> bool {
+        !info
+            .soft_cap
+            .is_some_and(|cap| Self::local_reservations(worker, info) >= cap)
+    }
+
     /// Find worker using consistent hash ring with load balancing
     fn find_worker_with_load_balance(
         &self,
@@ -137,7 +224,7 @@ impl PrefixHashPolicy {
         let healthy_workers: Vec<(usize, &Arc<dyn Worker>)> = workers
             .iter()
             .enumerate()
-            .filter(|(_, w)| w.is_healthy())
+            .filter(|(_, w)| w.is_available() && Self::under_soft_cap(w.as_ref(), info))
             .collect();
 
         if healthy_workers.is_empty() {
@@ -145,7 +232,10 @@ impl PrefixHashPolicy {
         }
 
         // Calculate total load for load balancing
-        let total_load: usize = healthy_workers.iter().map(|(_, w)| w.load()).sum();
+        let total_load: usize = healthy_workers
+            .iter()
+            .map(|(_, w)| Self::effective_load(w.as_ref(), info))
+            .sum();
         let num_workers = healthy_workers.len();
 
         // Use pre-computed ring if available
@@ -165,7 +255,23 @@ impl PrefixHashPolicy {
                 ring.find_healthy_url(&key, |url| healthy_url_map.contains_key(url))
             {
                 if let Some(&(idx, worker)) = healthy_url_map.get(initial_url) {
-                    let worker_load = worker.load();
+                    let worker_load = Self::effective_load(worker.as_ref(), info);
+
+                    // With bounded affinity, keep the first two requests of a
+                    // hot prefix together unless the selected rank has more
+                    // than one unit of extra stage/capacity pressure. Once the
+                    // local cap is reached that rank is absent from the healthy
+                    // map and the ring walks to another DP rank.
+                    if info.soft_cap.is_some() {
+                        let least_load = healthy_workers
+                            .iter()
+                            .map(|(_, worker)| Self::effective_load(worker.as_ref(), info))
+                            .min()
+                            .unwrap_or(worker_load);
+                        if worker_load <= least_load.saturating_add(1) {
+                            return (Some(idx), Branch::RingHit);
+                        }
+                    }
 
                     // Check if initial worker has acceptable load
                     if self.load_ok(worker_load, total_load, num_workers) {
@@ -176,8 +282,14 @@ impl PrefixHashPolicy {
                     // This is a simpler approach than walking the ring
                     let least_loaded = healthy_workers
                         .iter()
-                        .filter(|(_, w)| self.load_ok(w.load(), total_load, num_workers))
-                        .min_by_key(|(_, w)| w.load());
+                        .filter(|(_, w)| {
+                            self.load_ok(
+                                Self::effective_load(w.as_ref(), info),
+                                total_load,
+                                num_workers,
+                            )
+                        })
+                        .min_by_key(|(_, w)| Self::effective_load(w.as_ref(), info));
 
                     if let Some(&(idx, _)) = least_loaded {
                         return (Some(idx), Branch::LoadBalanceWalk);
@@ -192,7 +304,7 @@ impl PrefixHashPolicy {
         // Fallback: no ring or ring lookup failed, use least loaded worker
         let least_loaded = healthy_workers
             .iter()
-            .min_by_key(|(_, w)| w.load())
+            .min_by_key(|(_, w)| Self::effective_load(w.as_ref(), info))
             .map(|(idx, _)| *idx);
 
         (least_loaded, Branch::FallbackLeastLoad)
@@ -339,6 +451,118 @@ mod tests {
         let (result2, _) = policy.select_worker_impl(&workers, &info2);
 
         assert_eq!(result1, result2, "Same prefix should route to same worker");
+    }
+
+    #[test]
+    fn test_hot_256_token_prefix_stays_affine_until_cap_two_then_balances() {
+        let policy = PrefixHashPolicy::with_defaults();
+        let workers = create_workers(&[
+            "http://w1:8000",
+            "http://w2:8000",
+            "http://w3:8000",
+            "http://w4:8000",
+        ]);
+        let ring = Arc::new(HashRing::new(&workers));
+        let mut first = vec![7; 256];
+        first.push(101);
+        let mut second = vec![7; 256];
+        second.push(202);
+
+        let empty = std::collections::HashMap::new();
+        let initial_info = SelectWorkerInfo {
+            tokens: Some(&first),
+            hash_ring: Some(ring.clone()),
+            local_reservations: Some(&empty),
+            soft_cap: Some(2),
+            ..Default::default()
+        };
+        let (initial, _) = policy.select_worker_impl(&workers, &initial_info);
+        let initial = initial.unwrap();
+
+        let one = std::collections::HashMap::from([(workers[initial].url().to_string(), 1)]);
+        let second_info = SelectWorkerInfo {
+            tokens: Some(&second),
+            hash_ring: Some(ring.clone()),
+            local_reservations: Some(&one),
+            soft_cap: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(
+            policy.select_worker_impl(&workers, &second_info).0,
+            Some(initial)
+        );
+
+        let two = std::collections::HashMap::from([(workers[initial].url().to_string(), 2)]);
+        let capped_info = SelectWorkerInfo {
+            tokens: Some(&second),
+            hash_ring: Some(ring),
+            local_reservations: Some(&two),
+            soft_cap: Some(2),
+            ..Default::default()
+        };
+        let (after_cap, _) = policy.select_worker_impl(&workers, &capped_info);
+        assert_ne!(after_cap, Some(initial));
+    }
+
+    #[test]
+    fn test_zero_free_kv_is_soft_pressure_and_never_removes_all_candidates() {
+        use crate::core::worker_manager::KVCapacitySnapshot;
+
+        let policy = PrefixHashPolicy::with_defaults();
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        let ring = Arc::new(HashRing::new(&workers));
+        let tokens = vec![42; 300];
+        let initial_info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            hash_ring: Some(ring.clone()),
+            soft_cap: Some(2),
+            ..Default::default()
+        };
+        let initial = policy
+            .select_worker_impl(&workers, &initial_info)
+            .0
+            .unwrap();
+
+        let full = DPLoadSnapshot {
+            age_at_observation: Some(Duration::ZERO),
+            kv_capacity: Some(KVCapacitySnapshot {
+                full_available_tokens: 0,
+                full_evictable_tokens: 500_000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let one_full =
+            std::collections::HashMap::from([(workers[initial].url().to_string(), full.clone())]);
+        let pressured_info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            hash_ring: Some(ring.clone()),
+            load_snapshots: Some(&one_full),
+            estimated_tokens: 128_000,
+            soft_cap: Some(2),
+            ..Default::default()
+        };
+        assert_ne!(
+            policy.select_worker_impl(&workers, &pressured_info).0,
+            Some(initial)
+        );
+
+        let all_full = workers
+            .iter()
+            .map(|worker| (worker.url().to_string(), full.clone()))
+            .collect();
+        let fallback_info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            hash_ring: Some(ring),
+            load_snapshots: Some(&all_full),
+            estimated_tokens: 128_000,
+            soft_cap: Some(2),
+            ..Default::default()
+        };
+        assert!(policy
+            .select_worker_impl(&workers, &fallback_info)
+            .0
+            .is_some());
     }
 
     #[test]

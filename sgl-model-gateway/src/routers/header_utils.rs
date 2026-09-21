@@ -295,5 +295,6 @@ mod tests {
         assert!(!should_forward_request_header("cookie"));
         assert!(!should_forward_request_header("x-custom-header"));
         assert!(!should_forward_request_header("x-api-key"));
+        assert!(!should_forward_request_header("x-override-routed-dp-rank"));
     }
 }
