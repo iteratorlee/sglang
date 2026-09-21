@@ -228,6 +228,6 @@ def run_prepared_prefill(
         *state.stride(),
         num_warps=1,
         num_stages=3,
-        multibuffer=False,
+        multibuffer=True,
     )
     return output

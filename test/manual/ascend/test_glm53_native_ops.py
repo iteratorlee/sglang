@@ -286,7 +286,13 @@ class TestGlm53NativeOps(unittest.TestCase):
         reference = glm_kda_varlen_recurrent_npu(
             **kwargs, initial_state_source=reference_state
         )
-        with patch.dict(os.environ, {"SGLANG_GLM53_KDA_PREFILL_PREPARE": "1"}):
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_GLM53_KDA_PREFILL_PREPARE": "1",
+                "SGLANG_GLM53_KDA_PREFILL_BV16": "1",
+            },
+        ):
             actual = glm_kda_varlen_recurrent_npu(
                 **kwargs, initial_state_source=prepared_state, prefill=True
             )
