@@ -109,6 +109,21 @@ receive time alone misses a snapshot that was already stale inside the D host.
 
 ## Compatibility and cost
 
+Native PD token affinity is enabled only with
+`SGLANG_GATEWAY_PD_TOKEN_AFFINITY=1`. While enabled, `/generate` accepts only
+one non-empty, nonnegative `input_ids` token list and
+`sampling_params.n <= 1`. Text/input-embedding prompts, batched `input_ids`,
+and parallel sampling return HTTP 400 with
+`invalid_pd_token_affinity_input` before worker selection.
+
+This restriction preserves the cap2 contract. SRT expands batched input and
+parallel sampling into multiple scheduler requests, while the Gateway's
+reservation currently counts one HTTP request. Treating such a request as one
+lease, flattening its token lists, or merely disabling affinity would allow it
+to bypass the per-rank request cap. When the feature flag is absent or false,
+the Gateway retains the existing Native PD request behavior and does not apply
+this validation.
+
 `LoadSnapshot` is map-shaped msgpack. New readers default missing monotonic and
 capacity fields when they receive an old payload. Old readers ignore the new
 map keys. The capacity struct omits unavailable optional values. The existing

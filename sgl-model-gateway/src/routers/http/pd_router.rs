@@ -331,16 +331,42 @@ impl PDRouter {
         None
     }
 
-    fn get_generate_tokens(req: &GenerateRequest) -> Option<Arc<[u32]>> {
-        let InputIds::Single(ids) = req.input_ids.as_ref()? else {
-            return None;
+    fn get_generate_affinity_tokens(req: &GenerateRequest) -> Result<Arc<[u32]>, &'static str> {
+        if req.text.is_some() || req.input_embeds.is_some() {
+            return Err("Native PD token affinity requires input_ids as the only prompt input");
+        }
+
+        let ids = match req.input_ids.as_ref() {
+            Some(InputIds::Single(ids)) => ids,
+            Some(InputIds::Batch(_)) => {
+                return Err(
+                    "Native PD token affinity supports only non-empty single input_ids; batched input_ids expand to multiple PD requests",
+                );
+            }
+            None => {
+                return Err("Native PD token affinity requires non-empty single input_ids");
+            }
         };
+        if ids.is_empty() {
+            return Err("Native PD token affinity requires non-empty single input_ids");
+        }
+        if req
+            .sampling_params
+            .as_ref()
+            .and_then(|params| params.n)
+            .is_some_and(|n| n > 1)
+        {
+            return Err(
+                "Native PD token affinity requires sampling_params.n <= 1; n > 1 expands to multiple PD requests",
+            );
+        }
+
         ids.iter()
             .copied()
             .map(u32::try_from)
             .collect::<Result<Vec<_>, _>>()
-            .ok()
             .map(Arc::from)
+            .map_err(|_| "Native PD token affinity requires nonnegative input_ids")
     }
 
     fn get_generate_estimated_tokens(req: &GenerateRequest) -> usize {
@@ -364,6 +390,16 @@ impl PDRouter {
         raw_body: &Value,
         model_id: Option<&str>,
     ) -> Response {
+        let tokens = if self.pd_token_affinity {
+            match Self::get_generate_affinity_tokens(body) {
+                Ok(tokens) => Some(tokens),
+                Err(message) => {
+                    return error::bad_request("invalid_pd_token_affinity_input", message);
+                }
+            }
+        } else {
+            None
+        };
         let request_text = if self.policies_need_request_text() {
             body.text.clone()
         } else {
@@ -375,7 +411,7 @@ impl PDRouter {
             is_stream: body.stream,
             return_logprob: body.return_logprob.unwrap_or(false),
             request_text,
-            tokens: Self::get_generate_tokens(body),
+            tokens,
             estimated_tokens: Self::get_generate_estimated_tokens(body),
             model_id,
             headers: headers.cloned(),
@@ -2290,8 +2326,10 @@ mod tests {
         });
         let typed: GenerateRequest = serde_json::from_value(raw.clone()).unwrap();
         assert_eq!(
-            PDRouter::get_generate_tokens(&typed).as_deref(),
-            Some([11, 12, 13, 14].as_slice())
+            PDRouter::get_generate_affinity_tokens(&typed)
+                .unwrap()
+                .as_ref(),
+            [11, 12, 13, 14].as_slice()
         );
         assert_eq!(PDRouter::get_generate_estimated_tokens(&typed), 1028);
 
@@ -2301,6 +2339,79 @@ mod tests {
         assert!(typed_json.get("cache_salt").is_none());
         assert_eq!(raw["cache_salt"], "tenant-a");
         assert_eq!(raw["routed_dp_rank"], 7);
+    }
+
+    #[test]
+    fn test_generate_token_affinity_rejects_invalid_or_fanout_inputs() {
+        let cases = [
+            (
+                json!({"input_ids": []}),
+                "requires non-empty single input_ids",
+            ),
+            (
+                json!({"input_ids": [11, -1, 13]}),
+                "requires nonnegative input_ids",
+            ),
+            (
+                json!({"input_ids": [[11, 12], [13, 14]]}),
+                "batched input_ids expand to multiple PD requests",
+            ),
+            (
+                json!({"text": "tokenize me"}),
+                "requires input_ids as the only prompt input",
+            ),
+            (
+                json!({
+                    "input_ids": [11, 12, 13],
+                    "sampling_params": {"n": 2}
+                }),
+                "n > 1 expands to multiple PD requests",
+            ),
+        ];
+
+        for (raw, expected) in cases {
+            let typed: GenerateRequest = serde_json::from_value(raw).unwrap();
+            let error = PDRouter::get_generate_affinity_tokens(&typed).unwrap_err();
+            assert!(
+                error.contains(expected),
+                "expected {expected:?} in {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_token_affinity_invalid_inputs_return_http_400() {
+        use http_body_util::BodyExt;
+
+        let mut router = create_test_pd_router();
+        router.pd_token_affinity = true;
+        let cases = [
+            json!({"input_ids": []}),
+            json!({"input_ids": [11, -1]}),
+            json!({"input_ids": [[11], [12]]}),
+            json!({"text": "tokenize me"}),
+            json!({"input_ids": [11, 12], "sampling_params": {"n": 2}}),
+        ];
+
+        for raw in cases {
+            let typed: GenerateRequest = serde_json::from_value(raw.clone()).unwrap();
+            let response = router.route_generate_raw(None, &typed, &raw, None).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(error::HEADER_X_SMG_ERROR_CODE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("invalid_pd_token_affinity_input")
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                body["error"]["code"],
+                Value::String("invalid_pd_token_affinity_input".to_string())
+            );
+        }
+        assert!(router.reservations.views(&HashMap::new()).0.is_empty());
     }
 
     #[tokio::test]
