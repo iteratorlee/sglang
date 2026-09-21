@@ -504,50 +504,43 @@ impl PDRouter {
         Ok(original)
     }
 
-    fn inject_prefill_dp_rank_for_decode<'a>(
-        decode_request: Cow<'a, Value>,
-        prefill_worker: &dyn Worker,
+    fn inject_selected_pd_ranks<'a>(
+        request: Cow<'a, Value>,
+        prefill_dp_rank: Option<usize>,
+        decode_dp_rank: Option<usize>,
     ) -> Result<Cow<'a, Value>, String> {
-        let Some(prefill_dp_rank) = prefill_worker.dp_rank() else {
-            return Ok(decode_request);
-        };
+        let has_rank_hints = request.as_object().is_some_and(|obj| {
+            obj.contains_key(Self::DISAGG_PREFILL_DP_RANK_KEY)
+                || obj.contains_key(Self::DISAGG_DECODE_DP_RANK_KEY)
+        });
+        if prefill_dp_rank.is_none() && decode_dp_rank.is_none() && !has_rank_hints {
+            return Ok(request);
+        }
 
-        let mut decode_request = decode_request.into_owned();
-        let Some(obj) = decode_request.as_object_mut() else {
+        let mut request = request.into_owned();
+        let Some(obj) = request.as_object_mut() else {
             return Err(
-                "Failed to insert disagg_prefill_dp_rank because request body is not an object"
+                "Failed to insert selected PD ranks because request body is not an object"
                     .to_string(),
             );
         };
 
-        obj.remove(Self::DISAGG_DECODE_DP_RANK_KEY);
-        obj.insert(
-            Self::DISAGG_PREFILL_DP_RANK_KEY.to_string(),
-            Value::from(prefill_dp_rank as u64),
-        );
-        Ok(Cow::Owned(decode_request))
-    }
-
-    fn inject_decode_dp_rank_for_prefill<'a>(
-        prefill_request: Cow<'a, Value>,
-        decode_worker: &dyn Worker,
-    ) -> Result<Cow<'a, Value>, String> {
-        let Some(decode_dp_rank) = decode_worker.dp_rank() else {
-            return Ok(prefill_request);
-        };
-        let mut prefill_request = prefill_request.into_owned();
-        let Some(obj) = prefill_request.as_object_mut() else {
-            return Err(
-                "Failed to insert disagg_decode_dp_rank because request body is not an object"
-                    .to_string(),
-            );
-        };
+        // Selected workers are authoritative over client-provided rank hints.
         obj.remove(Self::DISAGG_PREFILL_DP_RANK_KEY);
-        obj.insert(
-            Self::DISAGG_DECODE_DP_RANK_KEY.to_string(),
-            Value::from(decode_dp_rank as u64),
-        );
-        Ok(Cow::Owned(prefill_request))
+        obj.remove(Self::DISAGG_DECODE_DP_RANK_KEY);
+        if let Some(prefill_dp_rank) = prefill_dp_rank {
+            obj.insert(
+                Self::DISAGG_PREFILL_DP_RANK_KEY.to_string(),
+                Value::from(prefill_dp_rank as u64),
+            );
+        }
+        if let Some(decode_dp_rank) = decode_dp_rank {
+            obj.insert(
+                Self::DISAGG_DECODE_DP_RANK_KEY.to_string(),
+                Value::from(decode_dp_rank as u64),
+            );
+        }
+        Ok(Cow::Owned(request))
     }
 
     async fn prepare_worker_request<'a>(
@@ -584,12 +577,15 @@ impl PDRouter {
         prefill: &dyn Worker,
         decode: &dyn Worker,
     ) -> Result<(PreparedWorkerRequest<'a>, PreparedWorkerRequest<'a>), String> {
-        let prefill_json_request =
-            Self::inject_decode_dp_rank_for_prefill(Cow::Borrowed(json_request), decode)?;
+        let prefill_json_request = Self::inject_selected_pd_ranks(
+            Cow::Borrowed(json_request),
+            prefill.dp_rank(),
+            decode.dp_rank(),
+        )?;
         let prefill_request =
             Self::prepare_worker_request(route, prefill, prefill_json_request).await?;
         let decode_json_request =
-            Self::inject_prefill_dp_rank_for_decode(Cow::Borrowed(json_request), prefill)?;
+            Self::inject_selected_pd_ranks(Cow::Borrowed(json_request), prefill.dp_rank(), None)?;
         let decode_request =
             Self::prepare_worker_request(route, decode, decode_json_request).await?;
 
@@ -2169,13 +2165,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_prepare_pd_worker_requests_uses_dp_aware_rank() {
-        let prefill = DPAwareWorkerBuilder::new("http://prefill:30000", 2, 4)
+    async fn test_prepare_pd_worker_requests_carries_selected_prefill_rank_to_both_sides() {
+        let prefill = DPAwareWorkerBuilder::new("http://prefill:30000", 1, 2)
             .worker_type(WorkerType::Prefill {
                 bootstrap_port: Some(8998),
             })
             .build();
-        let decode = DPAwareWorkerBuilder::new("http://decode:30001", 1, 4)
+        let decode = DPAwareWorkerBuilder::new("http://decode:30001", 6, 8)
             .worker_type(WorkerType::Decode)
             .build();
         let request = json!({
@@ -2189,7 +2185,8 @@ mod tests {
             "disagg_decode_dp_rank": 96,
             "bootstrap_host": "prefill",
             "bootstrap_port": 8998,
-            "bootstrap_room": 1234,
+            // room % P_DP is 0, deliberately different from selected P rank 1.
+            "bootstrap_room": 400,
         });
 
         let (prefill_request, decode_request) =
@@ -2201,24 +2198,25 @@ mod tests {
             prefill_request.endpoint_url,
             "http://prefill:30000/v1/completions"
         );
-        assert_eq!(prefill_request.body["routed_dp_rank"], 2);
-        assert_eq!(prefill_request.body["disagg_decode_dp_rank"], 1);
+        assert_eq!(prefill_request.body["routed_dp_rank"], 1);
+        assert_eq!(prefill_request.body["disagg_prefill_dp_rank"], 1);
+        assert_eq!(prefill_request.body["disagg_decode_dp_rank"], 6);
         assert!(prefill_request.body.get("data_parallel_rank").is_none());
-        assert!(prefill_request.body.get("disagg_prefill_dp_rank").is_none());
         assert_eq!(prefill_request.body["rid"], "cc-request-1");
         assert_eq!(prefill_request.body["cache_salt"], "cc-session-7");
+        assert_eq!(prefill_request.body["bootstrap_room"], 400);
 
         assert_eq!(
             decode_request.endpoint_url,
             "http://decode:30001/v1/completions"
         );
-        assert_eq!(decode_request.body["routed_dp_rank"], 1);
+        assert_eq!(decode_request.body["routed_dp_rank"], 6);
         assert!(decode_request.body.get("data_parallel_rank").is_none());
-        assert_eq!(decode_request.body["disagg_prefill_dp_rank"], 2);
+        assert_eq!(decode_request.body["disagg_prefill_dp_rank"], 1);
         assert!(decode_request.body.get("disagg_decode_dp_rank").is_none());
         assert_eq!(decode_request.body["rid"], "cc-request-1");
         assert_eq!(decode_request.body["cache_salt"], "cc-session-7");
-        assert_eq!(decode_request.body["bootstrap_room"], 1234);
+        assert_eq!(decode_request.body["bootstrap_room"], 400);
         assert!(matches!(prefill_request.body, Cow::Owned(_)));
         assert!(matches!(decode_request.body, Cow::Owned(_)));
     }
@@ -2257,6 +2255,37 @@ mod tests {
         assert!(decode_request.body.get("disagg_prefill_dp_rank").is_none());
         assert!(matches!(prefill_request.body, Cow::Borrowed(_)));
         assert!(matches!(decode_request.body, Cow::Borrowed(_)));
+    }
+
+    #[tokio::test]
+    async fn test_prepare_pd_worker_requests_removes_forged_ranks_for_non_dp_workers() {
+        let prefill = BasicWorkerBuilder::new("http://prefill:30000")
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            })
+            .build();
+        let decode = BasicWorkerBuilder::new("http://decode:30001")
+            .worker_type(WorkerType::Decode)
+            .build();
+        let request = json!({
+            "prompt": "shared prefix",
+            "disagg_prefill_dp_rank": 7,
+            "disagg_decode_dp_rank": 6,
+            "cache_salt": "tenant-extension",
+        });
+
+        let (prefill_request, decode_request) =
+            PDRouter::prepare_pd_worker_requests("/v1/completions", &request, &prefill, &decode)
+                .await
+                .unwrap();
+
+        for body in [&prefill_request.body, &decode_request.body] {
+            assert!(body.get("disagg_prefill_dp_rank").is_none());
+            assert!(body.get("disagg_decode_dp_rank").is_none());
+            assert_eq!(body["cache_salt"], "tenant-extension");
+        }
+        assert!(matches!(prefill_request.body, Cow::Owned(_)));
+        assert!(matches!(decode_request.body, Cow::Owned(_)));
     }
 
     #[test]
