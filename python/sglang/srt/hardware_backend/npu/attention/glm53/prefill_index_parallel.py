@@ -16,9 +16,11 @@ logger = logging.getLogger(__name__)
 
 _PD_MODE_ENV = "SGLANG_GLM53_PD_PREFILL_INDEX_TP_MODE"
 _VERIFY_DIR_ENV = "SGLANG_GLM53_PREFILL_INDEX_VERIFY_DIR"
+_PD_DP_PERFORMANCE_ENV = "SGLANG_GLM53_PD_PREFILL_INDEX_TP_DP_PERFORMANCE"
 _PD_VERIFY_MODE = "verify"
 _PD_PERFORMANCE_MODE = "performance"
 _PD_MODES = frozenset((_PD_VERIFY_MODE, _PD_PERFORMANCE_MODE))
+_VALIDATED_PD_DP_ATTN_TOPOLOGIES = frozenset(((2, 8), (4, 4)))
 
 # One record per execution mode and process is enough to prove that the
 # optimized branch ran. A server process owns only one rank in production.
@@ -151,6 +153,30 @@ def _pd_prefill_mode():
     return os.getenv(_PD_MODE_ENV, _PD_VERIFY_MODE).strip().lower()
 
 
+def _pd_prefill_topology_supported(args):
+    """Preserve DP1 and admit only audited single-node DP-attention layouts."""
+    if args.attn_cp_size != 1 or args.enable_prefill_cp:
+        return False
+    if args.dp_size == 1:
+        return (
+            not args.enable_dp_attention
+            and args.moe_dp_size == args.dwdp_size == 1
+        )
+    return (
+        args.enable_dp_attention
+        and args.nnodes == 1
+        and args.tp_size == args.ep_size == 16
+        and args.pp_size == 1
+        and args.moe_dp_size == args.dwdp_size == 1
+        # ServerArgs contains input leaves, not ParallelContext.attn_tp_size.
+        # DP attention is on, TP16/CP1 are checked, and DP is bounded before
+        # division: this is runtime_context.derive_attention_widths arithmetic.
+        and args.dp_size in (2, 4)
+        and (args.dp_size, args.tp_size // args.dp_size // args.attn_cp_size)
+        in _VALIDATED_PD_DP_ATTN_TOPOLOGIES
+    )
+
+
 def enabled(q, forward_batch):
     import torch
 
@@ -177,12 +203,15 @@ def enabled(q, forward_batch):
         args.tp_size == args.ep_size == 16
         and args.nnodes == 1
         and args.pp_size == 1
-        and not args.enable_dp_attention
         and not args.enable_two_batch_overlap
         and args.disable_overlap_schedule
         and args.quantization == "modelslim"
         and (
-            (args.disable_radix_cache and args.disaggregation_mode == "null")
+            (
+                not args.enable_dp_attention
+                and args.disable_radix_cache
+                and args.disaggregation_mode == "null"
+            )
             or _pd_prefill_enabled(args, forward_batch)
         )
     )
@@ -198,9 +227,17 @@ def _pd_prefill_enabled(args, forward_batch):
     restoration itself remains outside this row-partition optimization.
     """
     mode = _pd_prefill_mode()
+    is_dp_candidate = args.dp_size > 1
     return (
         args.disaggregation_mode == "prefill"
         and os.getenv("SGLANG_GLM53_PD_PREFILL_INDEX_TP", "0") == "1"
+        and _pd_prefill_topology_supported(args)
+        and (not is_dp_candidate or mode in _PD_MODES)
+        and (
+            not is_dp_candidate
+            or mode != _PD_PERFORMANCE_MODE
+            or os.getenv(_PD_DP_PERFORMANCE_ENV, "0") == "1"
+        )
         and (
             args.disable_radix_cache
             or (
@@ -211,9 +248,6 @@ def _pd_prefill_enabled(args, forward_batch):
                 )
             )
         )
-        and args.dp_size == args.moe_dp_size == args.dwdp_size == 1
-        and args.attn_cp_size == 1
-        and not args.enable_prefill_cp
         and forward_batch.forward_mode.is_extend_without_speculative()
         and not forward_batch.forward_mode.is_mixed()
     )
