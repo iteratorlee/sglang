@@ -7,12 +7,13 @@ import os
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_server_args, get_device, get_spec
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
+from sglang.srt.runtime_context import get_device, get_server_args, get_spec
 from sglang.srt.utils import is_npu
 
 from .graph_ops import scatter_rows_
@@ -73,6 +74,22 @@ def _get_index_k_buffer(forward_batch: ForwardBatch, layer_id: int):
     if wait_for_layer is not None:
         wait_for_layer(layer_id)
     return full_pool.get_index_k_buffer(transfer_id(layer_id))
+
+
+def get_prefill_sparse_block_size(forward_batch: ForwardBatch) -> int:
+    """Return the shared KPool/SFA layout choice for ordinary prefill."""
+
+    backend = get_attn_backend()
+    backend = getattr(backend, "full_attn_backend", backend)
+    if (
+        getattr(backend, "enable_sparsity_driven_kv_offload", False)
+        or (
+            is_dsa_enable_prefill_cp()
+            and forward_batch.attn_cp_metadata is not None
+        )
+    ):
+        return 1
+    return getattr(backend, "kpool_prefill_sparse_block_size", 1)
 
 
 def _ascend_lightning_weights(
@@ -285,6 +302,44 @@ class AscendIndexerKPoolMixin:
         future = seq_lens.to(output.dtype).view(-1, 1)
         return torch.where(output >= 0, output, future)
 
+    def _pool_blocks_with_tail(
+        self, pool_indices: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        """Keep KPool selections grouped for block-wise prefill SFA.
+
+        A selected pool represents exactly the same four aligned tokens that
+        ``_expand_with_tail`` emits. The one extra block contains the current
+        incomplete causal tail. Any remaining slots point to the first wholly
+        future block so eager gathers stay legal and sparse_mode=3 masks them.
+        """
+
+        if self.index_kpool != 4:
+            raise ValueError("Block-wise GLM prefill requires index_kpool=4")
+        seq_lens = positions + 1
+        tail_count = torch.remainder(seq_lens, self.index_kpool)
+        closed_pools = torch.div(
+            seq_lens, self.index_kpool, rounding_mode="floor"
+        )
+        history_len = torch.minimum(
+            closed_pools,
+            torch.full_like(closed_pools, pool_indices.shape[1]),
+        )
+        output = F.pad(pool_indices, (0, 1), value=-1)
+        columns = torch.arange(
+            output.shape[1], device=output.device, dtype=history_len.dtype
+        ).view(1, -1)
+        output = torch.where(
+            (tail_count > 0).view(-1, 1) & (columns == history_len.view(-1, 1)),
+            closed_pools.to(output.dtype).view(-1, 1),
+            output,
+        )
+        future_pool = torch.div(
+            seq_lens + self.index_kpool - 1,
+            self.index_kpool,
+            rounding_mode="floor",
+        ).to(output.dtype)
+        return torch.where(output >= 0, output, future_pool.view(-1, 1))
+
     def _store_prefill_pools(
         self,
         key: torch.Tensor,
@@ -467,7 +522,11 @@ class AscendIndexerKPoolMixin:
                 q, weights, compressed_by_request, forward_batch
             )
         valid_rows = pool_indices.shape[0]
-        topk = self._expand_with_tail(pool_indices, positions[:valid_rows])
+        sparse_block_size = get_prefill_sparse_block_size(forward_batch)
+        if sparse_block_size == self.index_kpool == 4:
+            topk = self._pool_blocks_with_tail(pool_indices, positions[:valid_rows])
+        else:
+            topk = self._expand_with_tail(pool_indices, positions[:valid_rows])
         # mHC/communication kernels may pad hidden states (e.g. 27 -> 32
         # tokens). Match the regular DSA indexer's graph/eager contract: keep
         # valid rows first. Padded query rows are outside actual_seq_lengths_q,

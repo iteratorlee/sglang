@@ -59,6 +59,18 @@ class IndexTopKShareState:
             topk_indices = cp_gather_after_forward(topk_indices, self._forward_batch)
         self._topk_indices = topk_indices
 
+    @staticmethod
+    def _expand_kpool_seed(src, positions, token_width):
+        """Restore the token-index MTP seed ABI from GLM prefill block IDs."""
+        import torch
+
+        offsets = torch.arange(4, device=src.device, dtype=src.dtype)
+        tokens = (src.unsqueeze(-1) * 4 + offsets).flatten(1)[:, :token_width]
+        # Match _expand_with_tail exactly, including every invalid slot.
+        # Reused decode seeds must not retain the rounded-up block filler.
+        future = (positions + 1).to(dtype=src.dtype).view(-1, 1)
+        return torch.minimum(tokens, future)
+
     def publish(self) -> None:
         if self._topk_indices is None or not self.should_publish:
             return
@@ -72,6 +84,27 @@ class IndexTopKShareState:
                 if sel is None
                 else self._topk_indices[sel]
             )
+            mode = self._forward_batch.forward_mode
+            if (
+                src.device.type == "npu"
+                and src.ndim == seed_buf.ndim == 2
+                and src.shape[1] * 4 - 1 == seed_buf.shape[1]
+                and mode.is_extend()
+                and not mode.is_draft_extend_v2()
+                and not mode.is_target_verify()
+            ):
+                from sglang.srt.hardware_backend.npu.attention.glm53.kpool_indexer import (
+                    get_prefill_sparse_block_size,
+                )
+
+                if get_prefill_sparse_block_size(self._forward_batch) == 4:
+                    positions = self._forward_batch.positions
+                    positions = (
+                        positions[: src.shape[0]] if sel is None else positions[sel]
+                    )
+                    src = self._expand_kpool_seed(
+                        src, positions, seed_buf.shape[1]
+                    )
             seed_buf[: src.shape[0]].copy_(src)
 
     @classmethod

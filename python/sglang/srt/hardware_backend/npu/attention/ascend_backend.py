@@ -329,6 +329,25 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
             self.q_head_dim = self.qk_rope_head_dim + self.qk_nope_head_dim
+            text_config = model_runner.model_config.hf_text_config
+            # GLM's KPool top-k already selects aligned four-token groups.
+            # Keep them grouped for ordinary BF16 prefill so SFA can coalesce
+            # the same KV reads instead of consuming 4x as many token indices.
+            self.kpool_prefill_sparse_block_size = (
+                4
+                if get_bool_env_var("SGLANG_GLM53_SFA_KPOOL_BLOCK", "False")
+                and self.kv_cache_dtype == torch.bfloat16
+                and self.qk_rope_head_dim == 0
+                and getattr(text_config, "index_kpool", 1) == 4
+                and getattr(text_config, "index_kpool_compress", False)
+                and getattr(text_config, "index_kpool_always_select_tail", False)
+                else 1
+            )
+            if get_bool_env_var("SGLANG_GLM53_SFA_KPOOL_AUDIT", "False"):
+                logger.info(
+                    "GLM KPool prefill SFA sparse_block_size=%d",
+                    self.kpool_prefill_sparse_block_size,
+                )
         else:
             self.use_alibi = getattr(model_runner.model_config, "use_alibi", False)
             if (
@@ -1229,6 +1248,13 @@ class AscendAttnBackend(AttentionBackend):
         else:
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+            sparse_block_size = 1
+            if is_prefill:
+                from sglang.srt.hardware_backend.npu.attention.glm53.kpool_indexer import (
+                    get_prefill_sparse_block_size,
+                )
+
+                sparse_block_size = get_prefill_sparse_block_size(forward_batch)
             topk_indices = _expand_dsa_sparse_indices(topk_indices)
             if self.kv_cache_dtype == torch.float8_e4m3fn:
                 assert q_nope.dtype == q_pe.dtype == torch.bfloat16
@@ -1250,7 +1276,7 @@ class AscendAttnBackend(AttentionBackend):
                         device=q_nope.device, dtype=torch.int32
                     ),
                     block_table=self.forward_metadata.block_tables,
-                    sparse_block_size=1,
+                    sparse_block_size=sparse_block_size,
                     layout_query="TND",
                     layout_kv="PA_BSND",
                     sparse_mode=3,
@@ -1275,7 +1301,7 @@ class AscendAttnBackend(AttentionBackend):
                         device=q_nope.device, dtype=torch.int32
                     ),
                     block_table=self.forward_metadata.block_tables,
-                    sparse_block_size=1,
+                    sparse_block_size=sparse_block_size,
                     layout_query="TND",
                     layout_kv="PA_BSND",
                     sparse_mode=3,
