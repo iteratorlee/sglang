@@ -301,6 +301,60 @@ class TestGlm53NativeOps(unittest.TestCase):
             prepared_state, reference_state, rtol=1e-4, atol=1e-5
         )
 
+    def test_kda_prepared_prefill_h8_matches_generic_exact(self):
+        from sglang.srt.hardware_backend.npu.attention.glm53.kda_recurrent_npu import (
+            glm_kda_varlen_recurrent_npu,
+        )
+
+        heads, tokens = 8, 129
+        q, k, v, a = [
+            torch.randn(1, tokens, heads, 128, dtype=torch.bfloat16, device="npu")
+            for _ in range(4)
+        ]
+        b = torch.randn(1, tokens, heads, device="npu", dtype=torch.bfloat16)
+        alog = torch.randn(1, 1, heads, 1, device="npu")
+        bias = torch.randn(heads * 128, device="npu")
+        starts = torch.tensor([0, tokens], device="npu", dtype=torch.int32)
+        ids = torch.tensor([2], device="npu", dtype=torch.int32)
+        seed = torch.randn(4, heads, 128, 128, device="npu") * 0.1
+        generic_state = seed.clone().transpose(-1, -2)
+        prepared_state = seed.clone().transpose(-1, -2)
+        kwargs = dict(
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            A_log=alog,
+            dt_bias=bias,
+            initial_state_indices=ids,
+            cu_seqlens=starts,
+            lower_bound=-5.0,
+            prefill=True,
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_GLM53_KDA_PREFILL_PREPARE": "0",
+                "SGLANG_GLM53_KDA_PREFILL_BV16": "1",
+            },
+        ):
+            expected = glm_kda_varlen_recurrent_npu(
+                **kwargs, initial_state_source=generic_state
+            )
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_GLM53_KDA_PREFILL_PREPARE": "1",
+                "SGLANG_GLM53_KDA_PREFILL_BV16": "1",
+            },
+        ):
+            actual = glm_kda_varlen_recurrent_npu(
+                **kwargs, initial_state_source=prepared_state
+            )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(prepared_state, generic_state, rtol=0, atol=0)
+
     def test_mhc_fused_norm_and_post(self):
         for rows in (1, 4, 16, 129):
             x = torch.randn(rows, 16384, device="npu", dtype=torch.bfloat16)

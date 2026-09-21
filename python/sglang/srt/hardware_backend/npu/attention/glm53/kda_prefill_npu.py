@@ -72,8 +72,11 @@ def _prepared_recurrent(
     S1: tl.constexpr,
     SK: tl.constexpr,
     SV: tl.constexpr,
+    HEAD_OFFSET: tl.constexpr = 0,
 ):
-    iv, req, head = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    iv = tl.program_id(0)
+    req = 0
+    head = HEAD_OFFSET + tl.program_id(2)
     bos = tl.load(STARTS + req).to(tl.int64)
     eos = tl.load(STARTS + req + 1).to(tl.int64)
     ks = tl.arange(0, D)
@@ -122,10 +125,12 @@ def _bv16_b1_layout_ok(q, k, v, a, b, output, state, indices, starts,
     """
     import torch
 
+    heads = q.shape[2] if q.ndim == 4 else 0
     if (
         q.ndim != 4
         or q.shape[0] != 1
-        or q.shape[2:] != (4, 128)
+        or heads not in (4, 8)
+        or q.shape[3] != 128
         or not 128 <= q.shape[1] <= 16384
         or q.device.type != "npu"
         or any(t.shape != q.shape for t in (k, v, a, output))
@@ -133,11 +138,11 @@ def _bv16_b1_layout_ok(q, k, v, a, b, output, state, indices, starts,
         or any(t.dtype != torch.bfloat16 or t.device != q.device
                or not t.is_contiguous() for t in (q, k, v, a, b, output))
         or state.ndim != 4
-        or state.shape[1:] != (4, 128, 128)
+        or state.shape[1:] != (heads, 128, 128)
         or state.dtype != torch.float32
         or state.device != q.device
-        or state.stride() not in ((65536, 16384, 128, 1),
-                                  (65536, 16384, 1, 128))
+        or state.stride() not in ((heads * 16384, 16384, 128, 1),
+                                  (heads * 16384, 16384, 1, 128))
         or indices.ndim != 1
         or indices.numel() != 1
         or starts.ndim != 1
@@ -177,11 +182,12 @@ def run_prepared_prefill(
 ):
     import torch
 
+    heads = q.shape[2]
     normalized_q = torch.empty(q.shape, dtype=torch.float32, device=q.device)
     normalized_k = torch.empty_like(normalized_q)
     gate_decay = torch.empty_like(normalized_q)
     beta = torch.empty(b.shape, dtype=torch.float32, device=b.device)
-    _prepare_inputs[(q.shape[1] * 4,)](
+    _prepare_inputs[(q.shape[1] * heads,)](
         q,
         k,
         a,
@@ -194,7 +200,7 @@ def run_prepared_prefill(
         beta,
         scale,
         lower_bound,
-        4,
+        heads,
         128,
         num_warps=1,
         num_stages=3,
@@ -209,25 +215,31 @@ def run_prepared_prefill(
                               track_indices, track_lens)
     ):
         value_tile = 16
-    _prepared_recurrent[(128 // value_tile, 1, 4)](
-        normalized_q,
-        normalized_k,
-        v,
-        gate_decay,
-        beta,
-        output,
-        state,
-        indices,
-        starts,
-        track_indices if track_indices is not None else indices,
-        track_lens if track_lens is not None else starts,
-        track_indices is not None,
-        4,
-        128,
-        value_tile,
-        *state.stride(),
-        num_warps=1,
-        num_stages=3,
-        multibuffer=True,
-    )
+    # Keep each launch at the exact H4 grid shape. Larger grids change the
+    # head-0 output reduction on Ascend even though the FP32 state stays exact.
+    # Head groups write disjoint output/state ranges and carry the full token
+    # stride through H, so no tensor copies or arithmetic changes are needed.
+    for head_offset in range(0, heads, 4):
+        _prepared_recurrent[(128 // value_tile, 1, 4)](
+            normalized_q,
+            normalized_k,
+            v,
+            gate_decay,
+            beta,
+            output,
+            state,
+            indices,
+            starts,
+            track_indices if track_indices is not None else indices,
+            track_lens if track_lens is not None else starts,
+            track_indices is not None,
+            heads,
+            128,
+            value_tile,
+            *state.stride(),
+            HEAD_OFFSET=head_offset,
+            num_warps=1,
+            num_stages=3,
+            multibuffer=True,
+        )
     return output

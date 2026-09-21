@@ -249,7 +249,8 @@ def glm_kda_varlen_recurrent_npu(
     if (
         prefill
         and intermediate_state is None
-        and num_q_heads == num_value_heads == 4
+        and num_q_heads == num_value_heads
+        and num_q_heads in (4, 8)
         and key_dim == value_dim == 128
         and initial_state_indices.numel() == 1
         and q.shape[1] >= 128
