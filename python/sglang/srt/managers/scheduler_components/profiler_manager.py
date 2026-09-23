@@ -491,4 +491,20 @@ class SchedulerProfilerManager:
                 )
                 return self._start_profile()
         else:
-            return self._stop_profile()
+            # A stage profile is configured on every DP scheduler, but only
+            # schedulers that receive a request run enough steps to stop it.
+            # Explicit /stop_profile must also disarm idle DP schedulers;
+            # otherwise their *next* request unexpectedly starts profiling.
+            try:
+                if self.profile_in_progress or envs.SGLANG_PROFILE_V2.get():
+                    return self._stop_profile()
+                return ProfileReqOutput(success=True, message="Succeeded")
+            finally:
+                if not envs.SGLANG_PROFILE_V2.get():
+                    self.profile_by_stage = False
+                    self.profiler_prefill_ct = None
+                    self.profiler_decode_ct = None
+                    self.profiler_target_prefill_ct = None
+                    self.profiler_target_decode_ct = None
+                    self.profiler_target_forward_ct = None
+                    self.profiler_start_forward_ct = None
