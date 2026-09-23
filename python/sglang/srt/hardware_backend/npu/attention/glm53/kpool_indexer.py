@@ -778,9 +778,10 @@ class AscendIndexerKPoolMixin:
             )
         elif (
             forward_batch.forward_mode.is_draft_extend_v2()
-            and getattr(get_attn_backend(), "graph_mode", False)
             and hasattr(self, "_glm53_draft_graph_steps")
         ):
+            # Draft extend packs up to four accepted tokens per request. The
+            # one-token decode path cannot use that layout, even in eager mode.
             indices = self._draft_extend_topk(
                 q,
                 key,
