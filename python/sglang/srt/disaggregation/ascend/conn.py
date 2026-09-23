@@ -1,6 +1,7 @@
 import concurrent.futures
 import enum
 import logging
+import os
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -16,6 +17,9 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVSender,
 )
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+    MooncakeTransferEngine,
+)
 from sglang.srt.utils.network import get_local_ip_auto
 
 logger = logging.getLogger(__name__)
@@ -44,11 +48,30 @@ class AscendKVManager(MooncakeKVManager):
     def init_engine(self):
         # TransferEngine initialized on ascend.
         local_ip = get_local_ip_auto()
-        self.engine = AscendTransferEngine(
-            hostname=local_ip,
-            npu_id=self.kv_args.gpu_id,
-            disaggregation_mode=self.disaggregation_mode,
-        )
+        backend = os.getenv("SGLANG_ASCEND_TRANSFER_ENGINE", "memfabric").lower()
+        if backend == "mooncake":
+            if os.getenv("ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE", "false").lower() not in (
+                "1", "true", "yes", "on"
+            ):
+                raise RuntimeError(
+                    "SGLANG_ASCEND_TRANSFER_ENGINE=mooncake requires "
+                    "ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE=1"
+                )
+            # Keep Ascend's KV/KPool/Mamba layout and TP-aware sender/receiver;
+            # only replace the HBM transfer engine. The NPU-specific Mooncake
+            # wheel uses Ascend Direct when ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE=1.
+            self.engine = MooncakeTransferEngine(
+                hostname=local_ip,
+                gpu_id=self.kv_args.gpu_id,
+            )
+        elif backend == "memfabric":
+            self.engine = AscendTransferEngine(
+                hostname=local_ip,
+                npu_id=self.kv_args.gpu_id,
+                disaggregation_mode=self.disaggregation_mode,
+            )
+        else:
+            raise ValueError(f"Unknown Ascend transfer engine: {backend}")
 
     def register_buffer_to_engine(self):
         # MemFabric aligns registered buffers to 2 MiB. Register everything in
@@ -65,7 +88,12 @@ class AscendKVManager(MooncakeKVManager):
             ptrs.extend(component_ptrs)
             lens.extend(component_lens)
         if ptrs:
-            self.engine.batch_register(ptrs, lens)
+            ret = self.engine.batch_register(ptrs, lens)
+            if ret not in (None, 0):
+                raise RuntimeError(
+                    f"Ascend memory registration failed for {len(ptrs)} buffers "
+                    f"(return code {ret})"
+                )
 
     def get_mla_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int], state_type=None
