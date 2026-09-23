@@ -222,6 +222,26 @@ def _glm53_npu_prefix_page_size(
     return math.lcm(tree_page_size, physical_page_size * kpool)
 
 
+_GLM53_VALIDATED_PREFILL_DP_TOPOLOGIES = frozenset(((2, 8), (4, 4)))
+
+
+def _glm53_npu_prefill_prefix_topology_supported(parallel):
+    """Keep TP16 behavior and narrowly admit audited DP-attention P layouts."""
+    if parallel.attn_cp_size != 1 or parallel.pp_size != 1:
+        return False
+    if parallel.dp_size == 1:
+        return True
+    return (
+        parallel.enable_dp_attention
+        and parallel.nnodes == 1
+        and parallel.tp_size == parallel.ep_size == 16
+        and parallel.attn_dp_size == parallel.dp_size
+        and parallel.moe_dp_size == parallel.dwdp_size == 1
+        and (parallel.dp_size, parallel.attn_tp_size)
+        in _GLM53_VALIDATED_PREFILL_DP_TOPOLOGIES
+    )
+
+
 def build_kv_cache(
     *,
     server_args: ServerArgs,
@@ -351,7 +371,9 @@ def build_kv_cache(
                     get_disagg().disaggregation_mode == "prefill"
                     and get_exec().mamba.enable_mamba_extra_buffer
                     and not get_exec().mamba.enable_mamba_extra_buffer_lazy
-                    and get_parallel().dp_size == 1
+                    and _glm53_npu_prefill_prefix_topology_supported(
+                        get_parallel()
+                    )
                 )
             )
         ),

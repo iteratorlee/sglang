@@ -22,6 +22,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from glm53_topology_test_schema import RUNTIME, SERVER_FIELDS, server_args_shape
+
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE = (
     "python/sglang/srt/hardware_backend/npu/attention/glm53/prefill_index_parallel.py"
@@ -47,7 +49,7 @@ class Mode:
 
 
 def args(**changes):
-    return types.SimpleNamespace(
+    return server_args_shape(
         **(
             {
                 "tp_size": 16,
@@ -64,6 +66,7 @@ def args(**changes):
                 "moe_dp_size": 1,
                 "dwdp_size": 1,
                 "attn_cp_size": 1,
+                "dcp_size": 1,
                 "enable_prefill_cp": False,
             }
             | changes
@@ -89,10 +92,15 @@ def query(device="npu", dtype="bf16", shape=(4096, 32, 128)):
     )
 
 
-def verification_inputs():
-    # The production oracle keys on q/weight/compressed geometry even though
-    # the stand-in scorer below returns a fixed result.
-    return query(), query(shape=(4096, 32)), [query(shape=(65536, 32))]
+def oracle_inputs(forward_batch):
+    tokens = sum(forward_batch.extend_seq_lens_cpu[: forward_batch.batch_size])
+    q = types.SimpleNamespace(shape=(tokens, 32, 128))
+    weights = types.SimpleNamespace(shape=(tokens, 32))
+    compressed = [
+        types.SimpleNamespace(shape=(int(end) // 4, 128))
+        for end in forward_batch.seq_lens_cpu[: forward_batch.batch_size]
+    ]
+    return q, weights, compressed
 
 
 class TensorValue:
@@ -318,6 +326,87 @@ class TestFlagsAndOracle(unittest.TestCase):
         self.config = args(tp_size=8, ep_size=8, disaggregation_mode="null")
         self.assertFalse(INDEX.enabled(query(), batch()))
 
+    def test_only_dp2tp8_and_dp4tp4_are_admitted_for_verify(self):
+        os.environ["SGLANG_GLM53_PD_PREFILL_INDEX_TP"] = "1"
+        os.environ["SGLANG_GLM53_PREFILL_INDEX_VERIFY_DIR"] = "/tmp/oracle"
+        for dp_size, attn_tp_size in ((2, 8), (4, 4)):
+            with self.subTest(dp_size=dp_size, attn_tp_size=attn_tp_size):
+                self.config = args(
+                    dp_size=dp_size,
+                    enable_dp_attention=True,
+                    disable_radix_cache=False,
+                )
+                self.assertNotIn("attn_tp_size", SERVER_FIELDS)
+                self.assertFalse(hasattr(self.config, "attn_tp_size"))
+                self.assertEqual(RUNTIME["attn_tp_size_of"](self.config), attn_tp_size)
+                self.assertTrue(INDEX.enabled(query(), batch()))
+        for mutation in (
+            dict(dp_size=8, enable_dp_attention=True),
+            dict(dp_size=0, enable_dp_attention=True),
+            dict(dp_size=3, enable_dp_attention=True),
+            dict(dp_size=2, tp_size=8, enable_dp_attention=True),
+            dict(dp_size=4, tp_size=32, enable_dp_attention=True),
+            dict(dp_size=2, enable_dp_attention=False),
+            dict(dp_size=2, ep_size=8, enable_dp_attention=True),
+            dict(dp_size=2, attn_cp_size=0, enable_dp_attention=True),
+            dict(dp_size=2, enable_prefill_cp=True, enable_dp_attention=True),
+            dict(
+                dp_size=2,
+                enable_dp_attention=True,
+                moe_dp_size=2,
+            ),
+            dict(
+                dp_size=2,
+                enable_dp_attention=True,
+                dwdp_size=2,
+            ),
+            dict(
+                dp_size=2,
+                enable_dp_attention=True,
+                attn_cp_size=2,
+            ),
+            dict(
+                dp_size=2,
+                enable_dp_attention=True,
+                pp_size=2,
+            ),
+            dict(
+                dp_size=2,
+                enable_dp_attention=True,
+                nnodes=2,
+            ),
+        ):
+            with self.subTest(mutation=mutation):
+                self.config = args(disable_radix_cache=False, **mutation)
+                self.assertFalse(INDEX.enabled(query(), batch()))
+
+    def test_server_args_shape_rejects_derived_width_injection(self):
+        with self.assertRaises(AttributeError):
+            args(attn_tp_size=8)
+        with self.assertRaises(AttributeError):
+            self.config.attn_tp_size = 8
+
+    def test_dp_performance_requires_separate_exact_verified_unlock(self):
+        os.environ["SGLANG_GLM53_PD_PREFILL_INDEX_TP"] = "1"
+        os.environ["SGLANG_GLM53_PD_PREFILL_INDEX_TP_MODE"] = "performance"
+        self.config = args(
+            dp_size=2,
+            enable_dp_attention=True,
+            disable_radix_cache=False,
+        )
+        for value in (None, "", "0", "true", "2"):
+            if value is None:
+                os.environ.pop(
+                    "SGLANG_GLM53_PD_PREFILL_INDEX_TP_DP_PERFORMANCE", None
+                )
+            else:
+                os.environ[
+                    "SGLANG_GLM53_PD_PREFILL_INDEX_TP_DP_PERFORMANCE"
+                ] = value
+            self.assertFalse(INDEX.enabled(query(), batch()))
+        os.environ["SGLANG_GLM53_PD_PREFILL_INDEX_TP_DP_PERFORMANCE"] = "1"
+        self.assertTrue(INDEX.enabled(query(), batch()))
+
     def test_tensor_and_work_threshold_guards(self):
         os.environ["SGLANG_GLM53_PD_PREFILL_INDEX_TP"] = "1"
         for q in (
@@ -398,8 +487,13 @@ class TestFlagsAndOracle(unittest.TestCase):
                     owner = Owner(layer, output)
                     for end in (65536, 131072):
                         fb = batch([4096], [end])
-                        INDEX.verify_once(owner, output, *verification_inputs(), fb, None)
-                        INDEX.verify_once(owner, output, *verification_inputs(), fb, None)
+                        q, weights, compressed = oracle_inputs(fb)
+                        INDEX.verify_once(
+                            owner, output, q, weights, compressed, fb, None
+                        )
+                        INDEX.verify_once(
+                            owner, output, q, weights, compressed, fb, None
+                        )
                     self.assertEqual(owner.calls, 2)
                 records = [
                     json.loads(line)
@@ -418,14 +512,24 @@ class TestFlagsAndOracle(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             os.environ["SGLANG_GLM53_PREFILL_INDEX_VERIFY_DIR"] = directory
             owner = Owner(3, TensorValue([1, 2]))
+            fb = batch()
+            q, weights, compressed = oracle_inputs(fb)
             with self.assertRaisesRegex(RuntimeError, "disagrees"):
                 INDEX.verify_once(
-                    owner, TensorValue([2, 1]), *verification_inputs(), batch(), None
+                    owner,
+                    TensorValue([2, 1]),
+                    q,
+                    weights,
+                    compressed,
+                    fb,
+                    None,
                 )
             self.assertFalse(getattr(owner, "_glm53_checked_prefill_shapes", set()))
             record = json.loads((Path(directory) / "rank0.jsonl").read_text())
             self.assertFalse(record["exact"])
-            INDEX.verify_once(owner, owner.expected, *verification_inputs(), batch(), None)
+            INDEX.verify_once(
+                owner, owner.expected, q, weights, compressed, fb, None
+            )
             self.assertEqual(owner.calls, 2)
 
     def test_oracle_off_does_not_run_reference_scorer(self):
