@@ -48,6 +48,10 @@ def glm_rms_norm_gated_npu(
         raise ValueError("GLM gated RMSNorm requires x and gate with equal numel")
     if x.shape[-1] != weight.numel():
         raise ValueError("GLM gated RMSNorm weight must match the head dimension")
+    # Idle attention-DP domains still run the MoE/EP collective, but have no
+    # local attention tokens. Ascend rejects a Triton launch with grid=(0,).
+    if x.numel() == 0:
+        return torch.empty_like(x)
     feature_dim = x.shape[-1]
     block_dim = triton.next_power_of_2(feature_dim)
     output = torch.empty_like(x)
