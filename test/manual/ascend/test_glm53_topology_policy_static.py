@@ -126,7 +126,7 @@ class PrefixTopologyPolicyTests(unittest.TestCase):
                 self.assertIs(RUNTIME["get_parallel"](), context)
                 self.assertEqual(POLICY(RUNTIME["get_parallel"]()), supported)
 
-    def test_preserves_tp16_and_admits_only_dp2tp8_dp4tp4(self):
+    def test_preserves_tp16_and_admits_910b_dp2tp4(self):
         self.assertTrue(POLICY(parallel()))
         self.assertTrue(
             POLICY(
@@ -148,11 +148,37 @@ class PrefixTopologyPolicyTests(unittest.TestCase):
                 )
             )
         )
+        cfg = server_args_shape(
+            dp_size=2,
+            tp_size=8,
+            ep_size=8,
+            enable_dp_attention=True,
+            nnodes=1,
+            pp_size=1,
+            attn_cp_size=1,
+            dcp_size=1,
+            moe_dp_size=1,
+            dwdp_size=1,
+        )
+        context = published_parallel(cfg)
+        self.assertEqual((context.attn_dp_size, context.attn_tp_size), (2, 4))
+        self.assertTrue(POLICY(context))
 
     def test_rejects_unvalidated_or_relaxed_parallel_layouts(self):
         mutations = (
             dict(dp_size=8, attn_dp_size=8, attn_tp_size=2, enable_dp_attention=True),
-            dict(dp_size=2, attn_dp_size=2, attn_tp_size=4, enable_dp_attention=True),
+            dict(
+                dp_size=4, attn_dp_size=4, attn_tp_size=2,
+                enable_dp_attention=True, tp_size=8, ep_size=8,
+            ),
+            dict(
+                dp_size=2, attn_dp_size=2, attn_tp_size=4,
+                enable_dp_attention=True, tp_size=8, ep_size=16,
+            ),
+            dict(
+                dp_size=2, attn_dp_size=2, attn_tp_size=4,
+                enable_dp_attention=True, tp_size=8, ep_size=8, nnodes=2,
+            ),
             dict(dp_size=2, attn_dp_size=1, attn_tp_size=8, enable_dp_attention=True),
             dict(dp_size=2, attn_dp_size=2, attn_tp_size=8),
             dict(

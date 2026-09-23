@@ -9,6 +9,7 @@ These tests do not validate NPU kernels, graph replay, SDMA or model accuracy.
 """
 
 import ast
+import concurrent.futures
 import math
 import ctypes
 import importlib.util
@@ -182,6 +183,9 @@ source_functions(
         "get_dsa_tail_state_indices",
         "build_dsa_tail_transfer_blocks",
         "build_transfer_entry_pairs",
+        "compute_mamba_state_slice_byte_blocks",
+        "compute_mamba_state_slice_blocks",
+        "should_send_replicated_state",
     ],
     UTILS,
 )
@@ -190,7 +194,6 @@ UTILS.update(
     is_mla_backend=lambda pool: isinstance(pool, NPUPool),
     deque=deque,
 )
-
 
 @dataclass(frozen=True)
 class MambaState:
@@ -205,10 +208,12 @@ class MambaPool:
     mamba_layer_ids = [0, 2]
     mem_usage = 0
 
-    def __init__(self, rows, window, transpose):
-        temporal = Tensor(np.zeros((2, rows, 2, 5, 7), dtype=np.float32))
+    def __init__(self, rows, window, transpose, conv_channels=6, temporal_heads=2):
+        temporal = Tensor(
+            np.zeros((2, rows, temporal_heads, 5, 7), dtype=np.float32)
+        )
         self.mamba_cache = MambaState(
-            [Tensor(np.zeros((2, rows, window, 6), dtype=np.uint16))],
+            [Tensor(np.zeros((2, rows, window, conv_channels), dtype=np.uint16))],
             temporal.transpose(-1, -2) if transpose else temporal,
         )
 
@@ -233,6 +238,27 @@ MAMBA_SEND = source_functions(
     UTILS,
     "MooncakeKVManager",
 )["_send_mamba_state"]
+
+MAMBA_SLICE_SEND = source_functions(
+    SRT / "disaggregation/mooncake/conn.py",
+    ["_send_mamba_state_slice"],
+    UTILS | {"logger": types.SimpleNamespace(warning_once=lambda *args: None)},
+    "MooncakeKVManager",
+)["_send_mamba_state_slice"]
+
+ASCEND_KV_SEND = source_functions(
+    SRT / "disaggregation/ascend/conn.py",
+    ["send_kvcache"],
+    {
+        "group_concurrent_contiguous": source_functions(
+            SRT / "disaggregation/common/utils.py",
+            ["group_concurrent_contiguous"],
+            {"np": np},
+        )["group_concurrent_contiguous"],
+        "concurrent": concurrent,
+    },
+    "AscendKVManager",
+)["send_kvcache"]
 
 
 def fake_module(**attrs):
@@ -281,6 +307,7 @@ MODULES = {
 }
 PARALLEL = types.SimpleNamespace(
     tp_size=16,
+    nnodes=1,
     moe_ep_size=16,
     attn_tp_size=16,
     pp_size=1,
@@ -315,16 +342,16 @@ def req_pool(rows):
     )
 
 
-def make_registered(rows):
+def make_registered(rows, parallel=PARALLEL):
     requests = req_pool(rows)
     target = HybridPool(NPUPool(2), [3, 11])
     draft = NPUPool(1)
     target_model, target_indexers = model([3, 11])
     draft_model, draft_indexers = model([0])
     pd_state.register_glm53_kpool_state(
-        target_model, target, requests, parallel=PARALLEL
+        target_model, target, requests, parallel=parallel
     )
-    pd_state.register_glm53_kpool_state(draft_model, draft, requests, parallel=PARALLEL)
+    pd_state.register_glm53_kpool_state(draft_model, draft, requests, parallel=parallel)
     return target, draft, requests, target_indexers + draft_indexers
 
 
@@ -374,8 +401,8 @@ class TestGlm53PDState(unittest.TestCase):
                 pd_state.register_glm53_kpool_state(m, pool, requests, parallel=parallel)
                 self.assertEqual(ptrs, pool.get_compress_tail_buf_infos()[0])
 
-    def test_910b_tp8_and_dp4tp2_preserve_request_state(self):
-        for dp, attn_tp, enabled in ((1, 8, False), (4, 2, True)):
+    def test_910b_tp8_dp4tp2_and_dp2tp4_preserve_request_state(self):
+        for dp, attn_tp, enabled in ((1, 8, False), (4, 2, True), (2, 4, True)):
             with self.subTest(dp=dp, attn_tp=attn_tp):
                 parallel = types.SimpleNamespace(**(vars(PARALLEL) | dict(
                     tp_size=8, moe_ep_size=8, enable_dp_attention=enabled,
@@ -389,6 +416,142 @@ class TestGlm53PDState(unittest.TestCase):
                 np.testing.assert_array_equal(indexers[0]._kpool_tail_k.array[:3], keys)
                 np.testing.assert_array_equal(indexers[0]._kpool_tail_score.array[:3], scores)
                 self.assertEqual(indexers[0]._kpool_tail_k.shape, (9, 4, 128))
+
+    def test_910b_tp4_to_tp2_rank_mapping_and_kv_draft_pages(self):
+        rank_mapping = source_functions(
+            SRT / "disaggregation/common/conn.py",
+            ["_resolve_rank_mapping"],
+            {},
+            "CommonKVManager",
+        )["_resolve_rank_mapping"]
+        skip_policy = source_functions(
+            SRT / "disaggregation/mooncake/conn.py",
+            ["_get_dsa_cache_transfer_skip_flags"],
+            {},
+            "MooncakeKVManager",
+        )["_get_dsa_cache_transfer_skip_flags"]
+        for d_rank, expected_p_ranks in ((0, [0, 1]), (1, [2, 3])):
+            manager = types.SimpleNamespace(
+                attn_tp_size=2,
+                kv_args=types.SimpleNamespace(engine_rank=d_rank),
+                is_mla_backend=False,
+                is_hybrid_mla_backend=True,
+                attn_cp_size=1,
+                attn_cp_rank=0,
+                pp_size=1,
+                pp_rank=0,
+            )
+            info = types.SimpleNamespace(attn_tp_size=4, attn_cp_size=1, pp_size=1)
+            rank_mapping(manager, info)
+            self.assertEqual(info.target_tp_ranks, expected_p_ranks)
+            self.assertEqual(info.required_prefill_response_num, 2)
+            self.assertEqual(info.required_dst_info_num, 1)
+            for rank, expected_skip in zip(expected_p_ranks, (False, True)):
+                p_manager = types.SimpleNamespace(
+                    attn_tp_size=4,
+                    kv_args=types.SimpleNamespace(engine_rank=rank),
+                    is_mla_backend=False,
+                    is_hybrid_mla_backend=True,
+                    _should_skip_cp_replicated_state_transfer=lambda: False,
+                )
+                self.assertEqual(
+                    skip_policy(
+                        p_manager, types.SimpleNamespace(dst_attn_tp_size=2)
+                    ),
+                    (expected_skip, False),
+                )
+
+        # The elected P rank sends every full-attention and draft KV entry by
+        # page id; TP changes do not change the NPU MLA per-page item geometry.
+        source_target, source_draft = NPUPool(2), NPUPool(1)
+        dest_target, dest_draft = NPUPool(2), NPUPool(1)
+        source_buffers = (
+            source_target.k_buffer + source_target.v_buffer
+            + source_target.index_k_buffer + source_draft.k_buffer
+            + source_draft.v_buffer + source_draft.index_k_buffer
+        )
+        dest_buffers = (
+            dest_target.k_buffer + dest_target.v_buffer
+            + dest_target.index_k_buffer + dest_draft.k_buffer
+            + dest_draft.v_buffer + dest_draft.index_k_buffer
+        )
+        for entry, (source, dest) in enumerate(zip(source_buffers, dest_buffers)):
+            source.array[2] = (
+                100 * (entry + 1)
+                + np.arange(source.array[2].size).reshape(source.array[2].shape)
+            )
+            dest.array.fill(7)
+        src_ptrs, _, src_lens = source_target.get_contiguous_buf_infos()
+        draft_ptrs, _, draft_lens = source_draft.get_contiguous_buf_infos()
+        dst_ptrs = (
+            dest_target.get_contiguous_buf_infos()[0]
+            + dest_draft.get_contiguous_buf_infos()[0]
+        )
+
+        def copy_blocks(session, blocks):
+            for source, dest, size in blocks:
+                ctypes.memmove(dest, source, size)
+            return 0
+
+        sender = types.SimpleNamespace(
+            pp_size=1,
+            enable_custom_mem_pool=False,
+            kv_args=types.SimpleNamespace(
+                kv_data_ptrs=src_ptrs + draft_ptrs,
+                kv_item_lens=src_lens + draft_lens,
+            ),
+            _validate_envelope_kv_layout=lambda *args: None,
+            _transfer_data=copy_blocks,
+        )
+        self.assertEqual(
+            ASCEND_KV_SEND(
+                sender, "tp4-to-tp2", np.array([2], dtype=np.int32), dst_ptrs,
+                np.array([7], dtype=np.int32), None, dst_attn_tp_size=2,
+            ),
+            0,
+        )
+        for source, dest in zip(source_buffers, dest_buffers):
+            np.testing.assert_array_equal(dest.array[7], source.array[2])
+            self.assertTrue((dest.array[:7] == 7).all())
+            self.assertTrue((dest.array[8:] == 7).all())
+
+    def test_910b_tp4_to_tp2_target_and_draft_kpool_tail(self):
+        p_parallel = types.SimpleNamespace(**(vars(PARALLEL) | dict(
+            tp_size=8, moe_ep_size=8, enable_dp_attention=True,
+            dp_size=2, attn_dp_size=2, attn_tp_size=4,
+        )))
+        d_parallel = types.SimpleNamespace(**(vars(PARALLEL) | dict(
+            tp_size=8, moe_ep_size=8, enable_dp_attention=True,
+            dp_size=4, attn_dp_size=4, attn_tp_size=2,
+        )))
+        source, source_draft, _, source_buffers = make_registered(5, p_parallel)
+        dest, dest_draft, _, dest_buffers = make_registered(9, d_parallel)
+        source_ptrs, _, source_lens = pd_state.combined_kpool_tail_infos(
+            source.full_kv_pool, source_draft
+        )
+        dest_ptrs, _, dest_lens = pd_state.combined_kpool_tail_infos(
+            dest.full_kv_pool, dest_draft
+        )
+        for entry, (p, d) in enumerate(zip(source_buffers, dest_buffers)):
+            for name in ("_kpool_tail_k", "_kpool_tail_score"):
+                getattr(p, name).array[2] = entry + 1
+                getattr(d, name).array.fill(7)
+        # Both P writers hold replicated KPool tails; their writes must be
+        # byte-identical, including the draft's independently registered tail.
+        for _ in range(2):
+            blocks = UTILS["build_dsa_tail_transfer_blocks"](
+                source_ptrs, source_lens, dest_ptrs,
+                UTILS["get_dsa_tail_state_indices"](source, 2, 131075),
+                UTILS["get_dsa_tail_state_indices"](dest, 7, 131075),
+                dest_lens,
+            )
+            for source_addr, dest_addr, size in blocks:
+                ctypes.memmove(dest_addr, source_addr, size)
+        for entry, (p, d) in enumerate(zip(source_buffers, dest_buffers)):
+            for name in ("_kpool_tail_k", "_kpool_tail_score"):
+                expected = np.full_like(getattr(d, name).array, 7)
+                expected[7, :3] = getattr(p, name).array[2, :3]
+                np.testing.assert_array_equal(getattr(d, name).array, expected)
 
     def test_registration_idempotent_and_replacement_rejected(self):
         m, indexers = model([0], rows=10)
@@ -501,7 +664,11 @@ class TestGlm53PDState(unittest.TestCase):
             {"moe_ep_size": 8},
             {"attn_tp_size": 4},
             {"tp_size": 8, "moe_ep_size": 8, "enable_dp_attention": True,
-             "dp_size": 2, "attn_dp_size": 2, "attn_tp_size": 4},
+             "dp_size": 2, "attn_dp_size": 2, "attn_tp_size": 2},
+            {"tp_size": 8, "moe_ep_size": 8, "enable_dp_attention": True,
+             "dp_size": 4, "attn_dp_size": 4, "attn_tp_size": 4},
+            {"tp_size": 8, "moe_ep_size": 8, "enable_dp_attention": True,
+             "dp_size": 2, "attn_dp_size": 2, "attn_tp_size": 4, "nnodes": 2},
             {"pp_size": 2},
             {"attn_cp_size": 2},
             {"enable_dp_attention": True},
@@ -599,6 +766,79 @@ class TestGlm53PDState(unittest.TestCase):
             )
             self.assertFalse(d.mamba_cache.temporal.array[:, :7].any())
             self.assertFalse(d.mamba_cache.temporal.array[:, 8:].any())
+
+    def test_910b_tp4_to_tp2_mamba_conv_and_temporal_bytes(self):
+        # Each D TP rank receives two TP-sharded P states from its selected P
+        # DP domain. Conv has a row before its channel axis; temporal does not.
+        for d_tp_rank in (0, 1):
+            with self.subTest(d_tp_rank=d_tp_rank):
+                dest = MambaPool(
+                    9, 6, True, conv_channels=12, temporal_heads=4
+                )
+                src_states = []
+
+                def copy_blocks(session, blocks):
+                    for source, target, size in blocks:
+                        ctypes.memmove(target, source, size)
+                    return 0
+
+                for writer in (0, 1):
+                    p_tp_rank = d_tp_rank * 2 + writer
+                    source = MambaPool(5, 3, False)
+                    pd_state.prepare_glm53_pd_mamba_state(
+                        types.SimpleNamespace(mamba_pool=source),
+                        types.SimpleNamespace(mamba_pool=source),
+                        mode="prefill", draft_tokens=4,
+                    )
+                    source.mamba_cache.conv[0].array[:, 2] = (
+                        p_tp_rank * 1000
+                        + np.arange(2 * 6 * 6).reshape(2, 6, 6)
+                    )
+                    source.mamba_cache.temporal.array[:, 2] = (
+                        p_tp_rank * 1000
+                        + np.arange(2 * 2 * 7 * 5).reshape(2, 2, 7, 5)
+                    )
+                    src_states.append(source)
+                    src_ptrs, _, src_lens = source.get_contiguous_buf_infos()
+                    dst_ptrs, _, dst_lens = dest.get_contiguous_buf_infos()
+                    sender = types.SimpleNamespace(
+                        kv_args=types.SimpleNamespace(engine_rank=p_tp_rank),
+                        attn_tp_size=4, pp_size=1,
+                        _transfer_data=copy_blocks,
+                    )
+                    self.assertEqual(
+                        MAMBA_SLICE_SEND(
+                            sender, types.SimpleNamespace(mooncake_session_id="cpu"),
+                            [2], src_ptrs, src_lens,
+                            source.get_state_dim_per_tensor(),
+                            dst_ptrs, [7], dst_lens,
+                            dest.get_state_dim_per_tensor(),
+                            d_tp_rank, 2, None,
+                            source.get_state_slice_outer_counts(),
+                            source.get_state_layer_ids(),
+                            dest.get_state_layer_ids(),
+                        ),
+                        0,
+                    )
+
+                np.testing.assert_array_equal(
+                    dest.mamba_cache.conv[0].array[:, 7],
+                    np.concatenate(
+                        [p.mamba_cache.conv[0].array[:, 2] for p in src_states],
+                        axis=-1,
+                    ),
+                )
+                np.testing.assert_array_equal(
+                    dest.mamba_cache.temporal.array[:, 7],
+                    np.concatenate(
+                        [p.mamba_cache.temporal.array[:, 2] for p in src_states],
+                        axis=1,
+                    ),
+                )
+                self.assertFalse(dest.mamba_cache.conv[0].array[:, :7].any())
+                self.assertFalse(dest.mamba_cache.conv[0].array[:, 8:].any())
+                self.assertFalse(dest.mamba_cache.temporal.array[:, :7].any())
+                self.assertFalse(dest.mamba_cache.temporal.array[:, 8:].any())
 
     def test_mamba_no_mtp_and_decode_do_not_change_layout(self):
         for mode, draft_tokens in (("prefill", None), ("decode", 4)):

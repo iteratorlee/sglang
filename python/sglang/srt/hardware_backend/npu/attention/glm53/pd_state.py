@@ -92,6 +92,7 @@ def grow_kpool_request_state(indexer, num_req_slots):
 def register_glm53_kpool_state(model, token_pool, req_pool, *, parallel):
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 
+    attn_layout = (parallel.attn_dp_size, parallel.attn_tp_size)
     single_attention_domain = (
         parallel.tp_size == parallel.moe_ep_size == parallel.attn_tp_size
         and parallel.tp_size in (8, 16)
@@ -102,10 +103,17 @@ def register_glm53_kpool_state(model, token_pool, req_pool, *, parallel):
         and parallel.enable_dp_attention
         and parallel.dp_size == parallel.attn_dp_size
         and (
-            (parallel.tp_size == 16 and (parallel.attn_dp_size, parallel.attn_tp_size)
-             in ((16, 1), (8, 2), (4, 4), (2, 8)))
-            or (parallel.tp_size == 8 and (parallel.attn_dp_size, parallel.attn_tp_size)
-                == (4, 2))
+            (
+                parallel.tp_size == 16
+                and attn_layout in ((16, 1), (8, 2), (4, 4), (2, 8))
+            )
+            or (
+                parallel.tp_size == 8
+                and (
+                    attn_layout == (4, 2)
+                    or (attn_layout == (2, 4) and parallel.nnodes == 1)
+                )
+            )
         )
     )
     if not (
@@ -116,7 +124,7 @@ def register_glm53_kpool_state(model, token_pool, req_pool, *, parallel):
         raise ValueError(
             "GLM53 NPU PD state requires PP1/CP1 and TP=EP=16 with "
             "attention TP16, DP16/TP1, DP8/TP2, DP4/TP4, or DP2/TP8; "
-            "or TP=EP=8 with attention TP8 or DP4/TP2"
+            "or TP=EP=8 with attention TP8, DP4/TP2, or DP2/TP4"
         )
     pool = getattr(token_pool, "full_kv_pool", token_pool)
     if not isinstance(pool, NPUMLATokenToKVPool):
