@@ -493,8 +493,11 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
-        seq_lens_max = forward_batch.seq_lens.max()
-        if forward_batch.forward_mode.is_target_verify():
+        # DP attention still runs idle domains through the shared MoE/EP
+        # collective. Their local target-verify batch has no sequence lengths.
+        if forward_batch.seq_lens.numel() == 0:
+            seq_lens_max = 0
+        elif forward_batch.forward_mode.is_target_verify():
             if (
                 forward_batch.spec_algorithm is not None
                 and forward_batch.spec_algorithm.is_dflash()
