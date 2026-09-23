@@ -449,7 +449,11 @@ class AscendIndexerKPoolMixin:
                     first_pos + q_len,
                     ((global_start // 128) + 1) * 128,
                 )
-                end = global_end - first_pos
+                # Keep the 128-token causal boundary (hence the same K
+                # dimension), but bound the query rows in each GEMM.  CANN's
+                # elementwise multiply may allocate a full-size temporary
+                # even for mul_(), and 128 rows exhaust 910B P HBM at 128k.
+                end = min(global_end - first_pos, start + 32)
                 candidate_count = min(global_end // self.index_kpool, k_req.shape[0])
                 if candidate_count == 0:
                     ids = torch.full(
