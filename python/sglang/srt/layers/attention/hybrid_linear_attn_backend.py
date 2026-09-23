@@ -1304,7 +1304,10 @@ class HybridLinearAttnBackend(AttentionBackend):
     ):
         is_linear_attn = not self._is_full_attn(layer, kwargs.get("layer_id"))
 
-        if forward_batch.forward_mode.is_idle():
+        # A domain with no local requests still joins the shared MoE/EP
+        # collective during target verification. Its forward mode is VERIFY,
+        # not IDLE, but attention has no tokens to process on this rank.
+        if forward_batch.forward_mode.is_idle() or forward_batch.seq_lens.numel() == 0:
             if is_linear_attn:
                 return mixed_qkv.new_empty(
                     mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim
