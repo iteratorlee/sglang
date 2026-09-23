@@ -174,7 +174,11 @@ def enabled(q, forward_batch):
 
     args = get_server_args()
     return (
-        args.tp_size == args.ep_size == 16
+        (
+            args.tp_size == args.ep_size == 16
+            or (args.tp_size == args.ep_size == 8
+                and args.disaggregation_mode == "prefill")
+        )
         and args.nnodes == 1
         and args.pp_size == 1
         and not args.enable_dp_attention

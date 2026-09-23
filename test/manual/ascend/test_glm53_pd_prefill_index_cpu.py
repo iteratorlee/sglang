@@ -89,6 +89,12 @@ def query(device="npu", dtype="bf16", shape=(4096, 32, 128)):
     )
 
 
+def verification_inputs():
+    # The production oracle keys on q/weight/compressed geometry even though
+    # the stand-in scorer below returns a fixed result.
+    return query(), query(shape=(4096, 32)), [query(shape=(65536, 32))]
+
+
 class TensorValue:
     def __init__(self, values):
         self.values = tuple(values)
@@ -226,6 +232,7 @@ class TestFlagsAndOracle(unittest.TestCase):
         fake_torch.equal = lambda a, b: a.values == b.values
         fake_dist = types.ModuleType("torch.distributed")
         fake_dist.get_rank = lambda group: self.rank
+        fake_dist.get_world_size = lambda group: 16
         fake_torch.distributed = fake_dist
         runtime = types.ModuleType("sglang.srt.runtime_context")
         runtime.get_server_args = lambda: self.config
@@ -296,6 +303,20 @@ class TestFlagsAndOracle(unittest.TestCase):
             with self.subTest(key=key):
                 self.config = args(**{key: value})
                 self.assertFalse(INDEX.enabled(query(), batch()))
+
+    def test_910b_tp8_ep8_prefill_index_is_opt_in_and_keeps_guards(self):
+        self.config = args(tp_size=8, ep_size=8)
+        self.assertFalse(INDEX.enabled(query(), batch()))
+        os.environ["SGLANG_GLM53_PD_PREFILL_INDEX_TP"] = "1"
+        self.assertTrue(INDEX.enabled(query(), batch()))
+        self.config.disable_radix_cache = False
+        self.assertFalse(INDEX.enabled(query(), batch()))
+        os.environ["SGLANG_GLM53_PREFILL_INDEX_VERIFY_DIR"] = "/tmp/oracle"
+        self.assertTrue(INDEX.enabled(query(), batch()))
+        self.config.ep_size = 16
+        self.assertFalse(INDEX.enabled(query(), batch()))
+        self.config = args(tp_size=8, ep_size=8, disaggregation_mode="null")
+        self.assertFalse(INDEX.enabled(query(), batch()))
 
     def test_tensor_and_work_threshold_guards(self):
         os.environ["SGLANG_GLM53_PD_PREFILL_INDEX_TP"] = "1"
@@ -377,8 +398,8 @@ class TestFlagsAndOracle(unittest.TestCase):
                     owner = Owner(layer, output)
                     for end in (65536, 131072):
                         fb = batch([4096], [end])
-                        INDEX.verify_once(owner, output, None, None, None, fb, None)
-                        INDEX.verify_once(owner, output, None, None, None, fb, None)
+                        INDEX.verify_once(owner, output, *verification_inputs(), fb, None)
+                        INDEX.verify_once(owner, output, *verification_inputs(), fb, None)
                     self.assertEqual(owner.calls, 2)
                 records = [
                     json.loads(line)
@@ -399,12 +420,12 @@ class TestFlagsAndOracle(unittest.TestCase):
             owner = Owner(3, TensorValue([1, 2]))
             with self.assertRaisesRegex(RuntimeError, "disagrees"):
                 INDEX.verify_once(
-                    owner, TensorValue([2, 1]), None, None, None, batch(), None
+                    owner, TensorValue([2, 1]), *verification_inputs(), batch(), None
                 )
             self.assertFalse(getattr(owner, "_glm53_checked_prefill_shapes", set()))
             record = json.loads((Path(directory) / "rank0.jsonl").read_text())
             self.assertFalse(record["exact"])
-            INDEX.verify_once(owner, owner.expected, None, None, None, batch(), None)
+            INDEX.verify_once(owner, owner.expected, *verification_inputs(), batch(), None)
             self.assertEqual(owner.calls, 2)
 
     def test_oracle_off_does_not_run_reference_scorer(self):
