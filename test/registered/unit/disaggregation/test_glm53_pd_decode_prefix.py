@@ -135,10 +135,23 @@ def target_cfg(**overrides):
 
 class ProfileTests(unittest.TestCase):
     def test_exact_supported_profile(self):
-        profile = glm53_pd_decode_prefix_profile(target_cfg(), target_model())
-        self.assertIsNotNone(profile)
-        self.assertEqual(profile.physical_page_size, 64)
-        self.assertEqual(profile.prefix_share_page_size, 256)
+        for topology in ({}, {"tp_size": 8, "dp_size": 4, "ep_size": 8}):
+            with self.subTest(topology=topology):
+                profile = glm53_pd_decode_prefix_profile(
+                    target_cfg(**topology), target_model()
+                )
+                self.assertIsNotNone(profile)
+                self.assertEqual(profile.physical_page_size, 64)
+                self.assertEqual(profile.prefix_share_page_size, 256)
+
+    def test_910b_requires_complete_profile_not_a_loose_eight_rank_match(self):
+        topology = {"tp_size": 8, "dp_size": 4, "ep_size": 8}
+        for change in ({"dp_size": 2}, {"ep_size": 16}, {"page_size": 128},
+                       {"speculative_num_draft_tokens": 5}):
+            with self.subTest(change=change):
+                self.assertIsNone(glm53_pd_decode_prefix_profile(
+                    target_cfg(**(topology | change)), target_model()
+                ))
 
     def test_every_unadapted_dimension_stays_rejected(self):
         cases = {

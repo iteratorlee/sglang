@@ -29,7 +29,7 @@ GLM53_PREFIX_SHARE_PAGE_SIZE = 256
 
 @dataclass(frozen=True)
 class Glm53PDDecodePrefixProfile:
-    """The one native topology for which the exception is supported."""
+    """The native decode layouts with the complete KPool/MTP state contract."""
 
     physical_page_size: int = GLM53_PHYSICAL_PAGE_SIZE
     prefix_share_page_size: int = GLM53_PREFIX_SHARE_PAGE_SIZE
@@ -70,9 +70,9 @@ def glm53_pd_decode_prefix_profile(
             and getattr(cfg, "quantization", None) == "modelslim"
             and getattr(cfg, "speculative_draft_model_quantization", None)
             == "modelslim"
-            and getattr(cfg, "tp_size", None) == 16
-            and getattr(cfg, "dp_size", None) == 8
-            and getattr(cfg, "ep_size", None) == 16
+            and (getattr(cfg, "tp_size", None),
+                 getattr(cfg, "dp_size", None),
+                 getattr(cfg, "ep_size", None)) in ((16, 8, 16), (8, 4, 8))
             and getattr(cfg, "pp_size", None) == 1
             and getattr(cfg, "dcp_size", None) == 1
             and getattr(cfg, "attn_cp_size", None) == 1

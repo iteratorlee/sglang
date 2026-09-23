@@ -95,7 +95,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     raise ValueError(
                         "--disaggregation-decode-enable-radix-cache is incompatible "
                         "with speculative decoding outside the validated GLM-5.3 "
-                        "Ascend DP8/TP2 EP16 EAGLE MTP profile "
+                        "Ascend DP8/TP2 EP16 or DP4/TP2 EP8 EAGLE MTP profiles "
                         f"(--speculative-algorithm {cfg.speculative_algorithm})"
                     )
                 logger.warning(
