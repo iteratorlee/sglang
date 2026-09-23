@@ -86,11 +86,15 @@ class AscendTransferEngine(MooncakeTransferEngine):
     def batch_register(self, ptrs: List[int], lengths: List[int]):
         try:
             ret_value = self.engine.batch_register_memory(ptrs, lengths)
-        except Exception:
-            # Mark register as failed
-            ret_value = -1
+        except Exception as exc:
+            raise RuntimeError(
+                f"Ascend memory registration failed for {len(ptrs)} buffers"
+            ) from exc
         if ret_value != 0:
-            logger.debug(f"Ascend memory registration for ptr {ptrs} failed.")
+            raise RuntimeError(
+                f"Ascend memory registration failed for {len(ptrs)} buffers "
+                f"(return code {ret_value})"
+            )
 
     @staticmethod
     def _get_transfer_protocol() -> str:
