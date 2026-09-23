@@ -35,6 +35,33 @@ def _glm_rms_norm_gated_row_kernel(
     tl.store(output + row_offsets, result, mask=mask)
 
 
+@triton.jit
+def _glm_rms_norm_gated_large_row_kernel(
+    x,
+    gate,
+    weight,
+    output,
+    eps,
+    feature_dim: tl.constexpr,
+    block_dim: tl.constexpr,
+    num_rows: tl.constexpr,
+    grid_rows: tl.constexpr,
+):
+    """Cover large inputs without exceeding Ascend's 65535-program grid cap."""
+
+    offsets = tl.arange(0, block_dim)
+    mask = offsets < feature_dim
+    weights = tl.load(weight + offsets, mask=mask, other=0.0).to(tl.float32)
+    for row in range(tl.program_id(0), num_rows, grid_rows):
+        row_offsets = row * feature_dim + offsets
+        values = tl.load(x + row_offsets, mask=mask, other=0.0).to(tl.float32)
+        gates = tl.load(gate + row_offsets, mask=mask, other=0.0).to(tl.float32)
+        variance = tl.sum(values * values, axis=0) / feature_dim
+        normalized = values / tl.sqrt(variance + eps)
+        result = normalized * weights / (1.0 + tl.exp(-gates))
+        tl.store(output + row_offsets, result, mask=mask)
+
+
 @input_guard
 def glm_rms_norm_gated_npu(
     x: torch.Tensor,
@@ -55,7 +82,16 @@ def glm_rms_norm_gated_npu(
     feature_dim = x.shape[-1]
     block_dim = triton.next_power_of_2(feature_dim)
     output = torch.empty_like(x)
-    _glm_rms_norm_gated_row_kernel[(x.numel() // feature_dim,)](
+    num_rows = x.numel() // feature_dim
+    if num_rows > 65535:
+        # A 2048-token GLM prefill chunk has 65536 head rows. Ascend rejects
+        # that one-dimensional launch. Keep the small/decode kernel unchanged.
+        grid_rows = min(num_rows, 32768)
+        kernel = _glm_rms_norm_gated_large_row_kernel
+    else:
+        grid_rows = num_rows
+        kernel = _glm_rms_norm_gated_row_kernel
+    kwargs = dict(
         x=x,
         gate=gate,
         weight=weight,
@@ -66,4 +102,7 @@ def glm_rms_norm_gated_npu(
         num_warps=1,
         num_stages=1,
     )
+    if num_rows > 65535:
+        kwargs.update(num_rows=num_rows, grid_rows=grid_rows)
+    kernel[(grid_rows,)](**kwargs)
     return output
