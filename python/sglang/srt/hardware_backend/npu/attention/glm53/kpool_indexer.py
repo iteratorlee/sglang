@@ -464,7 +464,15 @@ class AscendIndexerKPoolMixin:
                         q_req[start:end],
                         k_req[:candidate_count],
                     )
-                    logits = (F.relu(logits) * w_req[start:end].unsqueeze(-1)).sum(1)
+                    # Each 128-token tile can hold hundreds of MiB of scores
+                    # at 128k context.  The out-of-place relu and product kept
+                    # two extra copies live alongside the einsum result and
+                    # exhausted P HBM when all DP domains prefetched together.
+                    # This tensor is private to the current tile; reuse it for
+                    # both elementwise operations before reducing heads.
+                    logits.relu_()
+                    logits.mul_(w_req[start:end].unsqueeze(-1))
+                    logits = logits.sum(1)
                     logical_pos = first_pos + torch.arange(
                         start, end, device=q.device, dtype=torch.long
                     )
