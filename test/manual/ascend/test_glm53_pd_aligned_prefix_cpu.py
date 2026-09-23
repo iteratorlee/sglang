@@ -540,9 +540,17 @@ class AlignedPrefixTests(unittest.TestCase):
             for n in ast.walk(after)
             if isinstance(n, ast.FunctionDef)
         }
+        # Later Gateway DP-rank routing and admission-time P cache prefetch
+        # also changed Req.__init__ and Req.reset_for_retract. Keep the
+        # checkpoint change scoped to its own method while tracking those
+        # known, independent scheduler edits explicitly.
         self.assertEqual(
             [k for k in bm if bm[k] != am[k]],
-            ["_mamba_radix_cache_v2_req_prepare_for_extend"],
+            [
+                "__init__",
+                "reset_for_retract",
+                "_mamba_radix_cache_v2_req_prepare_for_extend",
+            ],
         )
         kda = ast.unparse(node(KDA, "forward_extend"))
         self.assertIn("track_lens = forward_batch.mamba_track_aligned_lens()", kda)
