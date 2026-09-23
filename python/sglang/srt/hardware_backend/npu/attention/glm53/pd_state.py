@@ -1,6 +1,6 @@
 """Bind GLM NPU KPool request state to the existing PD DSA_TAIL protocol.
 
-This is initialization-only wiring for homogeneous TP16/EP16/PP1. Paged K/V
+This is initialization-only wiring for supported single-node TP/EP layouts. Paged K/V
 and index buffers already travel in NPU MLA's main KV list; KDA conv/recurrent
 state uses the existing MAMBA component. Only live partial KPool groups need
 this additional component. MTP rollback scratch is batch-owned, not request
@@ -92,24 +92,31 @@ def grow_kpool_request_state(indexer, num_req_slots):
 def register_glm53_kpool_state(model, token_pool, req_pool, *, parallel):
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 
-    tp16 = (
-        parallel.tp_size == parallel.moe_ep_size == parallel.attn_tp_size == 16
+    single_attention_domain = (
+        parallel.tp_size == parallel.moe_ep_size == parallel.attn_tp_size
+        and parallel.tp_size in (8, 16)
         and not parallel.enable_dp_attention
     )
     dp_attention = (
-        parallel.tp_size == parallel.moe_ep_size == 16
+        parallel.tp_size == parallel.moe_ep_size
         and parallel.enable_dp_attention
         and parallel.dp_size == parallel.attn_dp_size
-        and (parallel.attn_dp_size, parallel.attn_tp_size) in ((16, 1), (8, 2), (4, 4), (2, 8))
+        and (
+            (parallel.tp_size == 16 and (parallel.attn_dp_size, parallel.attn_tp_size)
+             in ((16, 1), (8, 2), (4, 4), (2, 8)))
+            or (parallel.tp_size == 8 and (parallel.attn_dp_size, parallel.attn_tp_size)
+                == (4, 2))
+        )
     )
     if not (
-        (tp16 or dp_attention)
+        (single_attention_domain or dp_attention)
         and parallel.pp_size == 1
         and parallel.attn_cp_size == 1
     ):
         raise ValueError(
-            "GLM53 NPU PD state requires EP16/PP1/CP1 with TP16, "
-            "attention DP16/TP1, DP8/TP2, DP4/TP4, or DP2/TP8"
+            "GLM53 NPU PD state requires PP1/CP1 and TP=EP=16 with "
+            "attention TP16, DP16/TP1, DP8/TP2, DP4/TP4, or DP2/TP8; "
+            "or TP=EP=8 with attention TP8 or DP4/TP2"
         )
     pool = getattr(token_pool, "full_kv_pool", token_pool)
     if not isinstance(pool, NPUMLATokenToKVPool):

@@ -374,6 +374,22 @@ class TestGlm53PDState(unittest.TestCase):
                 pd_state.register_glm53_kpool_state(m, pool, requests, parallel=parallel)
                 self.assertEqual(ptrs, pool.get_compress_tail_buf_infos()[0])
 
+    def test_910b_tp8_and_dp4tp2_preserve_request_state(self):
+        for dp, attn_tp, enabled in ((1, 8, False), (4, 2, True)):
+            with self.subTest(dp=dp, attn_tp=attn_tp):
+                parallel = types.SimpleNamespace(**(vars(PARALLEL) | dict(
+                    tp_size=8, moe_ep_size=8, enable_dp_attention=enabled,
+                    dp_size=dp, attn_dp_size=dp, attn_tp_size=attn_tp,
+                )))
+                m, indexers = model([0])
+                pool, requests = NPUPool(1), req_pool(9)
+                keys = indexers[0]._kpool_tail_k.array.copy()
+                scores = indexers[0]._kpool_tail_score.array.copy()
+                pd_state.register_glm53_kpool_state(m, pool, requests, parallel=parallel)
+                np.testing.assert_array_equal(indexers[0]._kpool_tail_k.array[:3], keys)
+                np.testing.assert_array_equal(indexers[0]._kpool_tail_score.array[:3], scores)
+                self.assertEqual(indexers[0]._kpool_tail_k.shape, (9, 4, 128))
+
     def test_registration_idempotent_and_replacement_rejected(self):
         m, indexers = model([0], rows=10)
         pool, requests = NPUPool(1), req_pool(9)
@@ -484,13 +500,15 @@ class TestGlm53PDState(unittest.TestCase):
             {"tp_size": 8},
             {"moe_ep_size": 8},
             {"attn_tp_size": 4},
+            {"tp_size": 8, "moe_ep_size": 8, "enable_dp_attention": True,
+             "dp_size": 2, "attn_dp_size": 2, "attn_tp_size": 4},
             {"pp_size": 2},
             {"attn_cp_size": 2},
             {"enable_dp_attention": True},
         ):
             m, indexers = model([0])
             parallel = types.SimpleNamespace(**(vars(PARALLEL) | change))
-            with self.assertRaisesRegex(ValueError, "EP16/PP1/CP1"):
+            with self.assertRaisesRegex(ValueError, "PP1/CP1"):
                 pd_state.register_glm53_kpool_state(
                     m, NPUPool(1), req_pool(49), parallel=parallel
                 )
