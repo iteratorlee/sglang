@@ -417,6 +417,196 @@ class TestGlm53PDState(unittest.TestCase):
                 np.testing.assert_array_equal(indexers[0]._kpool_tail_score.array[:3], scores)
                 self.assertEqual(indexers[0]._kpool_tail_k.shape, (9, 4, 128))
 
+    def test_910b_dp4tp2_to_dp4tp2_uses_each_prefill_domain_and_tp_rank(self):
+        rank_mapping = source_functions(
+            SRT / "disaggregation/common/conn.py",
+            ["_resolve_rank_mapping"],
+            {},
+            "CommonKVManager",
+        )["_resolve_rank_mapping"]
+        resolve_prefill_dp = source_functions(
+            SRT / "disaggregation/decode.py",
+            ["_resolve_prefill_dp_rank"],
+            {"_bootstrap_addr": lambda req: req.bootstrap_addr},
+            "DecodePreallocQueue",
+        )["_resolve_prefill_dp_rank"]
+        skip_policy = source_functions(
+            SRT / "disaggregation/mooncake/conn.py",
+            ["_get_dsa_cache_transfer_skip_flags"],
+            {},
+            "MooncakeKVManager",
+        )["_get_dsa_cache_transfer_skip_flags"]
+        prefill_info = types.SimpleNamespace(dp_size=4, attn_tp_size=2)
+        queue = types.SimpleNamespace(
+            kv_manager=types.SimpleNamespace(prefill_info_table={"P": prefill_info})
+        )
+        for dp_rank in range(4):
+            req = types.SimpleNamespace(
+                bootstrap_addr="P", disagg_prefill_dp_rank=dp_rank
+            )
+            self.assertEqual(resolve_prefill_dp(queue, req), dp_rank)
+            for local_tp_rank in range(2):
+                with self.subTest(dp_rank=dp_rank, local_tp_rank=local_tp_rank):
+                    manager = types.SimpleNamespace(
+                        attn_tp_size=2,
+                        kv_args=types.SimpleNamespace(engine_rank=local_tp_rank),
+                        is_mla_backend=False,
+                        is_hybrid_mla_backend=True,
+                        attn_cp_size=1,
+                        attn_cp_rank=0,
+                        pp_size=1,
+                        pp_rank=0,
+                    )
+                    info = types.SimpleNamespace(
+                        attn_tp_size=2, attn_cp_size=1, pp_size=1
+                    )
+                    rank_mapping(manager, info)
+                    self.assertEqual(info.target_tp_ranks, [local_tp_rank])
+                    self.assertEqual(info.required_dst_info_num, 1)
+                    self.assertEqual(info.required_prefill_response_num, 1)
+                    p_manager = types.SimpleNamespace(
+                        attn_tp_size=2,
+                        kv_args=types.SimpleNamespace(
+                            engine_rank=dp_rank * 2 + local_tp_rank
+                        ),
+                        is_mla_backend=False,
+                        is_hybrid_mla_backend=True,
+                        _should_skip_cp_replicated_state_transfer=lambda: False,
+                    )
+                    self.assertEqual(
+                        skip_policy(
+                            p_manager, types.SimpleNamespace(dst_attn_tp_size=2)
+                        ),
+                        (False, False),
+                    )
+
+    def test_910b_dp4tp2_to_dp4tp2_target_draft_and_mamba_bytes(self):
+        parallel = types.SimpleNamespace(**(vars(PARALLEL) | dict(
+            tp_size=8, moe_ep_size=8, enable_dp_attention=True,
+            dp_size=4, attn_dp_size=4, attn_tp_size=2,
+        )))
+
+        def copy_blocks(session, blocks):
+            for source, dest, size in blocks:
+                ctypes.memmove(dest, source, size)
+            return 0
+
+        for dp_rank in range(4):
+            for tp_rank in range(2):
+                with self.subTest(dp_rank=dp_rank, tp_rank=tp_rank):
+                    marker = 100 * (dp_rank * 2 + tp_rank + 1)
+                    src_kv, src_draft = NPUPool(2), NPUPool(1)
+                    dst_kv, dst_draft = NPUPool(2), NPUPool(1)
+                    src_buffers = (
+                        src_kv.k_buffer + src_kv.v_buffer + src_kv.index_k_buffer
+                        + src_draft.k_buffer + src_draft.v_buffer
+                        + src_draft.index_k_buffer
+                    )
+                    dst_buffers = (
+                        dst_kv.k_buffer + dst_kv.v_buffer + dst_kv.index_k_buffer
+                        + dst_draft.k_buffer + dst_draft.v_buffer
+                        + dst_draft.index_k_buffer
+                    )
+                    for entry, (source, dest) in enumerate(zip(src_buffers, dst_buffers)):
+                        source.array[2] = marker + entry
+                        dest.array.fill(7)
+                    src_ptrs, _, src_lens = src_kv.get_contiguous_buf_infos()
+                    draft_ptrs, _, draft_lens = src_draft.get_contiguous_buf_infos()
+                    dst_ptrs = (
+                        dst_kv.get_contiguous_buf_infos()[0]
+                        + dst_draft.get_contiguous_buf_infos()[0]
+                    )
+                    sender = types.SimpleNamespace(
+                        pp_size=1,
+                        enable_custom_mem_pool=False,
+                        kv_args=types.SimpleNamespace(
+                            kv_data_ptrs=src_ptrs + draft_ptrs,
+                            kv_item_lens=src_lens + draft_lens,
+                        ),
+                        _validate_envelope_kv_layout=lambda *args: None,
+                        _transfer_data=copy_blocks,
+                    )
+                    self.assertEqual(
+                        ASCEND_KV_SEND(
+                            sender, "equal-tp", np.array([2], np.int32), dst_ptrs,
+                            np.array([7], np.int32), None, dst_attn_tp_size=2,
+                        ),
+                        0,
+                    )
+                    for source, dest in zip(src_buffers, dst_buffers):
+                        np.testing.assert_array_equal(dest.array[7], source.array[2])
+                        self.assertTrue((dest.array[:7] == 7).all())
+                        self.assertTrue((dest.array[8:] == 7).all())
+
+                    src, src_nextn, _, src_indexers = make_registered(5, parallel)
+                    dst, dst_nextn, _, dst_indexers = make_registered(9, parallel)
+                    src_args, dst_args = types.SimpleNamespace(), types.SimpleNamespace()
+                    UTILS["setup_state_kv_args"](src_args, src, src_nextn)
+                    UTILS["setup_state_kv_args"](dst_args, dst, dst_nextn)
+                    self.assertEqual(src_args.state_types, ["MAMBA", "DSA_TAIL"])
+                    self.assertEqual(src_args.state_types, dst_args.state_types)
+                    self.assertEqual(src_args.state_item_lens, dst_args.state_item_lens)
+                    src_tail_ptrs, _, src_tail_lens = pd_state.combined_kpool_tail_infos(
+                        src.full_kv_pool, src_nextn
+                    )
+                    dst_tail_ptrs, _, dst_tail_lens = pd_state.combined_kpool_tail_infos(
+                        dst.full_kv_pool, dst_nextn
+                    )
+                    for entry, (source, dest) in enumerate(zip(src_indexers, dst_indexers)):
+                        for state_kind, name in enumerate(("_kpool_tail_k", "_kpool_tail_score")):
+                            getattr(source, name).array[2] = marker + 10 * entry + state_kind
+                            getattr(dest, name).array.fill(7)
+                    for src_addr, dst_addr, size in UTILS["build_dsa_tail_transfer_blocks"](
+                        src_tail_ptrs, src_tail_lens, dst_tail_ptrs,
+                        UTILS["get_dsa_tail_state_indices"](src, 2, 131075),
+                        UTILS["get_dsa_tail_state_indices"](dst, 7, 131075),
+                        dst_tail_lens,
+                    ):
+                        ctypes.memmove(dst_addr, src_addr, size)
+                    for source, dest in zip(src_indexers, dst_indexers):
+                        for name in ("_kpool_tail_k", "_kpool_tail_score"):
+                            expected = np.full_like(getattr(dest, name).array, 7)
+                            expected[7, :3] = getattr(source, name).array[2, :3]
+                            np.testing.assert_array_equal(getattr(dest, name).array, expected)
+
+                    src_mamba, dst_mamba = MambaPool(5, 3, False), MambaPool(9, 6, True)
+                    pd_state.prepare_glm53_pd_mamba_state(
+                        types.SimpleNamespace(mamba_pool=src_mamba),
+                        types.SimpleNamespace(mamba_pool=src_mamba),
+                        mode="prefill", draft_tokens=4,
+                    )
+                    src_mamba.mamba_cache.conv[0].array[:, 2] = (
+                        marker + np.arange(2)[:, None, None] * 10
+                        + np.arange(6 * 6).reshape(6, 6)
+                    )
+                    src_mamba.mamba_cache.temporal.array[:, 2] = (
+                        marker + 100 + np.arange(2)[:, None, None, None] * 10
+                        + np.arange(2 * 7 * 5).reshape(2, 7, 5)
+                    )
+                    src_state_ptrs, _, src_state_lens = src_mamba.get_contiguous_buf_infos()
+                    dst_state_ptrs, _, dst_state_lens = dst_mamba.get_contiguous_buf_infos()
+                    self.assertEqual(src_state_lens, dst_state_lens)
+                    self.assertEqual(
+                        MAMBA_SEND(
+                            types.SimpleNamespace(pp_size=1, _transfer_data=copy_blocks),
+                            types.SimpleNamespace(mooncake_session_id="equal-tp"),
+                            [2], src_state_ptrs, src_state_lens, dst_state_ptrs, [7],
+                            src_mamba.get_state_layer_ids(),
+                            dst_mamba.get_state_layer_ids(),
+                        ),
+                        0,
+                    )
+                    np.testing.assert_array_equal(
+                        dst_mamba.mamba_cache.conv[0].array[:, 7],
+                        src_mamba.mamba_cache.conv[0].array[:, 2],
+                    )
+                    np.testing.assert_array_equal(
+                        dst_mamba.mamba_cache.temporal.array[:, 7],
+                        src_mamba.mamba_cache.temporal.array[:, 2],
+                    )
+                    self.assertFalse(dst_mamba.mamba_cache.conv[0].array[:, :7].any())
+                    self.assertFalse(dst_mamba.mamba_cache.temporal.array[:, :7].any())
+
     def test_910b_tp4_to_tp2_rank_mapping_and_kv_draft_pages(self):
         rank_mapping = source_functions(
             SRT / "disaggregation/common/conn.py",

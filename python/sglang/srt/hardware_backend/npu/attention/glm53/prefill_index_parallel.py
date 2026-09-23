@@ -20,7 +20,7 @@ _PD_DP_PERFORMANCE_ENV = "SGLANG_GLM53_PD_PREFILL_INDEX_TP_DP_PERFORMANCE"
 _PD_VERIFY_MODE = "verify"
 _PD_PERFORMANCE_MODE = "performance"
 _PD_MODES = frozenset((_PD_VERIFY_MODE, _PD_PERFORMANCE_MODE))
-_VALIDATED_PD_DP_ATTN_TOPOLOGIES = frozenset(((2, 8), (4, 4), (2, 4)))
+_VALIDATED_PD_DP_ATTN_TOPOLOGIES = frozenset(((2, 8), (4, 4), (2, 4), (4, 2)))
 
 # One record per execution mode and process is enough to prove that the
 # optimized branch ran. A server process owns only one rank in production.
@@ -169,7 +169,7 @@ def _pd_prefill_topology_supported(args):
         and args.pp_size == 1
         and args.moe_dp_size == args.dwdp_size == 1
         # ServerArgs contains input leaves, not ParallelContext.attn_tp_size.
-        # DP attention is on, TP16/CP1 are checked, and DP is bounded before
+        # DP attention is on, TP/CP1 are checked, and DP is bounded before
         # division: this is runtime_context.derive_attention_widths arithmetic.
         and args.dp_size in (2, 4)
         and (args.dp_size, args.tp_size // args.dp_size // args.attn_cp_size)

@@ -126,7 +126,7 @@ class PrefixTopologyPolicyTests(unittest.TestCase):
                 self.assertIs(RUNTIME["get_parallel"](), context)
                 self.assertEqual(POLICY(RUNTIME["get_parallel"]()), supported)
 
-    def test_preserves_tp16_and_admits_910b_dp2tp4(self):
+    def test_preserves_tp16_and_admits_910b_dp2tp4_dp4tp2(self):
         self.assertTrue(POLICY(parallel()))
         self.assertTrue(
             POLICY(
@@ -148,27 +148,40 @@ class PrefixTopologyPolicyTests(unittest.TestCase):
                 )
             )
         )
-        cfg = server_args_shape(
-            dp_size=2,
-            tp_size=8,
-            ep_size=8,
-            enable_dp_attention=True,
-            nnodes=1,
-            pp_size=1,
-            attn_cp_size=1,
-            dcp_size=1,
-            moe_dp_size=1,
-            dwdp_size=1,
-        )
-        context = published_parallel(cfg)
-        self.assertEqual((context.attn_dp_size, context.attn_tp_size), (2, 4))
-        self.assertTrue(POLICY(context))
+        for dp_size, attn_tp_size in ((2, 4), (4, 2)):
+            with self.subTest(dp_size=dp_size):
+                cfg = server_args_shape(
+                    dp_size=dp_size,
+                    tp_size=8,
+                    ep_size=8,
+                    enable_dp_attention=True,
+                    nnodes=1,
+                    pp_size=1,
+                    attn_cp_size=1,
+                    dcp_size=1,
+                    moe_dp_size=1,
+                    dwdp_size=1,
+                )
+                context = published_parallel(cfg)
+                self.assertEqual(
+                    (context.attn_dp_size, context.attn_tp_size),
+                    (dp_size, attn_tp_size),
+                )
+                self.assertTrue(POLICY(context))
+                self.assertEqual(
+                    PAGE_SIZE(NS(index_kpool=4), "npu:0", 64, 64, POLICY(context)),
+                    256,
+                )
 
     def test_rejects_unvalidated_or_relaxed_parallel_layouts(self):
         mutations = (
             dict(dp_size=8, attn_dp_size=8, attn_tp_size=2, enable_dp_attention=True),
             dict(
-                dp_size=4, attn_dp_size=4, attn_tp_size=2,
+                dp_size=8, attn_dp_size=8, attn_tp_size=1,
+                enable_dp_attention=True, tp_size=8, ep_size=8,
+            ),
+            dict(
+                dp_size=4, attn_dp_size=2, attn_tp_size=2,
                 enable_dp_attention=True, tp_size=8, ep_size=8,
             ),
             dict(
@@ -178,6 +191,18 @@ class PrefixTopologyPolicyTests(unittest.TestCase):
             dict(
                 dp_size=2, attn_dp_size=2, attn_tp_size=4,
                 enable_dp_attention=True, tp_size=8, ep_size=8, nnodes=2,
+            ),
+            dict(
+                dp_size=4, attn_dp_size=4, attn_tp_size=2,
+                enable_dp_attention=True, tp_size=8, ep_size=16,
+            ),
+            dict(
+                dp_size=4, attn_dp_size=4, attn_tp_size=2,
+                enable_dp_attention=True, tp_size=8, ep_size=8, nnodes=2,
+            ),
+            dict(
+                dp_size=4, attn_dp_size=4, attn_tp_size=2,
+                enable_dp_attention=True, tp_size=8, ep_size=8, attn_cp_size=2,
             ),
             dict(dp_size=2, attn_dp_size=1, attn_tp_size=8, enable_dp_attention=True),
             dict(dp_size=2, attn_dp_size=2, attn_tp_size=8),

@@ -222,7 +222,7 @@ def _glm53_npu_prefix_page_size(
     return math.lcm(tree_page_size, physical_page_size * kpool)
 
 
-_GLM53_VALIDATED_PREFILL_DP_TOPOLOGIES = frozenset(((2, 8), (4, 4), (2, 4)))
+_GLM53_VALIDATED_PREFILL_DP_TOPOLOGIES = frozenset(((2, 8), (4, 4), (2, 4), (4, 2)))
 
 
 def _glm53_npu_prefill_prefix_topology_supported(parallel):

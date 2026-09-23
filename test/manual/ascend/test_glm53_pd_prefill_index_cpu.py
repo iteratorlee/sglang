@@ -340,22 +340,27 @@ class TestFlagsAndOracle(unittest.TestCase):
                 self.assertFalse(hasattr(self.config, "attn_tp_size"))
                 self.assertEqual(RUNTIME["attn_tp_size_of"](self.config), attn_tp_size)
                 self.assertTrue(INDEX.enabled(query(), batch()))
-        self.config = args(
-            tp_size=8,
-            ep_size=8,
-            dp_size=2,
-            enable_dp_attention=True,
-            disable_radix_cache=False,
-        )
-        self.assertEqual(RUNTIME["attn_tp_size_of"](self.config), 4)
-        self.assertTrue(INDEX.enabled(query(), batch()))
+        for dp_size, attn_tp_size in ((2, 4), (4, 2)):
+            with self.subTest(dp_size=dp_size):
+                self.config = args(
+                    tp_size=8,
+                    ep_size=8,
+                    dp_size=dp_size,
+                    enable_dp_attention=True,
+                    disable_radix_cache=False,
+                )
+                self.assertEqual(RUNTIME["attn_tp_size_of"](self.config), attn_tp_size)
+                self.assertTrue(INDEX.enabled(query(), batch()))
         for mutation in (
             dict(dp_size=8, enable_dp_attention=True),
             dict(dp_size=0, enable_dp_attention=True),
             dict(dp_size=3, enable_dp_attention=True),
-            dict(dp_size=4, tp_size=8, ep_size=8, enable_dp_attention=True),
+            dict(dp_size=8, tp_size=8, ep_size=8, enable_dp_attention=True),
             dict(dp_size=2, tp_size=8, ep_size=16, enable_dp_attention=True),
             dict(dp_size=2, tp_size=8, ep_size=8, nnodes=2, enable_dp_attention=True),
+            dict(dp_size=4, tp_size=8, ep_size=16, enable_dp_attention=True),
+            dict(dp_size=4, tp_size=8, ep_size=8, nnodes=2, enable_dp_attention=True),
+            dict(dp_size=4, tp_size=8, ep_size=8, attn_cp_size=2, enable_dp_attention=True),
             dict(dp_size=4, tp_size=32, enable_dp_attention=True),
             dict(dp_size=2, enable_dp_attention=False),
             dict(dp_size=2, ep_size=8, enable_dp_attention=True),
@@ -391,20 +396,25 @@ class TestFlagsAndOracle(unittest.TestCase):
                 self.config = args(disable_radix_cache=False, **mutation)
                 self.assertFalse(INDEX.enabled(query(), batch()))
 
-    def test_910b_dp2tp4_keeps_cache_and_performance_guards(self):
-        self.config = args(
-            tp_size=8, ep_size=8, dp_size=2, enable_dp_attention=True,
-            disable_radix_cache=False,
-        )
+    def test_910b_dp2tp4_and_dp4tp2_keep_cache_and_performance_guards(self):
         os.environ["SGLANG_GLM53_PD_PREFILL_INDEX_TP"] = "1"
-        self.assertFalse(INDEX.enabled(query(), batch()))
-        os.environ["SGLANG_GLM53_PREFILL_INDEX_VERIFY_DIR"] = "/tmp/oracle"
-        self.assertTrue(INDEX.enabled(query(), batch()))
-        os.environ["SGLANG_GLM53_PD_PREFILL_INDEX_TP_MODE"] = "performance"
-        self.assertFalse(INDEX.enabled(query(), batch()))
-        os.environ["SGLANG_GLM53_PD_PREFILL_INDEX_TP_DP_PERFORMANCE"] = "1"
-        self.assertTrue(INDEX.enabled(query(), batch()))
-        self.assertFalse(INDEX.enabled(query(), batch(mode="mixed")))
+        for dp_size in (2, 4):
+            with self.subTest(dp_size=dp_size):
+                self.config = args(
+                    tp_size=8, ep_size=8, dp_size=dp_size,
+                    enable_dp_attention=True, disable_radix_cache=False,
+                )
+                os.environ.pop("SGLANG_GLM53_PREFILL_INDEX_VERIFY_DIR", None)
+                os.environ.pop("SGLANG_GLM53_PD_PREFILL_INDEX_TP_MODE", None)
+                os.environ.pop("SGLANG_GLM53_PD_PREFILL_INDEX_TP_DP_PERFORMANCE", None)
+                self.assertFalse(INDEX.enabled(query(), batch()))
+                os.environ["SGLANG_GLM53_PREFILL_INDEX_VERIFY_DIR"] = "/tmp/oracle"
+                self.assertTrue(INDEX.enabled(query(), batch()))
+                os.environ["SGLANG_GLM53_PD_PREFILL_INDEX_TP_MODE"] = "performance"
+                self.assertFalse(INDEX.enabled(query(), batch()))
+                os.environ["SGLANG_GLM53_PD_PREFILL_INDEX_TP_DP_PERFORMANCE"] = "1"
+                self.assertTrue(INDEX.enabled(query(), batch()))
+                self.assertFalse(INDEX.enabled(query(), batch(mode="mixed")))
 
     def test_server_args_shape_rejects_derived_width_injection(self):
         with self.assertRaises(AttributeError):
