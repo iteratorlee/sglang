@@ -88,6 +88,12 @@ class AscendKVManager(MooncakeKVManager):
             ptrs.extend(component_ptrs)
             lens.extend(component_lens)
         if ptrs:
+            if len(ptrs) != len(lens):
+                raise RuntimeError("Ascend memory registration pointer/length mismatch")
+            # The unified allocator can report the same storage under both KV
+            # and state components. Mooncake rejects an exact double register.
+            regions = list(dict.fromkeys(zip(ptrs, lens)))
+            ptrs, lens = map(list, zip(*regions))
             ret = self.engine.batch_register(ptrs, lens)
             if ret not in (None, 0):
                 raise RuntimeError(

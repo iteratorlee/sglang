@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from sglang.srt.environ import envs
@@ -126,6 +127,7 @@ class MooncakeTransferEngine:
             ) from e
 
         self.engine = TransferEngine()
+        self._ascend_context_tls = threading.local()
         self.hostname = hostname
         self.gpu_id = gpu_id if gpu_id is not None else 0
         # MC_FORCE_TCP=1 makes mooncake install TcpTransport instead of RDMA,
@@ -144,6 +146,7 @@ class MooncakeTransferEngine:
         ).to_host_port_str()
 
     def register(self, ptr, length) -> None:
+        self._ensure_ascend_thread_context()
         try:
             ret_value = self.engine.register_memory(ptr, length)
         except Exception as exc:
@@ -153,6 +156,7 @@ class MooncakeTransferEngine:
             raise RuntimeError(f"Mooncake memory registration failed (ret={ret_value})")
 
     def deregister(self, ptr) -> None:
+        self._ensure_ascend_thread_context()
         try:
             ret_value = self.engine.unregister_memory(ptr)
         except Exception as exc:
@@ -165,6 +169,7 @@ class MooncakeTransferEngine:
 
     def batch_register(self, ptrs: List[int], lengths: List[int]) -> int:
         """Batch register multiple memory regions."""
+        self._ensure_ascend_thread_context()
         try:
             ret_value = self.engine.batch_register_memory(ptrs, lengths)
         except Exception:
@@ -182,6 +187,7 @@ class MooncakeTransferEngine:
 
     def batch_deregister(self, ptrs: List[int]) -> int:
         """Batch deregister multiple memory regions."""
+        self._ensure_ascend_thread_context()
         try:
             ret_value = self.engine.batch_unregister_memory(ptrs)
         except Exception:
@@ -208,13 +214,17 @@ class MooncakeTransferEngine:
             # Default is "rdma"; set MOONCAKE_PROTOCOL=efa on AWS EFA hardware.
             protocol = envs.MOONCAKE_PROTOCOL.get()
 
-        ret_value = run_with_deadline(
-            lambda: self.engine.initialize(
+        def initialize_in_worker_thread():
+            self._ensure_ascend_thread_context()
+            return self.engine.initialize(
                 hostname,
                 "P2PHANDSHAKE",
                 protocol,
                 device_name if device_name is not None else "",
-            ),
+            )
+
+        ret_value = run_with_deadline(
+            initialize_in_worker_thread,
             timeout_s=envs.SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT.get(),
             what=f"Mooncake TransferEngine.initialize({hostname!r}, {protocol!r}, {device_name!r})",
         )
@@ -222,10 +232,23 @@ class MooncakeTransferEngine:
             logger.error("Mooncake Transfer Engine initialization failed.")
             raise RuntimeError("Mooncake Transfer Engine initialization failed.")
 
+    def _ensure_ascend_thread_context(self) -> None:
+        # ACL device contexts are thread-local. Mooncake initialization runs
+        # in run_with_deadline's worker; KV transfers run in sender executors.
+        if not envs.ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE.get():
+            return
+        if getattr(self._ascend_context_tls, "ready", False):
+            return
+        import torch
+
+        torch.npu.set_device(self.gpu_id)
+        self._ascend_context_tls.ready = True
+
     def transfer_sync(
         self, session_id: str, buffer: int, peer_buffer_address: int, length: int
     ) -> int:
         """Synchronously transfer data to the specified address."""
+        self._ensure_ascend_thread_context()
         try:
             ret = self.engine.transfer_sync_write(
                 session_id, buffer, peer_buffer_address, length
@@ -251,6 +274,7 @@ class MooncakeTransferEngine:
         lengths: List[int],
     ) -> int:
         """Synchronously transfer data to the specified addresses in batches."""
+        self._ensure_ascend_thread_context()
         try:
             ret = self.engine.batch_transfer_sync_write(
                 session_id, buffers, peer_buffer_addresses, lengths
@@ -278,6 +302,7 @@ class MooncakeTransferEngine:
         return self.session_id
 
     def send_probe(self, peer_session_id: str) -> int:
+        self._ensure_ascend_thread_context()
         return self.engine.send_probe(peer_session_id)
 
     def get_engine(self):
