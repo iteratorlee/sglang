@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import dataclasses
+import hashlib
 import json
 import logging
 import os
@@ -34,6 +35,7 @@ from datetime import datetime
 from enum import Enum
 from functools import lru_cache
 from http import HTTPStatus
+from pathlib import Path
 from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple, Union
 
 import fastapi
@@ -178,6 +180,7 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
+_GLM53_DECODE_BENCH_TRACE_DIR = os.getenv("SGLANG_GLM53_DECODE_BENCH_TRACE_DIR")
 
 logger = logging.getLogger(__name__)
 
@@ -234,6 +237,10 @@ class ReqState:
     time_stats: APIServerReqTimeStats
     last_completion_tokens: int = 1
     ttft_observed: bool = False
+    # Optional D-side benchmark trace; retained in memory and written only
+    # once when a benchmark request finishes. Each event can contain multiple
+    # output tokens under speculative decoding.
+    glm53_decode_bench_events: Optional[List[Tuple[int, int]]] = None
 
     dispatched: bool = False
     abort_sent: bool = False
@@ -2506,6 +2513,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if state.time_stats.first_token_time == 0.0:
                 state.time_stats.set_first_token_time()
 
+            if (
+                _GLM53_DECODE_BENCH_TRACE_DIR
+                and self.disaggregation_mode == DisaggregationMode.DECODE
+                and rid.startswith("bench-pd-910b-")
+            ):
+                completion = meta_info.get("completion_tokens")
+                if isinstance(completion, int) and completion > 0:
+                    events = state.glm53_decode_bench_events
+                    if events is None:
+                        events = state.glm53_decode_bench_events = []
+                    if not events or completion > events[-1][1]:
+                        events.append((time.perf_counter_ns(), completion))
+
             if state.finished:
                 span_attrs = (
                     self.convert_to_span_attrs(state, recv_obj, i)
@@ -2533,6 +2553,41 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             scheduler_time_stats, completion_tokens
                         )
                     )
+
+                if (
+                    _GLM53_DECODE_BENCH_TRACE_DIR
+                    and self.disaggregation_mode == DisaggregationMode.DECODE
+                    and rid.startswith("bench-pd-910b-")
+                ):
+                    try:
+                        trace_dir = Path(_GLM53_DECODE_BENCH_TRACE_DIR)
+                        trace_dir.mkdir(parents=True, exist_ok=True)
+                        digest = hashlib.sha256(rid.encode()).hexdigest()[:20]
+                        trace_path = trace_dir / f"{digest}.json"
+                        temporary = trace_dir / f".{digest}.{os.getpid()}.tmp"
+                        trace = {
+                            "rid": rid,
+                            "dp_rank": meta_info.get("dp_rank"),
+                            "prompt_tokens": meta_info.get("prompt_tokens"),
+                            "completion_tokens": meta_info.get("completion_tokens"),
+                            "cached_tokens": meta_info.get("cached_tokens"),
+                            "finish_reason": meta_info.get("finish_reason"),
+                            "decode_throughput": meta_info.get("decode_throughput"),
+                            "spec_accept_rate": meta_info.get("spec_accept_rate"),
+                            "spec_num_correct_drafts": meta_info.get(
+                                "spec_num_correct_drafts"
+                            ),
+                            "spec_num_proposed_drafts": meta_info.get(
+                                "spec_num_proposed_drafts"
+                            ),
+                            "events_perf_counter_ns_and_completion_tokens": (
+                                state.glm53_decode_bench_events or []
+                            ),
+                        }
+                        temporary.write_text(json.dumps(trace) + "\n")
+                        os.replace(temporary, trace_path)
+                    except Exception:
+                        logger.exception("Failed to write GLM53 D benchmark trace %s", rid)
 
                 del self.rid_to_state[rid]
 
