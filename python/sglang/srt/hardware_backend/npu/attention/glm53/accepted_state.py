@@ -42,12 +42,35 @@ class _TailCommitGraph:
     def __init__(self, indexers, requests, accepted):
         self.requests = requests.clone()
         self.accepted = accepted.clone()
+        self.fused = os.getenv("SGLANG_GLM53_MTP_FUSED_COMMIT", "0") == "1"
+        if self.fused:
+            from sglang.srt.hardware_backend.npu.attention.glm53.fused_tail_commit import (
+                make_pointer_tables,
+            )
+
+            self.tables, self.row_elements, self.num_steps = make_pointer_tables(indexers)
         # Scratch is immutable after verification. Repeated copies are
         # idempotent; native convolution rollback stays outside this graph.
-        _copy_tails(indexers, self.requests, self.accepted)
+        self._commit(indexers)
         torch.npu.synchronize()
         self.graph = torch.npu.NPUGraph()
         with torch.npu.graph(self.graph):
+            self._commit(indexers)
+
+    def _commit(self, indexers):
+        if self.fused:
+            from sglang.srt.hardware_backend.npu.attention.glm53.fused_tail_commit import (
+                commit_fused,
+            )
+
+            commit_fused(
+                self.tables,
+                self.row_elements,
+                self.num_steps,
+                self.requests,
+                self.accepted,
+            )
+        else:
             _copy_tails(indexers, self.requests, self.accepted)
 
     def replay(self, requests, accepted):
