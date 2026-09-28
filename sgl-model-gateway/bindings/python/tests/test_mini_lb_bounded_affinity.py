@@ -104,7 +104,7 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(lb._decode_inflight_reservations, [4, 1, 2, 3])
         self.assertEqual(lb.decode_affinity_snapshot()["overrides"], 1)
 
-    async def test_ties_balance_and_all_full_keeps_affinity(self):
+    async def test_ties_and_all_full_bursts_balance(self):
         lb = make_lb(decode_dp=4)
         lb._decode_inflight_reservations[:] = [4, 0, 0, 0]
         request = request_for_rank(lb, 0)
@@ -127,13 +127,20 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
 
         lb._decode_inflight_reservations[:] = [4, 4, 4, 4]
         request = request_for_rank(lb, 2)
-        _, decode, reservation = await lb._prepare_affinity_requests(
-            request, "generate"
-        )
-        self.assertEqual(decode["routed_dp_rank"], 2)
-        self.assertEqual(lb._decode_inflight_reservations[2], 5)
-        self.assertEqual(lb.decode_affinity_snapshot()["all_full_fallbacks"], 1)
-        reservation.release()
+        reservations = []
+        selected = []
+        for _ in range(8):
+            _, decode, reservation = await lb._prepare_affinity_requests(
+                request, "generate"
+            )
+            selected.append(decode["routed_dp_rank"])
+            reservations.append(reservation)
+        self.assertEqual(selected[0], 2)
+        self.assertEqual(set(selected[:4]), {0, 1, 2, 3})
+        self.assertEqual(lb._decode_inflight_reservations, [6, 6, 6, 6])
+        self.assertEqual(lb.decode_affinity_snapshot()["all_full_fallbacks"], 8)
+        for reservation in reservations:
+            reservation.release()
 
     async def test_routes_stay_valid_and_cleanup_has_no_residue(self):
         lb = make_lb(prefill_dp=3, decode_dp=8)

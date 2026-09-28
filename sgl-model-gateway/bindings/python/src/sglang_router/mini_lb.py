@@ -188,8 +188,8 @@ class MiniLoadBalancer:
         if self.affinity_decode_capacity:
             logger.warning(
                 "[MiniLB] Bounded decode affinity enabled: capacity=%d, "
-                "router-local in-flight reservations only; all-full falls back "
-                "to affinity.",
+                "router-local in-flight reservations only; all-full selects "
+                "a least-reserved DP rank.",
                 self.affinity_decode_capacity,
             )
 
@@ -343,10 +343,9 @@ class MiniLoadBalancer:
     def _reserve_decode_rank(self, affinity_rank, digest):
         """Select and reserve one valid D rank without yielding the event loop.
 
-        The capacity is deliberately soft: when every rank is at capacity, the
-        original affinity rank is retained. This preserves liveness and prefix
-        behavior during bursts while making the overload visible in the local
-        reservation counters.
+        The capacity is deliberately soft: when every rank is at capacity,
+        select a least-reserved rank. Keeping the original affinity rank in
+        that case can funnel an entire burst into one saturated DP domain.
         """
         counts = self._decode_inflight_reservations
         if len(counts) != self.decode_dp_size:
@@ -377,6 +376,13 @@ class MiniLoadBalancer:
                 self._decode_reservation_overrides += 1
             else:
                 self._decode_reservation_all_full_fallbacks += 1
+                minimum = min(counts)
+                least_reserved = [
+                    rank for rank, inflight in enumerate(counts)
+                    if inflight == minimum
+                ]
+                selected_rank = least_reserved[digest % len(least_reserved)]
+                self._decode_reservation_overrides += int(selected_rank != affinity_rank)
 
         counts[selected_rank] += 1
         self._decode_reservation_total += 1
