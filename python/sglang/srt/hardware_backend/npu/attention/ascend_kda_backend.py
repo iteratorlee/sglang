@@ -172,9 +172,13 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             glm_kda_varlen_recurrent_npu,
         )
 
-        # Native Ascend state/rollback uses logical [V,K], while the GLM tile
-        # updates [K,V]. Preserve views and explicit strides, never copy state.
-        return glm_kda_varlen_recurrent_npu(
+        # The NPU speculative pool already transposes its persistent [V,K]
+        # state. A second transpose changes the recurrent Triton specialization
+        # and produces different prefill values even from a zero state. Both
+        # paths must present the same logical [K,V] strides to the GLM kernel.
+        speculative_state_view = states.stride(-2) == 1 and states.stride(-1) > 1
+        kernel_states = states if speculative_state_view else states.transpose(-1, -2)
+        output = glm_kda_varlen_recurrent_npu(
             q=q,
             k=k,
             v=v,
@@ -182,7 +186,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             b=b.reshape(1, -1, layer.num_v_heads),
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
-            initial_state_source=states.transpose(-1, -2),
+            initial_state_source=kernel_states,
             initial_state_indices=indices,
             cu_seqlens=starts,
             lower_bound=layer.lower_bound,
@@ -193,6 +197,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
                 intermediate.transpose(-1, -2) if intermediate is not None else None
             ),
         )
+        return output
 
     def _get_conv_weights_t(
         self, layer: RadixLinearAttention, dtype: torch.dtype
@@ -656,6 +661,16 @@ class AscendKDAHybridLinearAttnBackend:
 
                 conv_states = mamba_caches.conv[0]
                 ssm_states = mamba_caches.temporal
+                # The recurrent GLM kernel sees the already-transposed MTP
+                # state directly. Its scratch remains contiguous [V,K]; commit
+                # through the physical destination view so the next recurrent
+                # call sees the same [K,V] matrix without a state copy.
+                commit_states = (
+                    ssm_states.transpose(-1, -2)
+                    if ssm_states.stride(-2) == 1
+                    and ssm_states.stride(-1) > 1
+                    else ssm_states
+                )
                 intermediate_state_cache = mamba_caches.intermediate_ssm
                 dst_indices_tensor = state_indices_tensor.to(torch.int32)
                 src_indices_tensor = torch.arange(
@@ -666,7 +681,7 @@ class AscendKDAHybridLinearAttnBackend:
                 last_steps = last_correct_step_indices.to(torch.int32)
 
                 move_intermediate_cache_kda(
-                    ssm_states,
+                    commit_states,
                     intermediate_state_cache,
                     dst_indices_tensor,
                     src_indices_tensor,
@@ -696,7 +711,7 @@ class AscendKDAHybridLinearAttnBackend:
                     mamba_steps_to_track = mamba_steps_to_track.to(torch.int32)
 
                     move_intermediate_cache_kda(
-                        ssm_states,
+                        commit_states,
                         intermediate_state_cache,
                         mamba_track_indices,
                         src_indices_tensor,
