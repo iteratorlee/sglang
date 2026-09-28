@@ -62,9 +62,17 @@ class ConfigTests(unittest.TestCase):
                 )
 
     def test_three_prefill_workers_keep_prefix_affinity(self):
-        lb = make_lb(capacity=0, prefill_dp=4, decode_dp=4)
-        lb.prefill_urls = [f"http://prefill-{i}:31116" for i in range(3)]
-        lb.prefill_bootstrap_ports = [18916] * 3
+        lb = mini_lb.MiniLoadBalancer(
+            RouterArgs(
+                mini_lb=True,
+                pd_disaggregation=True,
+                policy="random",
+                prefill_urls=[(f"http://prefill-{i}:31116", 18916) for i in range(3)],
+                decode_urls=["http://decode:32117"],
+                mini_lb_prefix_affinity=True,
+                mini_lb_prefix_affinity_length=4,
+            )
+        )
         counts = [0] * 3
         for family in range(90):
             request = {

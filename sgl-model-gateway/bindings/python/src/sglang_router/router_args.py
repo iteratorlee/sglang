@@ -1093,9 +1093,9 @@ class RouterArgs:
                 )
             if self.mini_lb_prefix_affinity_length <= 0:
                 raise ValueError("--mini-lb-prefix-affinity-length must be positive")
-            if len(self.prefill_urls) != 1 or len(self.decode_urls) != 1:
+            if not self.prefill_urls or len(self.decode_urls) != 1:
                 raise ValueError(
-                    "MiniLB prefix affinity requires exactly one prefill URL and one decode URL"
+                    "MiniLB prefix affinity requires at least one prefill URL and exactly one decode URL"
                 )
             if self.test_external_dp_routing:
                 raise ValueError(
