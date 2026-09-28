@@ -22,6 +22,24 @@ if is_npu():
     import torch_npu
 
 
+def _prefill_topk_tile_rows(device: torch.device) -> int:
+    setting = os.environ.get("SGLANG_GLM53_PREFILL_TOPK_TILE_ROWS", "32")
+    if setting == "auto":
+        threshold_mb = int(
+            os.environ.get("SGLANG_GLM53_PREFILL_TOPK_AUTO_FREE_MB", "512")
+        )
+        if threshold_mb <= 0:
+            raise ValueError("SGLANG_GLM53_PREFILL_TOPK_AUTO_FREE_MB must be positive")
+        free_bytes, _ = torch.npu.mem_get_info(device)
+        # The full 32-row score and CANN's elementwise scratch need hundreds
+        # of MiB at 128k.  Keep the fast tile until that headroom disappears.
+        return 8 if free_bytes < threshold_mb * 1024 * 1024 else 32
+    tile_rows = int(setting)
+    if not 1 <= tile_rows <= 32:
+        raise ValueError("SGLANG_GLM53_PREFILL_TOPK_TILE_ROWS must be auto or in [1, 32]")
+    return tile_rows
+
+
 def _get_full_attn_metadata(forward_batch: ForwardBatch):
     """Resolve MLA metadata through the active hybrid attention backend."""
 
@@ -426,9 +444,7 @@ class AscendIndexerKPoolMixin:
         # CANN may materialize another score-sized buffer for mul_().  Allow
         # memory-constrained prefill workers to lower the query tile without
         # changing the 128-token causal boundary or candidate pool dimension.
-        tile_rows = int(os.environ.get("SGLANG_GLM53_PREFILL_TOPK_TILE_ROWS", "32"))
-        if not 1 <= tile_rows <= 32:
-            raise ValueError("SGLANG_GLM53_PREFILL_TOPK_TILE_ROWS must be in [1, 32]")
+        tile_rows = _prefill_topk_tile_rows(q.device)
         result = []
         offset = 0
         for i in range(
