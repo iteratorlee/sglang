@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import time
 from collections import deque
 from concurrent.futures import Future
@@ -54,6 +55,7 @@ from sglang.srt.disaggregation.glm53_decode_prefix import (
     validate_glm53_pd_decode_prefix_runtime,
     write_glm53_cache_audit,
 )
+from sglang.srt.disaggregation.strict_kv_admission import projected_full_kv_tokens
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
@@ -396,6 +398,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.pp_rank = pp_rank
         self.pp_size = scheduler.ps.pp_size
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
+        self.strict_decode_kv_admission = (
+            os.environ.get("SGLANG_PD_STRICT_DECODE_KV_ADMISSION") == "1"
+        )
         self.transfer_backend = transfer_backend
         self.glm53_decode_prefix_profile = None
         if get_disagg().disaggregation_decode_enable_radix_cache:
@@ -1258,6 +1263,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if hisparse_req_budget <= 0:
                 break
 
+            if self.strict_decode_kv_admission and not self._strict_full_kv_admission_allows(
+                decode_req.req, preallocated_reqs
+            ):
+                # Leave the request in the preallocation queue until prior
+                # transfers/running requests release enough FULL KV. In
+                # particular, do not publish a destination whose prompt KV
+                # would consume another request's remaining output budget.
+                break
+
             # GLM-5's configured KV capacity covers local running slots. Requests
             # on transfer/waiting queues already own KV too, so admitting beyond
             # that limit can consume the headroom needed by running outputs.
@@ -1716,6 +1730,32 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if n_active is None:
             n_active = self._active_req_count(extra_reserved_reqs)
         return self.num_reserved_decode_tokens * n_active
+
+    def _strict_full_kv_admission_allows(
+        self, req: Req, preallocated_reqs: List[DecodeRequest]
+    ) -> bool:
+        """Keep enough FULL KV for all accepted requests' complete outputs.
+
+        Transfer/waiting requests already own their input KV but cannot be
+        retracted by the decode batch. The clipped output estimate in the
+        normal budget does not protect a running request against their growth.
+        """
+        active = [
+            *self.scheduler.running_batch.reqs,
+            *(entry.req for entry in self.transfer_queue.queue),
+            *self.scheduler.waiting_queue,
+            *(entry.req for entry in preallocated_reqs),
+            req,
+        ]
+        last_batch = self.scheduler.last_batch
+        if last_batch and last_batch.forward_mode.is_prebuilt():
+            active.extend(last_batch.reqs)
+        projected = projected_full_kv_tokens(
+            active,
+            page_size=self.token_to_kv_pool_allocator.page_size,
+            decode_headroom_per_request=self.num_reserved_decode_tokens,
+        )
+        return projected <= self.max_total_num_tokens
 
     def _swa_aware_allocatable_token_budgets(
         self,
