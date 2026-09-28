@@ -49,6 +49,37 @@ class TestMambaStateTransferBuffers(unittest.TestCase):
             self.assertTrue(torch.equal(actual, expected))
         self.assertTrue(torch.equal(pool.mamba_cache.temporal, expected_temporal))
 
+    def test_npu_copy_slots_preserves_snapshot_semantics_for_strided_state(self):
+        for src_slots, dst_slots in (([0], [2]), ([0, 1], [1, 2])):
+            with self.subTest(src=src_slots, dst=dst_slots):
+                temporal = torch.arange(
+                    NUM_LAYERS * 6 * NUM_SLOTS * 4, dtype=torch.float32
+                ).reshape(NUM_LAYERS, 6, NUM_SLOTS, 4).transpose(1, 2)
+                pool = _pool(temporal)
+                pool.replayssm_write_pos = None
+                pool.debug_memory_pool = False
+                for i, conv in enumerate(pool.mamba_cache.conv):
+                    conv.copy_(
+                        torch.arange(conv.numel(), dtype=conv.dtype).reshape(conv.shape)
+                        + i * conv.numel()
+                    )
+                expected = [
+                    tensor.clone()
+                    for tensor in (*pool.mamba_cache.conv, pool.mamba_cache.temporal)
+                ]
+                sources = torch.tensor(src_slots)
+                destinations = torch.tensor(dst_slots)
+                for tensor in expected:
+                    tensor[:, destinations] = tensor[:, sources].clone()
+
+                with mock.patch("sglang.srt.mem_cache.memory_pool._is_npu", True):
+                    pool.copy_from(sources, destinations)
+
+                for actual, reference in zip(
+                    (*pool.mamba_cache.conv, pool.mamba_cache.temporal), expected
+                ):
+                    self.assertTrue(torch.equal(actual, reference))
+
     def test_conv_only_state_advertises_no_empty_buffer(self):
         """A ShortConv layer declares a degenerate temporal shape, so the pool
         allocates an empty tensor for it. The RDMA engine rejects a zero-length

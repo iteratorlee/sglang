@@ -1055,6 +1055,20 @@ class MambaPool:
             temporal = self.mamba_cache.temporal
             if temporal.numel() > 0:
                 temporal[:, dst_indices] = temporal[:, src_indices]
+        elif _is_npu:
+            # Advanced indexing materializes state-sized temporaries on Ascend.
+            # COW normally uses disjoint source/destination slots; retain the
+            # snapshot semantics for overlapping requests with per-slot clones.
+            sources = src_indices.to("cpu").tolist()
+            destinations = dst_indices.to("cpu").tolist()
+            assert len(sources) == len(destinations)
+            overlap = not set(sources).isdisjoint(destinations)
+            for t in (*self.mamba_cache.conv, self.mamba_cache.temporal):
+                source_views = [t.select(1, slot) for slot in sources]
+                if overlap:
+                    source_views = [view.clone() for view in source_views]
+                for slot, source_view in zip(destinations, source_views):
+                    t.select(1, slot).copy_(source_view)
         else:
             for i in range(len(self.mamba_cache.conv)):
                 self.mamba_cache.conv[i][:, dst_indices] = self.mamba_cache.conv[i][
