@@ -1012,9 +1012,12 @@ class MambaPool:
         else:
             for i in range(len(self.mamba_cache.conv)):
                 t = self.mamba_cache.conv[i]
-                t[:, indices] = 0
+                # NPU advanced indexing can materialize a full-sized temporary
+                # for this assignment. The in-place fill writes the same slots
+                # without a second Mamba-state buffer at peak memory.
+                t.index_fill_(1, indices, 0)
             t = self.mamba_cache.temporal
-            t[:, indices] = 0
+            t.index_fill_(1, indices, 0)
 
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         """Clone mamba state (conv + temporal) from src slots into dst slots.

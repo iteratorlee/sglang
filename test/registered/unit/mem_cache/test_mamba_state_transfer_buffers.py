@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import torch
 
@@ -26,6 +27,28 @@ def _pool(temporal: torch.Tensor, num_conv: int = 2) -> MambaPool:
 
 
 class TestMambaStateTransferBuffers(unittest.TestCase):
+    def test_npu_clear_slots_matches_advanced_assignment_for_strided_state(self):
+        temporal_base = torch.arange(
+            NUM_LAYERS * 6 * NUM_SLOTS * 4, dtype=torch.float32
+        ).reshape(NUM_LAYERS, 6, NUM_SLOTS, 4)
+        temporal = temporal_base.transpose(1, 2)
+        pool = _pool(temporal, num_conv=2)
+        for i, conv in enumerate(pool.mamba_cache.conv):
+            conv.fill_(i + 1)
+        expected_conv = [tensor.clone() for tensor in pool.mamba_cache.conv]
+        expected_temporal = temporal.clone()
+        indices = torch.tensor([0, 2], dtype=torch.int64)
+        for tensor in expected_conv:
+            tensor[:, indices] = 0
+        expected_temporal[:, indices] = 0
+
+        with mock.patch("sglang.srt.mem_cache.memory_pool._is_npu", True):
+            pool.clear_slots(indices)
+
+        for actual, expected in zip(pool.mamba_cache.conv, expected_conv):
+            self.assertTrue(torch.equal(actual, expected))
+        self.assertTrue(torch.equal(pool.mamba_cache.temporal, expected_temporal))
+
     def test_conv_only_state_advertises_no_empty_buffer(self):
         """A ShortConv layer declares a degenerate temporal shape, so the pool
         allocates an empty tensor for it. The RDMA engine rejects a zero-length
