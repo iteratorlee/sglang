@@ -1010,14 +1010,18 @@ class MambaPool:
             )
             t[:, indices] = z
         else:
+            # torch_npu's index_fill_ may still allocate a full-sized temporary
+            # for a strided Mamba state (observed 718 MiB on 910B). A scalar
+            # select is a view; zeroing only the selected slot bounds the
+            # temporary memory by the slot rather than the whole state tensor.
+            slots = indices.to("cpu").tolist()
             for i in range(len(self.mamba_cache.conv)):
                 t = self.mamba_cache.conv[i]
-                # NPU advanced indexing can materialize a full-sized temporary
-                # for this assignment. The in-place fill writes the same slots
-                # without a second Mamba-state buffer at peak memory.
-                t.index_fill_(1, indices, 0)
+                for slot in slots:
+                    t.select(1, slot).zero_()
             t = self.mamba_cache.temporal
-            t.index_fill_(1, indices, 0)
+            for slot in slots:
+                t.select(1, slot).zero_()
 
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         """Clone mamba state (conv + temporal) from src slots into dst slots.
