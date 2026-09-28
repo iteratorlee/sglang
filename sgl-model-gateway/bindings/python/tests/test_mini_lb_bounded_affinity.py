@@ -61,6 +61,23 @@ class ConfigTests(unittest.TestCase):
                     )
                 )
 
+    def test_three_prefill_workers_keep_prefix_affinity(self):
+        lb = make_lb(capacity=0, prefill_dp=4, decode_dp=4)
+        lb.prefill_urls = [f"http://prefill-{i}:31116" for i in range(3)]
+        lb.prefill_bootstrap_ports = [18916] * 3
+        counts = [0] * 3
+        for family in range(90):
+            request = {
+                "input_ids": [family, 7, 11, 13, 17],
+                "cache_salt": f"session-{family}",
+            }
+            first = lb.select_pair(request)
+            second = lb.select_pair({**request, "bootstrap_room": family + 1000})
+            self.assertEqual(first, second)
+            self.assertEqual(first[1], 18916)
+            counts[lb.prefill_urls.index(first[0])] += 1
+        self.assertTrue(all(count >= 15 for count in counts), counts)
+
 
 class SelectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_full_affinity_uses_least_reserved_valid_rank(self):

@@ -494,10 +494,16 @@ class MiniLoadBalancer:
 
         return prefill_req, decode_req, d_rank
 
-    def select_pair(self):
+    def select_pair(self, request=None):
         assert len(self.prefill_urls) > 0, "No prefill servers available"
         assert len(self.decode_urls) > 0, "No decode servers available"
-        pidx = random.randint(0, len(self.prefill_urls) - 1)
+        if self.prefix_affinity and request is not None:
+            # Keep a prefix on the same P instance as well as the same P DP
+            # rank. Otherwise multiple P workers scatter reusable KV/Mamba
+            # state even though their DP ranks have stable affinity.
+            pidx = self._affinity_digest(request) % len(self.prefill_urls)
+        else:
+            pidx = random.randint(0, len(self.prefill_urls) - 1)
         didx = random.randint(0, len(self.decode_urls) - 1)
         return (
             self.prefill_urls[pidx],
@@ -842,7 +848,7 @@ async def handle_generate_request(request_data: dict, request: Request = None):
     if lb.prefix_affinity:
         # Validate before batch-shape inference and before either PD request.
         lb._affinity_digest(request_data)
-    prefill_server, bootstrap_port, decode_server = lb.select_pair()
+    prefill_server, bootstrap_port, decode_server = lb.select_pair(request_data)
 
     # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)
@@ -886,7 +892,7 @@ async def handle_generate_request(request_data: dict, request: Request = None):
 
 
 async def _forward_to_backend(request_data: dict, endpoint_name: str):
-    prefill_server, bootstrap_port, decode_server = lb.select_pair()
+    prefill_server, bootstrap_port, decode_server = lb.select_pair(request_data)
 
     # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)
