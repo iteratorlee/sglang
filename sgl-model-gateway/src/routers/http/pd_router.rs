@@ -183,6 +183,20 @@ fn decode_inflight_cap_from_env() -> Result<usize, String> {
     }
 }
 
+// Native /generate requests often omit model, while a non-IGW PD router may
+// still serve exactly one model. Use that model's ring for token-ID affinity;
+// an absent ring makes prefix_hash fall back to the same first idle P worker.
+fn hash_ring_model_for_pd<'a>(
+    effective_model_id: Option<&'a str>,
+    mut prefill_models: impl Iterator<Item = &'a str>,
+) -> Option<&'a str> {
+    if effective_model_id.is_some() {
+        return effective_model_id;
+    }
+    let first = prefill_models.next()?;
+    prefill_models.all(|model| model == first).then_some(first)
+}
+
 struct PreparedWorkerRequest<'a> {
     endpoint_url: String,
     body: Cow<'a, Value>,
@@ -1265,9 +1279,11 @@ impl PDRouter {
         let decode_policy = self.policy_registry.get_decode_policy();
 
         // Get cached hash ring for consistent hashing
-        let hash_ring = self
-            .worker_registry
-            .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
+        let hash_ring_model = hash_ring_model_for_pd(
+            effective_model_id,
+            prefill_workers.iter().map(|worker| worker.model_id()),
+        );
+        let hash_ring = hash_ring_model.and_then(|model| self.worker_registry.get_hash_ring(model));
 
         let attempts = decode_workers.len().saturating_mul(2).max(1);
         for _ in 0..attempts {
@@ -2336,6 +2352,23 @@ mod tests {
 
         assert_eq!(prefill_worker.load(), 0);
         assert_eq!(decode_worker.load(), 0);
+    }
+
+    #[test]
+    fn test_pd_hash_ring_model_without_igw() {
+        assert_eq!(
+            hash_ring_model_for_pd(None, ["glm", "glm", "glm"].into_iter()),
+            Some("glm")
+        );
+        assert_eq!(
+            hash_ring_model_for_pd(None, ["glm", "other"].into_iter()),
+            None
+        );
+        assert_eq!(hash_ring_model_for_pd(None, [].into_iter()), None);
+        assert_eq!(
+            hash_ring_model_for_pd(Some("explicit"), ["glm", "other"].into_iter()),
+            Some("explicit")
+        );
     }
 
     #[test]
