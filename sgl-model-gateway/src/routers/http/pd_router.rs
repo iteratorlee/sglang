@@ -65,6 +65,7 @@ pub struct PDRouter {
     pub api_key: Option<String>,
     pub enable_igw: bool,
     pd_token_affinity: bool,
+    pd_decode_inflight_cap: usize,
     load_snapshots: watch::Receiver<HashMap<String, DPLoadSnapshot>>,
     reservations: Arc<PDReservationTable>,
 }
@@ -162,6 +163,23 @@ impl PDReservationTable {
             post_snapshot_requests.insert(item.key().clone(), requests);
         }
         (active, post_snapshot_tokens, post_snapshot_requests)
+    }
+}
+
+const PD_DECODE_INFLIGHT_CAP_ENV: &str = "SGLANG_GATEWAY_PD_DECODE_INFLIGHT_CAP";
+
+fn parse_decode_inflight_cap(raw: &str) -> Result<usize, String> {
+    raw.parse::<usize>()
+        .ok()
+        .filter(|cap| *cap > 0)
+        .ok_or_else(|| format!("{PD_DECODE_INFLIGHT_CAP_ENV} must be a positive integer"))
+}
+
+fn decode_inflight_cap_from_env() -> Result<usize, String> {
+    match std::env::var(PD_DECODE_INFLIGHT_CAP_ENV) {
+        Ok(raw) => parse_decode_inflight_cap(&raw),
+        Err(std::env::VarError::NotPresent) => Ok(2),
+        Err(error) => Err(format!("{PD_DECODE_INFLIGHT_CAP_ENV}: {error}")),
     }
 }
 
@@ -303,6 +321,7 @@ impl PDRouter {
             api_key: ctx.router_config.api_key.clone(),
             enable_igw: ctx.router_config.enable_igw,
             pd_token_affinity: pd_token_affinity_enabled(),
+            pd_decode_inflight_cap: decode_inflight_cap_from_env()?,
             load_snapshots,
             reservations: Arc::new(PDReservationTable::default()),
         })
@@ -1292,16 +1311,18 @@ impl PDRouter {
                 &post_snapshot_reserved_tokens,
                 &post_snapshot_reserved_requests,
                 estimated_tokens,
-                self.pd_token_affinity.then_some(2),
+                self.pd_token_affinity
+                    .then_some(self.pd_decode_inflight_cap),
                 "decode",
             )
             .await?;
 
             let reservations = if reserve && self.pd_token_affinity {
-                let Some(decode_lease) =
-                    self.reservations
-                        .try_reserve(decode.url(), estimated_tokens, Some(2))
-                else {
+                let Some(decode_lease) = self.reservations.try_reserve(
+                    decode.url(),
+                    estimated_tokens,
+                    Some(self.pd_decode_inflight_cap),
+                ) else {
                     continue;
                 };
                 PDReservationPair {
@@ -2036,6 +2057,7 @@ mod tests {
             api_key: Some("test_api_key".to_string()),
             enable_igw: false,
             pd_token_affinity: false,
+            pd_decode_inflight_cap: 2,
             load_snapshots,
             reservations: Arc::new(PDReservationTable::default()),
         }
@@ -2314,6 +2336,26 @@ mod tests {
 
         assert_eq!(prefill_worker.load(), 0);
         assert_eq!(decode_worker.load(), 0);
+    }
+
+    #[test]
+    fn test_decode_inflight_cap_config() {
+        assert_eq!(parse_decode_inflight_cap("5").unwrap(), 5);
+        assert!(parse_decode_inflight_cap("0").is_err());
+        assert!(parse_decode_inflight_cap("invalid").is_err());
+
+        let table = PDReservationTable::default();
+        let leases: Vec<_> = (0..5)
+            .map(|_| {
+                table
+                    .try_reserve("http://decode:30001@0", 1, Some(5))
+                    .unwrap()
+            })
+            .collect();
+        assert!(table
+            .try_reserve("http://decode:30001@0", 1, Some(5))
+            .is_none());
+        drop(leases);
     }
 
     #[test]
