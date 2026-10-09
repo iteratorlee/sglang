@@ -12,6 +12,7 @@ non-NPU hosts.
 
 from __future__ import annotations
 
+import logging
 import threading
 from contextlib import AbstractContextManager, contextmanager
 from functools import partial
@@ -37,6 +38,8 @@ if TYPE_CHECKING:
         BaseCudaGraphRunner,
     )
 
+logger = logging.getLogger(__name__)
+
 
 class NPUCudaGraphBackend(BaseCudaGraphBackend):
     """One torch.npu.NPUGraph per shape; attention metadata captured
@@ -52,6 +55,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._graphs: Dict[Any, Any] = {}
         self._outputs: Dict[Any, Any] = {}
         self._pool = None
+        self._runner_name = type(cuda_graph_runner).__name__
         self._device_module = cuda_graph_runner.device_module
         self._device_id = self._device_module.current_device()
         self._tp_group = cuda_graph_runner.model_runner.tp_group
@@ -83,6 +87,12 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
         import torch_npu  # noqa: F401  (verifies NPU availability)
+
+        trace_memory = get_bool_env_var("SGLANG_NPU_GRAPH_MEMORY_TRACE")
+        if trace_memory:
+            free_before = self._device_module.mem_get_info()[0]
+            allocated_before = self._device_module.memory_allocated()
+            reserved_before = self._device_module.memory_reserved()
 
         # Two warmups so kernels are loaded and one-time setup is paid before capture.
         # post_warmup_hook lets the attention backend reset state that warmup mutated.
@@ -125,6 +135,23 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
+        if trace_memory:
+            pool_attr = getattr(graph, "pool", None)
+            actual_pool = pool_attr() if callable(pool_attr) else pool_attr
+            logger.info(
+                "NPU graph capture runner=%s shape=%s requested_pool=%s "
+                "graph_pool=%s stream=%s "
+                "free_delta=%.2f MiB "
+                "allocated_delta=%.2f MiB reserved_delta=%.2f MiB",
+                self._runner_name,
+                shape_key,
+                self._pool,
+                actual_pool,
+                self._capture_stream,
+                (self._device_module.mem_get_info()[0] - free_before) / 2**20,
+                (self._device_module.memory_allocated() - allocated_before) / 2**20,
+                (self._device_module.memory_reserved() - reserved_before) / 2**20,
+            )
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
