@@ -375,7 +375,13 @@ class EmbeddingBatchResult:
 
 def is_health_check_generate_req(recv_req):
     rid = getattr(recv_req, "rid", None)
-    return rid is not None and rid.startswith(HEALTH_CHECK_RID_PREFIX)
+    # AbortReq for a health RID must reach the scheduler even while it is busy;
+    # only generation requests are eligible for the busy-server shortcut.
+    return (
+        not isinstance(recv_req, io_struct.AbortReq)
+        and isinstance(rid, str)
+        and rid.startswith(HEALTH_CHECK_RID_PREFIX)
+    )
 
 
 class MsgpackDecodeError(ValueError):

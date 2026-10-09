@@ -105,10 +105,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
-from sglang.srt.managers.utils import (
-    compute_num_reserved_tokens,
-    is_health_check_generate_req,
-)
+from sglang.srt.managers.utils import compute_num_reserved_tokens
 from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
@@ -2275,7 +2272,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
-                # Known race: /health_generate pops its rid as soon as ANY message bumps last_receive_tstamp.
+                # A cancelled health probe may have released its state after
+                # sending an abort while an output was already in flight.
                 if rid.startswith(HEALTH_CHECK_RID_PREFIX):
                     continue
                 logger.error(
@@ -3313,7 +3311,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         pass
 
     def _handle_abort_req(self, recv_obj: AbortReq):
-        if is_health_check_generate_req(recv_obj):
+        if recv_obj.rid.startswith(HEALTH_CHECK_RID_PREFIX):
+            # A health probe has no waiting HTTP client. The abort echo can
+            # race with local cancellation cleanup, so either side may remove it.
+            self.rid_to_state.pop(recv_obj.rid, None)
             return
         # Two scheduler messages can race in handle_loop for the same rid: a
         # batch output that finishes it normally (deletes rid_to_state[rid])
@@ -3577,7 +3578,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """Release rid_to_state entries created for a failed handler.
 
         Undelivered states are removed locally. Dispatched requests are aborted
-        and retained until the scheduler response removes them.
+        and retained until the scheduler response removes them, except health
+        probes: a busy scheduler can return only a HealthCheckOutput (no RID),
+        so their local state is released once the abort is sent.
         """
         for rid in rids:
             state = self.rid_to_state.get(rid)
@@ -3585,6 +3588,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if state.dispatched:
                     try:
                         self.abort_request(rid)
+                        if rid.startswith(HEALTH_CHECK_RID_PREFIX):
+                            self.rid_to_state.pop(rid, None)
                     except Exception:
                         logger.exception(
                             "Failed to abort request %s during cleanup", rid
