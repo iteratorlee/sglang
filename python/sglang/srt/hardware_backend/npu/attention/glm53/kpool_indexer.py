@@ -4,6 +4,7 @@ from typing import Optional
 from copy import copy
 import logging
 import os
+import threading
 
 import torch
 import torch.nn.functional as F
@@ -25,6 +26,9 @@ if is_npu():
 
 logger = logging.getLogger(__name__)
 _reported_prefill_pooled_score = False
+_prefill_score_validation_claimed = False
+_prefill_score_validation_lock = threading.Lock()
+_PREFILL_SCORE_VALIDATE_MIN_KEYS = 16384
 
 
 def _prefill_pooled_score_enabled(device: torch.device, legacy_tile_rows: int) -> bool:
@@ -67,6 +71,101 @@ def _log_prefill_pooled_score_once(q, weights, keys, tile_rows):
         tuple(keys.shape),
         tile_rows,
     )
+
+
+def _claim_prefill_score_validation() -> bool:
+    """Reserve the first eligible fused tile once per worker process."""
+    global _prefill_score_validation_claimed
+    with _prefill_score_validation_lock:
+        if _prefill_score_validation_claimed:
+            return False
+        _prefill_score_validation_claimed = True
+        return True
+
+
+def _validate_prefill_score_tile(
+    fused_scores: torch.Tensor,
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    keys: torch.Tensor,
+    first_pos: int,
+    pool_size: int,
+    pooled_topk: int,
+) -> None:
+    """One-shot, at-most-four-row check using the old BF16 score operations."""
+    # Query torch_npu for the *actual* inputs' physical formats. Logical
+    # contiguity does not establish an Ascend storage format.
+    get_format = getattr(torch_npu, "get_npu_format", None)
+
+    def actual_format(tensor):
+        if get_format is None:
+            return "unavailable"
+        try:
+            return get_format(tensor)
+        except Exception as exc:
+            return f"unavailable:{type(exc).__name__}"
+
+    q_format = actual_format(q)
+    weights_format = actual_format(weights)
+    keys_format = actual_format(keys)
+
+    checked_rows = min(4, q.shape[0])
+    q = q[:checked_rows]
+    weights = weights[:checked_rows]
+    fused_scores = fused_scores[:checked_rows]
+    old_scores = torch.einsum("qhd,kd->qhk", q, keys)
+    old_scores.relu_()
+    old_scores.mul_(weights.unsqueeze(-1))
+    old_scores = old_scores.sum(1)
+    error = (fused_scores.float() - old_scores.float()).abs()
+    max_error = error.max().item()
+    mean_error = error.mean().item()
+
+    logical_pos = first_pos + torch.arange(q.shape[0], device=q.device)
+    visible = torch.div(logical_pos + 1, pool_size, rounding_mode="floor")
+    pool_ids = torch.arange(keys.shape[0], device=q.device)
+    invalid = pool_ids.view(1, -1) >= visible.view(-1, 1)
+    old_masked = old_scores.masked_fill(invalid, float("-inf"))
+    fused_masked = fused_scores.masked_fill(invalid, float("-inf"))
+    take = min(pooled_topk, keys.shape[0])
+    old_ids = old_masked.topk(take, dim=-1).indices
+    fused_ids = fused_masked.topk(take, dim=-1).indices
+    exact_rows = (
+        old_ids.sort(dim=-1).values == fused_ids.sort(dim=-1).values
+    ).all(dim=-1).sum().item()
+
+    # A changed ID at a tied BF16 boundary need not lose a better pool.
+    # Count only omitted pools that score strictly above the weakest selected
+    # pool under the old score, even if the sets differ at a tie.
+    selected_old_scores = old_masked.gather(1, fused_ids)
+    selected_min = selected_old_scores.min(dim=-1).values
+    higher_total = (old_masked > selected_min.view(-1, 1)).sum(dim=-1)
+    higher_selected = (selected_old_scores > selected_min.view(-1, 1)).sum(dim=-1)
+    strict_omitted = (higher_total - higher_selected).clamp_min(0).sum().item()
+
+    logger.info(
+        "GLM53 P fused score validation: first_pos=%s rows=%s keys=%s "
+        "q_format=%s weights_format=%s key_format=%s "
+        "score_max_abs=%s score_mean_abs=%s "
+        "top512_set_exact_rows=%s/%s strict_better_score_omitted=%s",
+        first_pos,
+        q.shape[0],
+        keys.shape[0],
+        q_format,
+        weights_format,
+        keys_format,
+        max_error,
+        mean_error,
+        exact_rows,
+        q.shape[0],
+        strict_omitted,
+    )
+    if max_error != 0 or strict_omitted:
+        raise RuntimeError(
+            "GLM53 P fused score validation failed: "
+            f"score_max_abs={max_error}, "
+            f"strict_better_score_omitted={strict_omitted}"
+        )
 
 
 def _prefill_topk_tile_rows(device: torch.device) -> int:
@@ -495,6 +594,16 @@ class AscendIndexerKPoolMixin:
         if fused_scores:
             fused_pooled_scores, supported = _prefill_pooled_score_backend()
             fused_scores = supported(q, weights, compressed_by_request)
+        validate_setting = (
+            os.environ.get("SGLANG_GLM53_PREFILL_SCORE_VALIDATE", "0").strip().lower()
+            if fused_scores
+            else "0"
+        )
+        if validate_setting not in ("", "0", "off", "false", "1", "on", "true"):
+            raise ValueError(
+                "SGLANG_GLM53_PREFILL_SCORE_VALIDATE must be 0 or 1"
+            )
+        validate_scores = validate_setting in ("1", "on", "true")
         # CANN may materialize another score-sized buffer for mul_().  Allow
         # memory-constrained prefill workers to lower the query tile without
         # changing the 128-token causal boundary or candidate pool dimension.
@@ -553,6 +662,20 @@ class AscendIndexerKPoolMixin:
                             k_req[:candidate_count],
                             tile_rows,
                         )
+                        if (
+                            validate_scores
+                            and candidate_count >= _PREFILL_SCORE_VALIDATE_MIN_KEYS
+                            and _claim_prefill_score_validation()
+                        ):
+                            _validate_prefill_score_tile(
+                                logits,
+                                q_req[start:end],
+                                w_req[start:end],
+                                k_req[:candidate_count],
+                                first_pos + start,
+                                self.index_kpool,
+                                pooled_topk,
+                            )
                     else:
                         logits = torch.einsum(
                             "qhd,kd->qhk",
