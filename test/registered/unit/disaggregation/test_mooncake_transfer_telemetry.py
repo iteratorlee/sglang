@@ -163,6 +163,12 @@ class TestMooncakeTransferTelemetry(unittest.TestCase):
             json.loads(line) for line in Path(self.writer.path).read_text().splitlines()
         ]
 
+    def test_missing_tracing_context_is_not_serialized_as_request_id(self):
+        scope = self.writer.begin(17, slice(0, 1), True, SimpleNamespace())
+        scope.dequeued()
+        scope.finish()
+        self.assertIsNone(self.rows()[0]["rid"])
+
     def test_two_chunks_types_executor_and_duplicate_finish(self):
         engine = MockEngine()
         first = self.writer.begin(17, slice(0, 64), False, "req-17")

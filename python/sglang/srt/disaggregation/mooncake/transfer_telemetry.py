@@ -175,7 +175,9 @@ class TransferScope:
         self.telemetry = telemetry
         self.chunk_id = chunk_id
         self.room = int(room)
-        self.rid = str(rid) if rid is not None else None
+        # TraceNullContext returns itself for absent attributes. Such an
+        # object is not a request ID and must not become a misleading string.
+        self.rid = rid if isinstance(rid, str) else None
         self.index_start = (
             int(index_slice.start) if index_slice.start is not None else None
         )
