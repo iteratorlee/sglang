@@ -99,6 +99,7 @@ pub struct PrefixHashPolicy {
     pd_prefill_cache_capacity: bool,
     pd_prefill_affinity_slack: Option<usize>,
     pd_prefill_stage_reservation: bool,
+    pd_prefill_work_tokens: Option<usize>,
 }
 
 impl PrefixHashPolicy {
@@ -115,6 +116,10 @@ impl PrefixHashPolicy {
                 "SGLANG_GATEWAY_PD_PREFILL_STAGE_RESERVATION",
             )
             .is_ok_and(|value| value == "1"),
+            pd_prefill_work_tokens: std::env::var("SGLANG_GATEWAY_PD_PREFILL_WORK_TOKENS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| *value > 0),
         }
     }
 
@@ -256,6 +261,11 @@ impl PrefixHashPolicy {
             // The local P lease spans dispatch through its consumed response
             // body. These same requests can already occur in SRT's snapshot;
             // take the larger lifecycle count instead of counting them twice.
+            let work_pressure = self.pd_prefill_work_tokens.map_or(0, |quantum| {
+                // SRT includes the remaining chunked prompt in this gauge;
+                // request counts alone hide a long prefill from the policy.
+                snapshot.num_waiting_uncached_tokens.div_ceil(quantum)
+            });
             return active
                 .max(
                     snapshot
@@ -263,7 +273,8 @@ impl PrefixHashPolicy {
                         .saturating_add(runnable_waiting)
                         .saturating_add(stage_pressure),
                 )
-                .saturating_add(capacity_pressure);
+                .saturating_add(capacity_pressure)
+                .saturating_add(work_pressure);
         }
         active
             .max(snapshot.num_running_reqs)
@@ -722,6 +733,39 @@ mod tests {
             ..info
         };
         assert_eq!(policy.effective_load(&worker, &info), 3);
+    }
+
+    #[test]
+    fn test_prefill_work_pressure_observes_chunked_prompt_and_stays_prefill_only() {
+        let prefill = BasicWorkerBuilder::new("http://p:8000")
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(9000),
+            })
+            .build();
+        let decode = BasicWorkerBuilder::new("http://d:8000")
+            .worker_type(WorkerType::Decode)
+            .build();
+        let snapshot = DPLoadSnapshot {
+            age_at_observation: Some(Duration::ZERO),
+            num_waiting_uncached_tokens: 65_537,
+            ..Default::default()
+        };
+        let snapshots = std::collections::HashMap::from([
+            (prefill.url().to_string(), snapshot.clone()),
+            (decode.url().to_string(), snapshot),
+        ]);
+        let info = SelectWorkerInfo {
+            load_snapshots: Some(&snapshots),
+            ..Default::default()
+        };
+        let mut policy = PrefixHashPolicy::with_defaults();
+        policy.pd_prefill_cache_capacity = true;
+        policy.pd_prefill_stage_reservation = true;
+        policy.pd_prefill_work_tokens = Some(16_384);
+        assert_eq!(policy.effective_load(&prefill, &info), 5);
+        assert_eq!(policy.effective_load(&decode, &info), 0);
+        policy.pd_prefill_work_tokens = None;
+        assert_eq!(policy.effective_load(&prefill, &info), 0);
     }
 
     #[test]
