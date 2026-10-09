@@ -4,16 +4,129 @@ Retains the verified fallback for vendor dynamic-receive-size failures. This
 path is explicitly enabled for GLM W8A8 layers; decode still uses DeepEP LL.
 """
 
+import logging
 import os
 
 import torch
 import torch.distributed as dist
 
+logger = logging.getLogger(__name__)
+_last_dispatch_metadata = None
+_activation_logged = False
+
+
+def normal_hccl_profile(args, limit):
+    """Finite opt-in profiles; preserve the original TP16 deployment guard."""
+    common = (
+        args.nnodes == args.pp_size == 1
+        and not args.enable_two_batch_overlap
+        and not args.enable_eplb
+        and args.ep_num_redundant_experts == 0
+        and args.quantization == "modelslim"
+        and limit == 10.0
+        and args.moe_a2a_backend == "deepep"
+    )
+    if not common:
+        return None
+    if args.tp_size == args.ep_size == 16 and not args.enable_dp_attention:
+        return "tp16_ep16"
+    if (
+        args.tp_size == args.ep_size == 8
+        and args.enable_dp_attention
+        and args.dp_size == 4
+        and args.attn_cp_size == args.dcp_size == 1
+        and args.moe_dp_size == 1
+        and not args.enable_prefill_cp
+        and args.disaggregation_mode == "prefill"
+        and args.disable_overlap_schedule
+    ):
+        return "prefill_dp4_tp2_ep8"
+    return None
+
+
+def _check_equal_dispatch_shapes(group, x, ids, weights, world):
+    # The opted-in P DP4/TP2 padding policy forces MAX_LEN for eager prefills.
+    # Retain this check on every EP8 invocation before fixed-size payload
+    # gathers to catch any downstream geometry or routing-contract violation.
+    shape = torch.tensor(
+        [
+            x.shape[0],
+            x.shape[1],
+            ids.ndim,
+            ids.shape[0] if ids.ndim else -1,
+            ids.shape[1] if ids.ndim > 1 else -1,
+            weights.ndim,
+            weights.shape[0] if weights.ndim else -1,
+            weights.shape[1] if weights.ndim > 1 else -1,
+        ],
+        dtype=torch.int64,
+        device=x.device,
+    )
+    gathered = shape.new_empty((world * shape.numel(),))
+    dist.all_gather_into_tensor(gathered, shape, group=group)
+    shapes = gathered.view(world, -1).cpu().tolist()
+    expected = shapes[0]
+    if (
+        any(peer != expected for peer in shapes)
+        or expected[2] != 2
+        or expected[5] != 2
+        or expected[0] != expected[3]
+        or expected[0] != expected[6]
+        or expected[4] != expected[7]
+    ):
+        raise RuntimeError(
+            "GLM HCCL normal EP8 requires equal local rows/width/topk across "
+            f"all ranks (MAX_LEN or equal SUM_LEN); dispatch shapes={shapes}"
+        )
+
+
+def log_normal_hccl_activation(quant_info, profile):
+    """Log actual dispatch and expert storage once per process, after dispatch."""
+    global _activation_logged
+    if _activation_logged or _last_dispatch_metadata is None:
+        return
+    if any(
+        weight.dtype != torch.int8
+        for weight in (quant_info.w13_weight, quant_info.w2_weight)
+    ):
+        raise RuntimeError("GLM HCCL normal experts must retain INT8 weights")
+    if any(
+        scale.dtype != torch.float32
+        for scale in (quant_info.w13_weight_scale, quant_info.w2_weight_scale)
+    ):
+        raise RuntimeError("GLM HCCL normal expert scales must remain FP32")
+    rank, world, rows, width, x_dtype, q_dtype, scale_dtype = _last_dispatch_metadata
+    logger.info(
+        "GLM53 normal HCCL active: profile=%s rank=%d world=%d local_rows=%d width=%d "
+        "x_dtype=%s dispatch_dtype=%s token_scale_dtype=%s "
+        "w13=%s/%s w2=%s/%s weight_scale_dtype=%s/%s "
+        "reduce_scatter=%s",
+        profile,
+        rank,
+        world,
+        rows,
+        width,
+        x_dtype,
+        q_dtype,
+        scale_dtype,
+        tuple(quant_info.w13_weight.shape),
+        quant_info.w13_weight.dtype,
+        tuple(quant_info.w2_weight.shape),
+        quant_info.w2_weight.dtype,
+        quant_info.w13_weight_scale.dtype,
+        quant_info.w2_weight_scale.dtype,
+        os.getenv("SGLANG_GLM53_NORMAL_REDUCE_SCATTER", "0"),
+    )
+    _activation_logged = True
+
 
 def collective_dispatch(group, x, ids, weights, num_experts=288):
+    global _last_dispatch_metadata
     world, rank = dist.get_world_size(group), dist.get_rank(group)
     tokens, width = x.shape
     topk = ids.shape[1]
+    if world == 8:
+        _check_equal_dispatch_shapes(group, x, ids, weights, world)
 
     def gather(t):
         out = t.new_empty((world * t.shape[0], *t.shape[1:]))
@@ -22,6 +135,8 @@ def collective_dispatch(group, x, ids, weights, num_experts=288):
 
     # Row quantization is identical to quantizing the received BF16 rows.
     q, scale = torch.ops.npu.npu_dynamic_quant(x)
+    if q.dtype != torch.int8 or scale.dtype != torch.float32:
+        raise RuntimeError("GLM HCCL normal dispatch requires INT8 rows/FP32 scales")
     all_q, all_scale, all_ids, all_weights = map(gather, (q, scale, ids, weights))
     flat = all_ids.cpu().flatten()
     assert num_experts % world == 0
@@ -42,6 +157,15 @@ def collective_dispatch(group, x, ids, weights, num_experts=288):
         recv_scale = scale.new_ones((1,))
     chosen_weights = all_weights.flatten().index_select(0, loc)
     state = (rows, chosen_weights, tokens, world, width, int(selected.numel()))
+    _last_dispatch_metadata = (
+        rank,
+        world,
+        tokens,
+        width,
+        x.dtype,
+        q.dtype,
+        scale.dtype,
+    )
     return recv, recv_scale, counts, state
 
 

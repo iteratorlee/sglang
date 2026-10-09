@@ -39,25 +39,23 @@ class NPUW8A8ClampedMoEMethod(NPUW8A8Int8MoEMethod):
             scale_data = scale_data.index_select(1, order)
             self._set_dispatcher_output_dtype(layer, "int8")
             if os.getenv("SGLANG_GLM53_NORMAL_HCCL", "0") == "1":
+                from sglang.srt.hardware_backend.npu.moe.glm53_collectives import (
+                    normal_hccl_profile,
+                )
                 from sglang.srt.runtime_context import get_server_args
 
                 args = get_server_args()
                 dispatchers = getattr(layer.dispatcher, "_inners", [layer.dispatcher])
-                if not (
-                    args.tp_size == args.ep_size == 16
-                    and args.nnodes == args.pp_size == 1
-                    and not args.enable_dp_attention
-                    and not args.enable_two_batch_overlap
-                    and not args.enable_eplb
-                    and args.ep_num_redundant_experts == 0
-                    and args.quantization == "modelslim"
-                    and self.limit == 10.0
-                    and args.moe_a2a_backend == "deepep"
-                    and all(hasattr(d, "_normal_dispatcher") for d in dispatchers)
+                profile = normal_hccl_profile(args, self.limit)
+                if profile is None or not all(
+                    hasattr(d, "_normal_dispatcher") for d in dispatchers
                 ):
                     raise ValueError(
-                        "GLM HCCL normal routing requires the TP16/EP16 ModelSlim deployment"
+                        "GLM HCCL normal routing requires the TP16/EP16 ModelSlim "
+                        "deployment or P-only single-node DP4/TP2/EP8 PP1/CP1 "
+                        "ModelSlim clamp10 without overlap/TBO/EPLB"
                     )
+                self._glm53_normal_hccl_profile = profile
                 layer.dispatcher.set_quant_config(
                     {"dispatcher_output_dtype": "int8", "glm53_normal_hccl": True}
                 )
@@ -96,6 +94,12 @@ class NPUW8A8ClampedMoEMethod(NPUW8A8Int8MoEMethod):
         counts = self._counts(expert_tokens, group_list_type)
         if pertoken_scale is None:
             hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
+        if getattr(self, "_glm53_normal_hccl_profile", None) is not None:
+            from sglang.srt.hardware_backend.npu.moe.glm53_collectives import (
+                log_normal_hccl_activation,
+            )
+
+            log_normal_hccl_activation(quant_info, self._glm53_normal_hccl_profile)
         accum = self._int8_gmm(hidden_states, quant_info.w13_weight, counts)
         return torch.ops.npu.npu_dequant_swiglu_quant(
             accum,

@@ -121,6 +121,29 @@ class DpPaddingMode(IntEnum):
         # For dp_size=1, max_len equals sum_len, so prefer MAX_LEN mode
         # to enable symmetric memory optimization (needed for DSA CP, etc.).
         if is_extend_in_batch and dp_size > 1:
+            import os
+
+            if os.getenv("SGLANG_GLM53_NORMAL_HCCL", "0") == "1":
+                from sglang.srt.runtime_context import get_disagg, get_parallel
+
+                parallel = get_parallel()
+                if (
+                    get_disagg().disaggregation_mode == "prefill"
+                    and parallel.nnodes == 1
+                    and parallel.tp_size == parallel.moe_ep_size == 8
+                    and parallel.dp_size == parallel.attn_dp_size == 4
+                    and parallel.enable_dp_attention
+                    and parallel.attn_tp_size == 2
+                    and parallel.pp_size
+                    == parallel.attn_cp_size
+                    == parallel.dcp_size
+                    == 1
+                ):
+                    # Standard HCCL payload gathers require equal EP rows even
+                    # when every DP domain has an unequal final prefill chunk.
+                    # Existing MAX_LEN padding and invalid-row routing handle
+                    # this at the cost of additional padded compute/storage.
+                    return DpPaddingMode.MAX_LEN
             # Hybrid-SSM models materialize idle ranks via the MAX_LEN
             # fabricated-row conversion; other models keep mainline SUM_LEN.
             if get_flags().dp.max_len_with_idle and min(global_num_tokens) == 0:
