@@ -216,6 +216,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.pending_reqs = [decode_req]
         queue.retracted_queue = []
         queue.num_reserved_decode_tokens = 0
+        queue.strict_decode_kv_admission = False
+        queue.strict_kv_fair_scan = False
+        queue.glm53_decode_prefix_profile = None
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)

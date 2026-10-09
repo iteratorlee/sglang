@@ -55,7 +55,10 @@ from sglang.srt.disaggregation.glm53_decode_prefix import (
     validate_glm53_pd_decode_prefix_runtime,
     write_glm53_cache_audit,
 )
-from sglang.srt.disaggregation.strict_kv_admission import projected_full_kv_tokens
+from sglang.srt.disaggregation.strict_kv_admission import (
+    StrictKVBypassGuard,
+    projected_full_kv_tokens,
+)
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
@@ -401,6 +404,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.strict_decode_kv_admission = (
             os.environ.get("SGLANG_PD_STRICT_DECODE_KV_ADMISSION") == "1"
         )
+        self.strict_kv_fair_scan = self.strict_decode_kv_admission and (
+            os.environ.get("SGLANG_PD_STRICT_KV_FAIR_SCAN") == "1"
+        )
+        self.strict_kv_bypass_guard = StrictKVBypassGuard()
         self.transfer_backend = transfer_backend
         self.glm53_decode_prefix_profile = None
         if get_disagg().disaggregation_decode_enable_radix_cache:
@@ -678,6 +685,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         """
         if self._check_if_req_exceed_kv_capacity(req):
             return
+        if (
+            self.strict_kv_fair_scan
+            and not is_retracted
+            and projected_full_kv_tokens(
+                [req],
+                page_size=self.token_to_kv_pool_allocator.page_size,
+                decode_headroom_per_request=self.num_reserved_decode_tokens,
+            )
+            > self.max_total_num_tokens
+        ):
+            message = (
+                f"Request {req.rid} exceeds strict FULL KV capacity for its "
+                "complete output"
+            )
+            prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
+            self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+            return
 
         if is_retracted and self.glm53_decode_prefix_profile is not None:
             # CPU retraction backs up the target pool and active Mamba state,
@@ -867,6 +891,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def release_memory_occupation(self):
         self._cancel_prefill_dp_rank_queries()
         self.queue.clear()
+        self.strict_kv_bypass_guard = StrictKVBypassGuard()
         for req in self.retracted_queue:
             retraction_discard(
                 req,
@@ -1154,7 +1179,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         pp_good_rids: Optional[List[str]] = None,
         pp_bad_rids: Optional[List[str]] = None,
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
-        """Pop the preallocated requests from the pending queue (FIFO)."""
+        """Pop ready requests in queue order, with optional bounded KV bypass."""
         is_pp_mode = self.pp_size > 1
         if is_pp_mode and (pp_good_rids is None or pp_bad_rids is None):
             raise ValueError("PP consensus is required when pp_size > 1")
@@ -1228,6 +1253,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 r for r in self.pending_reqs if id(r) not in failed_ids
             ]
 
+        fair_scan = getattr(self, "strict_kv_fair_scan", False)
+        if fair_scan:
+            guard = self.strict_kv_bypass_guard
+            guard.reconcile(
+                entry
+                for i, entry in enumerate(self.queue)
+                if i not in indices_to_remove
+                and entry.waiting_for_input
+                and not isinstance(entry.req.finished_reason, FINISH_ABORT)
+            )
+
         # HiSparse physical constraint: max requests by device buffer capacity.
         # Each admitted req needs padded_buffer_size from hisparse device pool.
         # waiting_queue reqs already have device buffers (allocated in admit_request_direct),
@@ -1243,8 +1279,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 - len(self.transfer_queue.queue),
             )
 
-        # Then, preallocate the remaining requests if possible
-        for i, decode_req in enumerate(self.queue):
+        # At the bypass limit, visit only the protected request. This bounds
+        # both the work and the number of younger destinations published while
+        # waiting for its full output reservation to become available.
+        candidates = enumerate(self.queue)
+        if fair_scan and guard.at_limit:
+            candidates = (
+                (i, entry)
+                for i, entry in enumerate(self.queue)
+                if entry is guard.blocked_entry
+            )
+        scan_remaining = None
+        for i, decode_req in candidates:
+            if scan_remaining is not None:
+                if scan_remaining == 0:
+                    break
+                scan_remaining -= 1
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
@@ -1263,14 +1313,24 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if hisparse_req_budget <= 0:
                 break
 
-            if self.strict_decode_kv_admission and not self._strict_full_kv_admission_allows(
-                decode_req.req, preallocated_reqs
+            if (
+                self.strict_decode_kv_admission
+                and not self._strict_full_kv_admission_allows(
+                    decode_req.req, preallocated_reqs
+                )
             ):
                 # Leave the request in the preallocation queue until prior
                 # transfers/running requests release enough FULL KV. In
                 # particular, do not publish a destination whose prompt KV
                 # would consume another request's remaining output budget.
-                break
+                if not fair_scan:
+                    break
+                guard.blocked(decode_req)
+                if guard.at_limit:
+                    break
+                if scan_remaining is None:
+                    scan_remaining = 16
+                continue
 
             # GLM-5's configured KV capacity covers local running slots. Requests
             # on transfer/waiting queues already own KV too, so admitting beyond
@@ -1383,10 +1443,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
                 )
 
-            if (
-                minimum_full_allocatable_tokens
-                > full_allocatable_tokens
-            ):
+            if minimum_full_allocatable_tokens > full_allocatable_tokens:
                 if prefix_match is not None and prefix_match.l1_prefix_len > 0:
                     self._release_matched_prefix_lock(decode_req.req)
                 break
@@ -1667,6 +1724,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
+            if fair_scan:
+                guard.admitted(decode_req)
+                if guard.at_limit:
+                    break
 
         if failed_reqs:
             failed_ids = {id(r) for r in failed_reqs}
@@ -1677,6 +1738,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
+        if fair_scan:
+            guard.reconcile(
+                entry
+                for entry in self.queue
+                if entry.waiting_for_input
+                and not isinstance(entry.req.finished_reason, FINISH_ABORT)
+            )
 
         return preallocated_reqs, failed_reqs
 
@@ -1879,9 +1947,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         num_to_evict = minimum_allocatable_tokens - allocatable_tokens
         available_before = self._radix_full_available()
         reported_evictable = self._radix_full_evictable()
-        result = self.tree_cache.evict_for_alloc(
-            EvictParams(num_tokens=num_to_evict)
-        )
+        result = self.tree_cache.evict_for_alloc(EvictParams(num_tokens=num_to_evict))
         allocatable_tokens = self._allocatable_token_budgets(**budget_args)
         if allocatable_tokens < minimum_allocatable_tokens:
             if req is None or not getattr(req, "pd_radix_admission_warned", False):

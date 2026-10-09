@@ -9,6 +9,48 @@ admit a transfer that consumes the running request's remaining KV capacity.
 from typing import Iterable
 
 
+class StrictKVBypassGuard:
+    """Bound admissions past the oldest FULL-KV-blocked decode request.
+
+    Only successful admissions count as bypasses. Once the limit is reached,
+    younger requests cannot consume capacity until the protected request is
+    admitted or removed. The request identity is the DecodeRequest's identity,
+    so duplicate request IDs or mutable Req fields cannot affect accounting.
+    """
+
+    def __init__(self, max_bypasses: int = 8):
+        self.max_bypasses = max_bypasses
+        self.blocked_entry = None
+        self.bypasses = 0
+
+    @property
+    def blocked_id(self):
+        return id(self.blocked_entry) if self.blocked_entry is not None else None
+
+    @property
+    def at_limit(self) -> bool:
+        return self.blocked_entry is not None and self.bypasses >= self.max_bypasses
+
+    def reconcile(self, live_entries: Iterable) -> None:
+        if self.blocked_entry is not None and not any(
+            entry is self.blocked_entry for entry in live_entries
+        ):
+            self.blocked_entry = None
+            self.bypasses = 0
+
+    def blocked(self, entry) -> None:
+        if self.blocked_entry is None:
+            self.blocked_entry = entry
+            self.bypasses = 0
+
+    def admitted(self, entry) -> None:
+        if entry is self.blocked_entry:
+            self.blocked_entry = None
+            self.bypasses = 0
+        elif self.blocked_entry is not None:
+            self.bypasses += 1
+
+
 def projected_full_kv_tokens(
     requests: Iterable,
     *,
