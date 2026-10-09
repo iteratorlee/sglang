@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Optional
 from copy import copy
+import logging
 import os
 
 import torch
@@ -20,6 +21,52 @@ from .graph_ops import scatter_rows_
 
 if is_npu():
     import torch_npu
+
+
+logger = logging.getLogger(__name__)
+_reported_prefill_pooled_score = False
+
+
+def _prefill_pooled_score_enabled(device: torch.device, legacy_tile_rows: int) -> bool:
+    """Use fused scoring only when the old path needs tile 8, unless forced."""
+    setting = os.environ.get("SGLANG_GLM53_PREFILL_POOLED_SCORE", "0").strip().lower()
+    if setting in ("0", "off", "false", ""):
+        return False
+    if setting not in ("1", "auto", "always"):
+        raise ValueError(
+            "SGLANG_GLM53_PREFILL_POOLED_SCORE must be 0, auto, or always"
+        )
+    return (
+        device.type == "npu"
+        and get_server_args().disaggregation_mode == "prefill"
+        and (setting == "always" or legacy_tile_rows == 8)
+    )
+
+
+def _prefill_pooled_score_backend():
+    # Keep Triton import lazy: the default and decode paths need no scorer JIT.
+    from .pooled_score_prefill_npu import fused_pooled_scores, supported
+
+    return fused_pooled_scores, supported
+
+
+def _log_prefill_pooled_score_once(q, weights, keys, tile_rows):
+    """Record the first successful P prefill fused-score invocation per process."""
+    global _reported_prefill_pooled_score
+    if _reported_prefill_pooled_score:
+        return
+    _reported_prefill_pooled_score = True
+    logger.info(
+        "GLM53 P prefill fused pooled score active: q_dtype=%s q_shape=%s "
+        "weights_dtype=%s weights_shape=%s key_dtype=%s key_shape=%s tile_rows=%s",
+        q.dtype,
+        tuple(q.shape),
+        weights.dtype,
+        tuple(weights.shape),
+        keys.dtype,
+        tuple(keys.shape),
+        tile_rows,
+    )
 
 
 def _prefill_topk_tile_rows(device: torch.device) -> int:
@@ -441,10 +488,19 @@ class AscendIndexerKPoolMixin:
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         pooled_topk = self.index_topk // self.index_kpool
+        # This scorer is reached only by ordinary prefill (including TP query
+        # fragments). Keep PD decode and speculative paths on LightningIndexer.
+        legacy_tile_rows = _prefill_topk_tile_rows(q.device)
+        fused_scores = _prefill_pooled_score_enabled(q.device, legacy_tile_rows)
+        if fused_scores:
+            fused_pooled_scores, supported = _prefill_pooled_score_backend()
+            fused_scores = supported(q, weights, compressed_by_request)
         # CANN may materialize another score-sized buffer for mul_().  Allow
         # memory-constrained prefill workers to lower the query tile without
         # changing the 128-token causal boundary or candidate pool dimension.
-        tile_rows = _prefill_topk_tile_rows(q.device)
+        # The fused path writes [rows, pools], so it can use 32 rows even when
+        # the legacy [rows, heads, pools] path needs the tile-8 HBM fallback.
+        tile_rows = 32 if fused_scores else legacy_tile_rows
         result = []
         offset = 0
         for i in range(
@@ -485,20 +541,29 @@ class AscendIndexerKPoolMixin:
                         device=q.device,
                     )
                 else:
-                    logits = torch.einsum(
-                        "qhd,kd->qhk",
-                        q_req[start:end],
-                        k_req[:candidate_count],
-                    )
-                    # Each 128-token tile can hold hundreds of MiB of scores
-                    # at 128k context.  The out-of-place relu and product kept
-                    # two extra copies live alongside the einsum result and
-                    # exhausted P HBM when all DP domains prefetched together.
-                    # This tensor is private to the current tile; reuse it for
-                    # both elementwise operations before reducing heads.
-                    logits.relu_()
-                    logits.mul_(w_req[start:end].unsqueeze(-1))
-                    logits = logits.sum(1)
+                    if fused_scores:
+                        logits = fused_pooled_scores(
+                            q_req[start:end],
+                            w_req[start:end],
+                            k_req[:candidate_count],
+                        )
+                        _log_prefill_pooled_score_once(
+                            q_req[start:end],
+                            w_req[start:end],
+                            k_req[:candidate_count],
+                            tile_rows,
+                        )
+                    else:
+                        logits = torch.einsum(
+                            "qhd,kd->qhk",
+                            q_req[start:end],
+                            k_req[:candidate_count],
+                        )
+                        # Preserve the original BF16 rounding after the dot,
+                        # in-place weighted product, and head reduction.
+                        logits.relu_()
+                        logits.mul_(w_req[start:end].unsqueeze(-1))
+                        logits = logits.sum(1)
                     logical_pos = first_pos + torch.arange(
                         start, end, device=q.device, dtype=torch.long
                     )
