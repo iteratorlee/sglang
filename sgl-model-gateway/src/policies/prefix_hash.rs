@@ -94,12 +94,23 @@ impl Branch {
 #[derive(Debug)]
 pub struct PrefixHashPolicy {
     config: PrefixHashConfig,
+    /// A P can reclaim unlocked prefix-cache pages. Keep this opt-in until
+    /// paired replay validation; D's full-output budget stays unchanged.
+    pd_prefill_cache_capacity: bool,
+    pd_prefill_affinity_slack: Option<usize>,
 }
 
 impl PrefixHashPolicy {
     /// Create a new PrefixHashPolicy with the given configuration
     pub fn new(config: PrefixHashConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            pd_prefill_cache_capacity: std::env::var("SGLANG_GATEWAY_PD_PREFILL_CACHE_CAPACITY")
+                .is_ok_and(|value| value == "1"),
+            pd_prefill_affinity_slack: std::env::var("SGLANG_GATEWAY_PD_PREFILL_AFFINITY_SLACK")
+                .ok()
+                .and_then(|value| value.parse().ok()),
+        }
     }
 
     /// Create a new PrefixHashPolicy with default configuration
@@ -147,11 +158,13 @@ impl PrefixHashPolicy {
             .unwrap_or(0)
     }
 
-    fn effective_load(worker: &dyn Worker, info: &SelectWorkerInfo<'_>) -> usize {
+    fn effective_load(&self, worker: &dyn Worker, info: &SelectWorkerInfo<'_>) -> usize {
         let local = worker.load().max(Self::local_reservations(worker, info));
         let Some(snapshot) = Self::snapshot_for(worker, info) else {
             return local;
         };
+        let cache_aware_prefill = self.pd_prefill_cache_capacity
+            && matches!(worker.worker_type(), WorkerType::Prefill { .. });
         let runnable_waiting = snapshot
             .queues
             .as_ref()
@@ -185,10 +198,26 @@ impl PrefixHashPolicy {
             .copied()
             .unwrap_or(0);
         let capacity_pressure = snapshot.kv_capacity.as_ref().map_or(0, |capacity| {
-            let demand = info.estimated_tokens.saturating_add(post_snapshot_tokens);
-            let token_pressure = if demand > capacity.full_available_tokens {
-                let deficit = demand - capacity.full_available_tokens;
-                1usize.saturating_add(deficit / info.estimated_tokens.max(1))
+            // P produces one boundary token, whereas estimated_tokens includes
+            // D's entire future output. Do not charge that output to P's pool.
+            let request_tokens = if cache_aware_prefill {
+                info.tokens
+                    .map(|tokens| tokens.len().saturating_add(1))
+                    .unwrap_or(info.estimated_tokens)
+            } else {
+                info.estimated_tokens
+            };
+            let demand = request_tokens.saturating_add(post_snapshot_tokens);
+            let available = if cache_aware_prefill {
+                capacity
+                    .full_available_tokens
+                    .saturating_add(capacity.full_evictable_tokens)
+            } else {
+                capacity.full_available_tokens
+            };
+            let token_pressure = if demand > available {
+                let deficit = demand - available;
+                1usize.saturating_add(deficit / request_tokens.max(1))
             } else {
                 0
             };
@@ -197,10 +226,28 @@ impl PrefixHashPolicy {
                     .request_slots_available
                     .is_some_and(|slots| slots <= post_snapshot_requests),
             );
-            token_pressure.saturating_add(slot_pressure)
+            let mamba_pressure = if cache_aware_prefill {
+                usize::from(capacity.mamba_available_slots.is_some_and(|slots| {
+                    slots.saturating_add(capacity.mamba_evictable_slots.unwrap_or(0))
+                        <= post_snapshot_requests
+                }))
+            } else {
+                0
+            };
+            token_pressure
+                .saturating_add(slot_pressure)
+                .saturating_add(mamba_pressure)
         });
 
-        local
+        // For SSE, the gateway's P WorkerLoadGuard survives until D finishes
+        // streaming, even though P is done. A fresh P snapshot represents its
+        // actual lifecycle; stale/missing snapshots still fall back to local.
+        let active = if cache_aware_prefill {
+            Self::local_reservations(worker, info)
+        } else {
+            local
+        };
+        active
             .max(snapshot.num_running_reqs)
             .saturating_add(runnable_waiting)
             .saturating_add(stage_pressure)
@@ -234,7 +281,7 @@ impl PrefixHashPolicy {
         // Calculate total load for load balancing
         let total_load: usize = healthy_workers
             .iter()
-            .map(|(_, w)| Self::effective_load(w.as_ref(), info))
+            .map(|(_, w)| self.effective_load(w.as_ref(), info))
             .sum();
         let num_workers = healthy_workers.len();
 
@@ -255,7 +302,20 @@ impl PrefixHashPolicy {
                 ring.find_healthy_url(&key, |url| healthy_url_map.contains_key(url))
             {
                 if let Some(&(idx, worker)) = healthy_url_map.get(initial_url) {
-                    let worker_load = Self::effective_load(worker.as_ref(), info);
+                    let worker_load = self.effective_load(worker.as_ref(), info);
+
+                    if matches!(worker.worker_type(), WorkerType::Prefill { .. }) {
+                        if let Some(slack) = self.pd_prefill_affinity_slack {
+                            let least_load = healthy_workers
+                                .iter()
+                                .map(|(_, w)| self.effective_load(w.as_ref(), info))
+                                .min()
+                                .unwrap_or(worker_load);
+                            if worker_load <= least_load.saturating_add(slack) {
+                                return (Some(idx), Branch::RingHit);
+                            }
+                        }
+                    }
 
                     // With bounded affinity, keep the first two requests of a
                     // hot prefix together unless the selected rank has more
@@ -265,7 +325,7 @@ impl PrefixHashPolicy {
                     if info.soft_cap.is_some() {
                         let least_load = healthy_workers
                             .iter()
-                            .map(|(_, worker)| Self::effective_load(worker.as_ref(), info))
+                            .map(|(_, worker)| self.effective_load(worker.as_ref(), info))
                             .min()
                             .unwrap_or(worker_load);
                         if worker_load <= least_load.saturating_add(1) {
@@ -284,12 +344,12 @@ impl PrefixHashPolicy {
                         .iter()
                         .filter(|(_, w)| {
                             self.load_ok(
-                                Self::effective_load(w.as_ref(), info),
+                                self.effective_load(w.as_ref(), info),
                                 total_load,
                                 num_workers,
                             )
                         })
-                        .min_by_key(|(_, w)| Self::effective_load(w.as_ref(), info));
+                        .min_by_key(|(_, w)| self.effective_load(w.as_ref(), info));
 
                     if let Some(&(idx, _)) = least_loaded {
                         return (Some(idx), Branch::LoadBalanceWalk);
@@ -304,7 +364,7 @@ impl PrefixHashPolicy {
         // Fallback: no ring or ring lookup failed, use least loaded worker
         let least_loaded = healthy_workers
             .iter()
-            .min_by_key(|(_, w)| Self::effective_load(w.as_ref(), info))
+            .min_by_key(|(_, w)| self.effective_load(w.as_ref(), info))
             .map(|(idx, _)| *idx);
 
         (least_loaded, Branch::FallbackLeastLoad)
@@ -563,6 +623,163 @@ mod tests {
             .select_worker_impl(&workers, &fallback_info)
             .0
             .is_some());
+    }
+
+    #[test]
+    fn test_prefill_reclaimable_cache_does_not_look_like_active_work() {
+        use crate::core::worker_manager::KVCapacitySnapshot;
+
+        let worker = BasicWorkerBuilder::new("http://p:8000")
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(9000),
+            })
+            .build();
+        // These stream guards describe D output, after P has already finished.
+        for _ in 0..4 {
+            worker.increment_load();
+        }
+        let snapshot = DPLoadSnapshot {
+            age_at_observation: Some(Duration::ZERO),
+            kv_capacity: Some(KVCapacitySnapshot {
+                full_available_tokens: 0,
+                full_evictable_tokens: 139_264,
+                request_slots_available: Some(1),
+                mamba_available_slots: Some(0),
+                mamba_evictable_slots: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let snapshots = std::collections::HashMap::from([(worker.url().to_string(), snapshot)]);
+        let tokens = vec![1; 65_536];
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            load_snapshots: Some(&snapshots),
+            estimated_tokens: 100_000,
+            ..Default::default()
+        };
+        let mut policy = PrefixHashPolicy::with_defaults();
+        policy.pd_prefill_cache_capacity = true;
+        assert_eq!(policy.effective_load(&worker, &info), 0);
+        policy.pd_prefill_cache_capacity = false;
+        assert!(policy.effective_load(&worker, &info) >= 4);
+    }
+
+    #[test]
+    fn test_prefill_does_not_reserve_decode_output_but_decode_still_does() {
+        use crate::core::worker_manager::KVCapacitySnapshot;
+
+        let prefill = BasicWorkerBuilder::new("http://p:8000")
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(9000),
+            })
+            .build();
+        let decode = BasicWorkerBuilder::new("http://d:8000")
+            .worker_type(WorkerType::Decode)
+            .build();
+        let snapshot = DPLoadSnapshot {
+            age_at_observation: Some(Duration::ZERO),
+            kv_capacity: Some(KVCapacitySnapshot {
+                full_available_tokens: 20_000,
+                full_evictable_tokens: 100_000,
+                request_slots_available: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let snapshots = std::collections::HashMap::from([
+            (prefill.url().to_string(), snapshot.clone()),
+            (decode.url().to_string(), snapshot),
+        ]);
+        let tokens = vec![1; 16_384];
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            load_snapshots: Some(&snapshots),
+            estimated_tokens: 80_000,
+            ..Default::default()
+        };
+        let mut policy = PrefixHashPolicy::with_defaults();
+        policy.pd_prefill_cache_capacity = true;
+        assert_eq!(policy.effective_load(&prefill, &info), 0);
+        assert!(policy.effective_load(&decode, &info) > 0);
+    }
+
+    #[test]
+    fn test_prefill_stale_snapshot_preserves_local_load_fallback() {
+        let worker = BasicWorkerBuilder::new("http://p:8000")
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(9000),
+            })
+            .build();
+        for _ in 0..3 {
+            worker.increment_load();
+        }
+        let snapshots = std::collections::HashMap::from([(
+            worker.url().to_string(),
+            DPLoadSnapshot {
+                age_at_observation: Some(Duration::from_secs(4)),
+                ..Default::default()
+            },
+        )]);
+        let info = SelectWorkerInfo {
+            load_snapshots: Some(&snapshots),
+            ..Default::default()
+        };
+        let mut policy = PrefixHashPolicy::with_defaults();
+        policy.pd_prefill_cache_capacity = true;
+        assert_eq!(policy.effective_load(&worker, &info), 3);
+    }
+
+    #[test]
+    fn test_prefill_affinity_allows_bounded_queue_but_balances_large_backlog() {
+        let mut policy = PrefixHashPolicy::with_defaults();
+        policy.pd_prefill_cache_capacity = true;
+        policy.pd_prefill_affinity_slack = Some(2);
+        let workers: Vec<Arc<dyn Worker>> = (0..2)
+            .map(|i| {
+                Arc::new(
+                    BasicWorkerBuilder::new(format!("http://p{i}:8000"))
+                        .worker_type(WorkerType::Prefill {
+                            bootstrap_port: Some(9000),
+                        })
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect();
+        let ring = Arc::new(HashRing::new(&workers));
+        let tokens = vec![2; 300];
+        let base = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            hash_ring: Some(ring.clone()),
+            ..Default::default()
+        };
+        let target = policy.select_worker_impl(&workers, &base).0.unwrap();
+        let mut snapshots = std::collections::HashMap::from([(
+            workers[target].url().to_string(),
+            DPLoadSnapshot {
+                age_at_observation: Some(Duration::ZERO),
+                num_waiting_reqs: 2,
+                ..Default::default()
+            },
+        )]);
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            hash_ring: Some(ring.clone()),
+            load_snapshots: Some(&snapshots),
+            ..Default::default()
+        };
+        assert_eq!(policy.select_worker_impl(&workers, &info).0, Some(target));
+        snapshots
+            .get_mut(workers[target].url())
+            .unwrap()
+            .num_waiting_reqs = 6;
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            hash_ring: Some(ring),
+            load_snapshots: Some(&snapshots),
+            ..Default::default()
+        };
+        assert_ne!(policy.select_worker_impl(&workers, &info).0, Some(target));
     }
 
     #[test]
