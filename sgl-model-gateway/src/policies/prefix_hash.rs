@@ -98,6 +98,7 @@ pub struct PrefixHashPolicy {
     /// paired replay validation; D's full-output budget stays unchanged.
     pd_prefill_cache_capacity: bool,
     pd_prefill_affinity_slack: Option<usize>,
+    pd_prefill_stage_reservation: bool,
 }
 
 impl PrefixHashPolicy {
@@ -110,6 +111,10 @@ impl PrefixHashPolicy {
             pd_prefill_affinity_slack: std::env::var("SGLANG_GATEWAY_PD_PREFILL_AFFINITY_SLACK")
                 .ok()
                 .and_then(|value| value.parse().ok()),
+            pd_prefill_stage_reservation: std::env::var(
+                "SGLANG_GATEWAY_PD_PREFILL_STAGE_RESERVATION",
+            )
+            .is_ok_and(|value| value == "1"),
         }
     }
 
@@ -247,6 +252,19 @@ impl PrefixHashPolicy {
         } else {
             local
         };
+        if cache_aware_prefill && self.pd_prefill_stage_reservation {
+            // The local P lease spans dispatch through its consumed response
+            // body. These same requests can already occur in SRT's snapshot;
+            // take the larger lifecycle count instead of counting them twice.
+            return active
+                .max(
+                    snapshot
+                        .num_running_reqs
+                        .saturating_add(runnable_waiting)
+                        .saturating_add(stage_pressure),
+                )
+                .saturating_add(capacity_pressure);
+        }
         active
             .max(snapshot.num_running_reqs)
             .saturating_add(runnable_waiting)
@@ -663,6 +681,47 @@ mod tests {
         assert_eq!(policy.effective_load(&worker, &info), 0);
         policy.pd_prefill_cache_capacity = false;
         assert!(policy.effective_load(&worker, &info) >= 4);
+    }
+
+    #[test]
+    fn test_prefill_stage_reservation_covers_stale_observation_without_double_counting() {
+        use crate::core::worker_manager::DisaggregationLoadSnapshot;
+
+        let worker = BasicWorkerBuilder::new("http://p:8000")
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(9000),
+            })
+            .build();
+        let snapshots = std::collections::HashMap::from([(
+            worker.url().to_string(),
+            DPLoadSnapshot {
+                age_at_observation: Some(Duration::ZERO),
+                num_waiting_reqs: 2,
+                disaggregation: Some(DisaggregationLoadSnapshot {
+                    prefill_bootstrap_queue_reqs: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )]);
+        let reservations = std::collections::HashMap::from([(worker.url().to_string(), 4)]);
+        let info = SelectWorkerInfo {
+            load_snapshots: Some(&snapshots),
+            local_reservations: Some(&reservations),
+            ..Default::default()
+        };
+        let mut policy = PrefixHashPolicy::with_defaults();
+        policy.pd_prefill_cache_capacity = true;
+        policy.pd_prefill_stage_reservation = true;
+        assert_eq!(policy.effective_load(&worker, &info), 4);
+
+        // SRT can know about more queued requests than the local gateway.
+        let one = std::collections::HashMap::from([(worker.url().to_string(), 1)]);
+        let info = SelectWorkerInfo {
+            local_reservations: Some(&one),
+            ..info
+        };
+        assert_eq!(policy.effective_load(&worker, &info), 3);
     }
 
     #[test]

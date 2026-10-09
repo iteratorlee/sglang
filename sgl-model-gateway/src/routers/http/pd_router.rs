@@ -65,6 +65,7 @@ pub struct PDRouter {
     pub api_key: Option<String>,
     pub enable_igw: bool,
     pd_token_affinity: bool,
+    pd_prefill_stage_reservation: bool,
     pd_decode_inflight_cap: usize,
     load_snapshots: watch::Receiver<HashMap<String, DPLoadSnapshot>>,
     reservations: Arc<PDReservationTable>,
@@ -91,7 +92,28 @@ struct PDReservationLease {
 
 #[derive(Debug, Default)]
 struct PDReservationPair {
+    prefill: Option<PDReservationLease>,
     _decode: Option<PDReservationLease>,
+}
+
+// The P load counter and optional local reservation have exactly the same
+// lifetime: from pair selection until the P response body has been consumed.
+struct PrefillStage {
+    _lease: Option<PDReservationLease>,
+    _load: WorkerLoadGuard,
+}
+
+impl PrefillStage {
+    fn new(
+        lease: Option<PDReservationLease>,
+        worker: Arc<dyn Worker>,
+        headers: Option<&HeaderMap>,
+    ) -> Self {
+        Self {
+            _lease: lease,
+            _load: WorkerLoadGuard::new(worker, headers),
+        }
+    }
 }
 
 impl Drop for PDReservationLease {
@@ -167,6 +189,27 @@ impl PDReservationTable {
 }
 
 const PD_DECODE_INFLIGHT_CAP_ENV: &str = "SGLANG_GATEWAY_PD_DECODE_INFLIGHT_CAP";
+const PD_PREFILL_STAGE_RESERVATION_ENV: &str = "SGLANG_GATEWAY_PD_PREFILL_STAGE_RESERVATION";
+
+fn prefill_stage_reservation_from_env() -> bool {
+    prefill_stage_reservation_enabled(
+        std::env::var(PD_PREFILL_STAGE_RESERVATION_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn prefill_stage_reservation_enabled(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+// Input token IDs are exact. Text endpoints have no token IDs at the gateway;
+// estimate four UTF-8 bytes per token and reserve at least one input token.
+fn prefill_input_tokens(input_ids: Option<usize>, text: Option<&str>) -> usize {
+    input_ids
+        .filter(|count| *count > 0)
+        .unwrap_or_else(|| text.map_or(1, |text| text.len().div_ceil(4).max(1)))
+}
 
 fn parse_decode_inflight_cap(raw: &str) -> Result<usize, String> {
     raw.parse::<usize>()
@@ -211,6 +254,7 @@ struct PDRequestContext<'a> {
     request_text: Option<String>,
     tokens: Option<Arc<[u32]>>,
     estimated_tokens: usize,
+    prefill_tokens: usize,
     model_id: Option<&'a str>,
     headers: Option<HeaderMap>,
 }
@@ -335,6 +379,7 @@ impl PDRouter {
             api_key: ctx.router_config.api_key.clone(),
             enable_igw: ctx.router_config.enable_igw,
             pd_token_affinity: pd_token_affinity_enabled(),
+            pd_prefill_stage_reservation: prefill_stage_reservation_from_env(),
             pd_decode_inflight_cap: decode_inflight_cap_from_env()?,
             load_snapshots,
             reservations: Arc::new(PDReservationTable::default()),
@@ -446,6 +491,14 @@ impl PDRouter {
             request_text,
             tokens,
             estimated_tokens: Self::get_generate_estimated_tokens(body),
+            prefill_tokens: prefill_input_tokens(
+                body.input_ids.as_ref().map(|ids| match ids {
+                    InputIds::Single(ids) => ids.len(),
+                    InputIds::Batch(batches) => batches.iter().map(Vec::len).sum(),
+                }),
+                body.text.as_deref(),
+            )
+            .saturating_add(1),
             model_id,
             headers: headers.cloned(),
         };
@@ -657,11 +710,12 @@ impl PDRouter {
                     let shared_request = Arc::clone(&shared_request);
                     let context = context.clone();
                     async move {
-                        let (prefill, decode, reservations) = match self
+                        let (prefill, decode, mut reservations) = match self
                             .select_pd_pair(
                                 context.request_text.as_deref(),
                                 context.tokens.as_deref(),
                                 context.estimated_tokens,
+                                context.prefill_tokens,
                                 context.model_id,
                                 context.headers.as_ref(),
                                 true,
@@ -680,6 +734,11 @@ impl PDRouter {
                             prefill.url(),
                             decode.url()
                         );
+                        let prefill_stage = PrefillStage::new(
+                            reservations.prefill.take(),
+                            Arc::clone(&prefill),
+                            headers,
+                        );
 
                         let mut json_request = match serde_json::to_value(shared_request.as_ref()) {
                             Ok(v) => v,
@@ -696,16 +755,30 @@ impl PDRouter {
                         };
 
                         let ctx_is_stream = context.is_stream;
-                        let response = self
+                        let mut response = self
                             .execute_dual_dispatch_internal(
                                 headers,
                                 json_request,
                                 context,
                                 Arc::clone(&prefill),
                                 Arc::clone(&decode),
+                                prefill_stage,
                                 start_time,
                             )
                             .await;
+                        if self.pd_prefill_stage_reservation {
+                            // The frozen replay client already records headers.
+                            // Preserve the selected virtual DP URLs for phase
+                            // attribution without changing the stream payload.
+                            for (name, worker) in [
+                                ("x-sglang-pd-prefill-worker", &prefill),
+                                ("x-sglang-pd-decode-worker", &decode),
+                            ] {
+                                if let Ok(value) = HeaderValue::from_str(worker.url()) {
+                                    response.headers_mut().insert(name, value);
+                                }
+                            }
+                        }
                         let response =
                             crate::core::AttachedBody::wrap_response(response, reservations);
 
@@ -791,7 +864,6 @@ impl PDRouter {
         &self,
         res: reqwest::Response,
         context: &PDRequestContext<'_>,
-        prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
     ) -> Response {
         let status = res.status();
@@ -835,7 +907,6 @@ impl PDRouter {
                 None,
                 context.return_logprob,
                 Some(response_headers),
-                prefill,
                 decode,
             )
         } else {
@@ -910,6 +981,33 @@ impl PDRouter {
         }
     }
 
+    // D may reject before P has returned even its headers. In that case P is
+    // cancelled, so its breaker has no observed outcome. Attribute only D's
+    // actual status/transport result and preserve the usual response shape.
+    async fn handle_decode_before_prefill(
+        &self,
+        result: Result<reqwest::Response, reqwest::Error>,
+        context: &PDRequestContext<'_>,
+        decode: Arc<dyn Worker>,
+    ) -> Response {
+        let mut response = match result {
+            Ok(res) => {
+                if !context.is_stream {
+                    decode.record_outcome(res.status().is_client_error());
+                }
+                self.handle_decode_error_response(res, context, decode)
+                    .await
+            }
+            Err(e) => {
+                decode.record_outcome(false);
+                error!(decode_url = %decode.url(), error = %e, "Decode request failed before prefill headers");
+                error::bad_gateway("decode_server_error", format!("Decode server error: {}", e))
+            }
+        };
+        response.extensions_mut().insert(BreakerOutcomesRecorded);
+        response
+    }
+
     // Internal method that performs the actual dual dispatch (without retry logic)
     async fn execute_dual_dispatch_internal(
         &self,
@@ -918,12 +1016,11 @@ impl PDRouter {
         context: PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        prefill_stage: PrefillStage,
         _start_time: Instant,
     ) -> Response {
-        // For non-streaming: use guard for automatic load management
-        // For streaming: load will be managed in create_streaming_response
-        let _prefill_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
+        // P's guard and lease were acquired immediately after selection. They
+        // remain live through the P body, including while D runs concurrently.
         let _decode_guard =
             (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
 
@@ -971,10 +1068,8 @@ impl PDRouter {
         }
         .emit();
 
-        let prefill_fut = prefill_request.send();
-        let decode_fut = decode_request.send();
-        tokio::pin!(prefill_fut);
-        tokio::pin!(decode_fut);
+        let mut prefill_fut = Box::pin(prefill_request.send());
+        let mut decode_fut = Box::pin(decode_request.send());
 
         // Poll both until prefill resolves; decode normally resolves later, but
         // may resolve first if it rejects the request outright.
@@ -988,6 +1083,17 @@ impl PDRouter {
                     break;
                 }
                 dr = &mut decode_fut, if decode_early.is_none() => {
+                    let failed = match &dr {
+                        Ok(res) => !res.status().is_success(),
+                        Err(_) => true,
+                    };
+                    if failed {
+                        // `Box::pin` owns the send future: dropping it closes
+                        // P's pending request before reading D's error body.
+                        drop(prefill_fut);
+                        drop(prefill_stage);
+                        return self.handle_decode_before_prefill(dr, &context, decode).await;
+                    }
                     decode_early = Some(dr);
                 }
             }
@@ -1002,6 +1108,10 @@ impl PDRouter {
             Ok(resp) => !resp.status().is_success(),
             Err(_) => true,
         };
+        let prefill_ok = match &prefill_result {
+            Ok(resp) => resp.status().is_success() || resp.status().is_client_error(),
+            Err(_) => false,
+        };
 
         if prefill_failed {
             warn!(
@@ -1013,13 +1123,9 @@ impl PDRouter {
             // Tick prefill by its real status (4xx = client fault). Don't record
             // decode: it was cancelled due to a prefill fault, not its own, so a
             // prefill error storm can't trip healthy decode breakers.
-            let prefill_ok = match &prefill_result {
-                Ok(r) => r.status().is_client_error(),
-                Err(_) => false,
-            };
             prefill.record_outcome(prefill_ok);
 
-            // Status-faithful error shaping (4xx forwarded, transport/5xx -> 502).
+            // Status-faithful error shaping (including P's 500; transport -> 502).
             let mut response = match self
                 .process_prefill_response(prefill_result, prefill.url(), false)
                 .await
@@ -1033,6 +1139,47 @@ impl PDRouter {
             response.extensions_mut().insert(BreakerOutcomesRecorded);
             return response;
         }
+
+        // Finish P before waiting for successful D headers. Keep polling the
+        // concurrent D request while reading P. A D rejection cancels P just
+        // as before, rather than waiting indefinitely for an orphaned P body.
+        let decode_failed_early = decode_early.as_ref().is_some_and(|result| match result {
+            Ok(res) => !res.status().is_success(),
+            Err(_) => true,
+        });
+        let prefill_body_result = if decode_failed_early {
+            drop(prefill_result);
+            None
+        } else {
+            let prefill_body_fut = self.process_prefill_response(
+                prefill_result,
+                prefill.url(),
+                context.return_logprob,
+            );
+            tokio::pin!(prefill_body_fut);
+            loop {
+                tokio::select! {
+                    biased;
+                    body = &mut prefill_body_fut => break Some(body),
+                    dr = &mut decode_fut, if decode_early.is_none() => {
+                        let failed = match &dr {
+                            Ok(res) => !res.status().is_success(),
+                            Err(_) => true,
+                        };
+                        decode_early = Some(dr);
+                        if failed {
+                            break None;
+                        }
+                    }
+                }
+            }
+        };
+        let prefill_body = match prefill_body_result {
+            Some(Ok((_, body))) => body,
+            Some(Err(error_response)) => return error_response,
+            None => None,
+        };
+        drop(prefill_stage);
 
         // Prefill ok: take decode's result, awaiting it if still pending.
         let decode_result = match decode_early {
@@ -1071,13 +1218,6 @@ impl PDRouter {
                     // decode on drop, so skip to avoid double-counting.
                     // Mark the response so the outer dispatcher skips its
                     // status-derived `record_outcome`.
-                    let prefill_ok = match &prefill_result {
-                        Ok(r) => {
-                            let s = r.status();
-                            s.is_success() || s.is_client_error()
-                        }
-                        Err(_) => false,
-                    };
                     prefill.record_outcome(prefill_ok);
                     if !context.is_stream {
                         let decode_ok = status.is_success() || status.is_client_error();
@@ -1085,35 +1225,11 @@ impl PDRouter {
                     }
 
                     let mut response = self
-                        .handle_decode_error_response(res, &context, prefill, decode)
+                        .handle_decode_error_response(res, &context, decode)
                         .await;
                     response.extensions_mut().insert(BreakerOutcomesRecorded);
                     return response;
                 }
-
-                // Process prefill response
-                let prefill_body = if context.return_logprob {
-                    match self
-                        .process_prefill_response(
-                            prefill_result,
-                            prefill.url(),
-                            context.return_logprob,
-                        )
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
-                } else {
-                    // Even if we don't need logprobs, we should check prefill status
-                    match self
-                        .process_prefill_response(prefill_result, prefill.url(), false)
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
-                };
 
                 if context.is_stream {
                     // Streaming response
@@ -1136,7 +1252,6 @@ impl PDRouter {
                         prefill_logprobs,
                         context.return_logprob,
                         Some(response_headers),
-                        prefill,
                         decode,
                     )
                 } else {
@@ -1190,13 +1305,6 @@ impl PDRouter {
                 // dispatcher skips its status-derived `record_outcome`
                 // and we don't double-count.
                 decode.record_outcome(false);
-                let prefill_ok = match &prefill_result {
-                    Ok(res) => {
-                        let s = res.status();
-                        s.is_success() || s.is_client_error()
-                    }
-                    Err(_) => false,
-                };
                 prefill.record_outcome(prefill_ok);
 
                 let mut response = error::bad_gateway(
@@ -1242,6 +1350,7 @@ impl PDRouter {
         request_text: Option<&str>,
         tokens: Option<&[u32]>,
         estimated_tokens: usize,
+        prefill_tokens: usize,
         model_id: Option<&str>,
         headers: Option<&HeaderMap>,
         reserve: bool,
@@ -1287,7 +1396,7 @@ impl PDRouter {
 
         let attempts = decode_workers.len().saturating_mul(2).max(1);
         for _ in 0..attempts {
-            let snapshots = if self.pd_token_affinity {
+            let snapshots = if self.pd_token_affinity || self.pd_prefill_stage_reservation {
                 self.load_snapshots.borrow().clone()
             } else {
                 HashMap::new()
@@ -1310,11 +1419,21 @@ impl PDRouter {
                 &local_reservations,
                 &post_snapshot_reserved_tokens,
                 &post_snapshot_reserved_requests,
-                estimated_tokens,
+                if self.pd_prefill_stage_reservation {
+                    prefill_tokens
+                } else {
+                    estimated_tokens
+                },
                 None,
                 "prefill",
             )
             .await?;
+            let prefill_lease = if reserve && self.pd_prefill_stage_reservation {
+                self.reservations
+                    .try_reserve(prefill.url(), prefill_tokens, None)
+            } else {
+                None
+            };
             let decode = Self::pick_worker_by_policy_arc(
                 &decode_workers,
                 &*decode_policy,
@@ -1333,7 +1452,7 @@ impl PDRouter {
             )
             .await?;
 
-            let reservations = if reserve && self.pd_token_affinity {
+            let decode_lease = if reserve && self.pd_token_affinity {
                 let Some(decode_lease) = self.reservations.try_reserve(
                     decode.url(),
                     estimated_tokens,
@@ -1341,11 +1460,13 @@ impl PDRouter {
                 ) else {
                     continue;
                 };
-                PDReservationPair {
-                    _decode: Some(decode_lease),
-                }
+                Some(decode_lease)
             } else {
-                PDReservationPair::default()
+                None
+            };
+            let reservations = PDReservationPair {
+                prefill: prefill_lease,
+                _decode: decode_lease,
             };
 
             let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
@@ -1447,7 +1568,6 @@ impl PDRouter {
         prefill_logprobs: Option<Value>,
         return_logprob: bool,
         headers: Option<HeaderMap>,
-        prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
     ) -> Response {
         use crate::core::AttachedBody;
@@ -1537,10 +1657,7 @@ impl PDRouter {
         let stream = UnboundedReceiverStream::new(rx);
         let body = Body::from_stream(stream);
 
-        let guards = vec![
-            WorkerLoadGuard::new(prefill, headers.as_ref()),
-            WorkerLoadGuard::new(decode, headers.as_ref()),
-        ];
+        let decode_guard = WorkerLoadGuard::new(decode, headers.as_ref());
 
         let mut response = Response::new(body);
         *response.status_mut() = status;
@@ -1549,7 +1666,7 @@ impl PDRouter {
         response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         *response.headers_mut() = response_headers;
 
-        AttachedBody::wrap_response(response, guards)
+        AttachedBody::wrap_response(response, decode_guard)
     }
 
     // Helper to process non-streaming decode response with logprob merging
@@ -1800,16 +1917,18 @@ impl RouterTrait for PDRouter {
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
 
         // Select a random worker pair using the policy
-        let (prefill, decode, _reservations) =
-            match self.select_pd_pair(None, None, 0, None, None, false).await {
-                Ok(pair) => pair,
-                Err(e) => {
-                    return error::service_unavailable(
-                        "no_healthy_worker_pair",
-                        format!("No healthy worker pair available: {}", e),
-                    );
-                }
-            };
+        let (prefill, decode, _reservations) = match self
+            .select_pd_pair(None, None, 0, 1, None, None, false)
+            .await
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                return error::service_unavailable(
+                    "no_healthy_worker_pair",
+                    format!("No healthy worker pair available: {}", e),
+                );
+            }
+        };
 
         let prefill_url = Self::worker_endpoint_url(prefill.as_ref(), "health_generate");
         let decode_url = Self::worker_endpoint_url(decode.as_ref(), "health_generate");
@@ -1933,7 +2052,8 @@ impl RouterTrait for PDRouter {
         let is_stream = body.stream;
         let return_logprob = body.logprobs;
 
-        let request_text = if self.policies_need_request_text() {
+        let request_text = if self.policies_need_request_text() || self.pd_prefill_stage_reservation
+        {
             Self::build_chat_request_text(body)
         } else {
             None
@@ -1941,6 +2061,7 @@ impl RouterTrait for PDRouter {
 
         // Calculate batch size
         let batch_size = Self::get_chat_batch_size(body);
+        let prefill_tokens = prefill_input_tokens(None, request_text.as_deref()).saturating_add(1);
 
         let context = PDRequestContext {
             route: "/v1/chat/completions",
@@ -1950,6 +2071,7 @@ impl RouterTrait for PDRouter {
             request_text,
             tokens: None,
             estimated_tokens: 0,
+            prefill_tokens,
             model_id,
             headers: headers.cloned(),
         };
@@ -1966,7 +2088,8 @@ impl RouterTrait for PDRouter {
         let is_stream = body.stream;
         let return_logprob = body.logprobs.is_some();
 
-        let request_text = if self.policies_need_request_text() {
+        let request_text = if self.policies_need_request_text() || self.pd_prefill_stage_reservation
+        {
             match &body.prompt {
                 StringOrArray::String(s) => Some(s.clone()),
                 StringOrArray::Array(v) => v.first().map(|s| s.to_string()),
@@ -1977,6 +2100,15 @@ impl RouterTrait for PDRouter {
 
         // Calculate batch size
         let batch_size = Self::get_completion_batch_size(body);
+        let prefill_tokens = match &body.prompt {
+            StringOrArray::String(prompt) => prefill_input_tokens(None, Some(prompt)),
+            StringOrArray::Array(prompts) => prompts
+                .iter()
+                .map(|prompt| prefill_input_tokens(None, Some(&prompt.to_string())))
+                .fold(0usize, usize::saturating_add)
+                .max(1),
+        }
+        .saturating_add(1);
 
         let context = PDRequestContext {
             route: "/v1/completions",
@@ -1986,6 +2118,7 @@ impl RouterTrait for PDRouter {
             request_text,
             tokens: None,
             estimated_tokens: 0,
+            prefill_tokens,
             model_id,
             headers: headers.cloned(),
         };
@@ -2000,12 +2133,13 @@ impl RouterTrait for PDRouter {
         model_id: Option<&str>,
     ) -> Response {
         // Extract text for cache-aware routing
-        let req_text = if self.policies_need_request_text() {
+        let req_text = if self.policies_need_request_text() || self.pd_prefill_stage_reservation {
             Some(body.query.clone())
         } else {
             None
         };
 
+        let prefill_tokens = prefill_input_tokens(None, req_text.as_deref()).saturating_add(1);
         let context = PDRequestContext {
             route: "/v1/rerank",
             batch_size: None,
@@ -2014,6 +2148,7 @@ impl RouterTrait for PDRouter {
             request_text: req_text,
             tokens: None,
             estimated_tokens: 0,
+            prefill_tokens,
             model_id,
             headers: headers.cloned(),
         };
@@ -2059,6 +2194,192 @@ mod tests {
     use super::*;
     use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder, WorkerType};
 
+    async fn mock_worker(status: StatusCode, body: Body) -> String {
+        use axum::routing::post;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let body = Arc::new(Mutex::new(Some(body)));
+        let app = axum::Router::new().route(
+            "/generate",
+            post(move || {
+                let body = body.lock().unwrap_or_else(|e| e.into_inner()).take();
+                async move { (status, body.unwrap_or_else(Body::empty)) }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url
+    }
+
+    async fn mock_prefill_without_headers() -> (String, tokio::sync::oneshot::Receiver<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered = Arc::new(Mutex::new(Some(entered_tx)));
+        let app = axum::Router::new().route(
+            "/generate",
+            axum::routing::post(move || {
+                let signal = entered.lock().unwrap_or_else(|e| e.into_inner()).take();
+                async move {
+                    if let Some(signal) = signal {
+                        let _ = signal.send(());
+                    }
+                    std::future::pending::<Response>().await
+                }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, entered_rx)
+    }
+
+    async fn mock_gated_decode(
+        status: Option<StatusCode>,
+    ) -> (String, tokio::sync::oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        if let Some(status) = status {
+            let release = Arc::new(Mutex::new(Some(release_rx)));
+            let app = axum::Router::new().route(
+                "/generate",
+                axum::routing::post(move || {
+                    let release = release.lock().unwrap_or_else(|e| e.into_inner()).take();
+                    async move {
+                        if let Some(release) = release {
+                            let _ = release.await;
+                        }
+                        (status, "decode failed")
+                    }
+                }),
+            );
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        } else {
+            // Accept the request, then close the TCP connection without HTTP
+            // headers when released to produce a genuine reqwest send error.
+            tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let _ = release_rx.await;
+                drop(socket);
+            });
+        }
+        (url, release_tx)
+    }
+
+    async fn assert_decode_failure_before_prefill_headers(
+        decode_status: Option<StatusCode>,
+        stream: bool,
+    ) {
+        use http_body_util::BodyExt;
+        use tokio::time::{timeout, Duration};
+
+        let (p_url, p_entered) = mock_prefill_without_headers().await;
+        let (d_url, release_decode) = mock_gated_decode(decode_status).await;
+        let mut router = create_test_pd_router();
+        router.pd_token_affinity = true;
+        router.pd_prefill_stage_reservation = true;
+        router.retry_config.max_retries = 1;
+        let (prefill, decode) = register_pd_workers(&router, p_url, d_url);
+        let router = Arc::new(router);
+        let task_router = Arc::clone(&router);
+        let raw = json!({"input_ids": [1, 2, 3], "stream": stream});
+        let typed: GenerateRequest = serde_json::from_value(raw.clone()).unwrap();
+        let request = tokio::spawn(async move {
+            task_router
+                .route_generate_raw(None, &typed, &raw, None)
+                .await
+        });
+
+        timeout(Duration::from_secs(3), p_entered)
+            .await
+            .expect("P request never reached the worker")
+            .unwrap();
+        assert!(!request.is_finished(), "P headers are still pending");
+        assert_eq!(
+            router.reservations.views(&HashMap::new()).0[prefill.url()],
+            1
+        );
+        assert_eq!(
+            router.reservations.views(&HashMap::new()).0[decode.url()],
+            1
+        );
+        assert_eq!(prefill.load(), 1);
+        assert_eq!(prefill.circuit_breaker().total_successes(), 0);
+        assert_eq!(prefill.circuit_breaker().total_failures(), 0);
+
+        release_decode.send(()).unwrap();
+        let response = timeout(Duration::from_secs(3), request)
+            .await
+            .expect("D failure must cancel pending P headers")
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            decode_status.unwrap_or(StatusCode::BAD_GATEWAY)
+        );
+        assert!(!router
+            .reservations
+            .views(&HashMap::new())
+            .0
+            .contains_key(prefill.url()));
+        assert_eq!(prefill.load(), 0);
+        assert_eq!(prefill.circuit_breaker().total_successes(), 0);
+        assert_eq!(prefill.circuit_breaker().total_failures(), 0);
+        // The existing D lease remains attached to the response body.
+        assert_eq!(
+            router.reservations.views(&HashMap::new()).0[decode.url()],
+            1
+        );
+
+        timeout(Duration::from_secs(3), response.into_body().collect())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(router.reservations.views(&HashMap::new()).0.is_empty());
+        assert_eq!(prefill.circuit_breaker().total_successes(), 0);
+        assert_eq!(prefill.circuit_breaker().total_failures(), 0);
+        assert_eq!(
+            decode.circuit_breaker().total_successes(),
+            u64::from(decode_status.is_some_and(|status| status.is_client_error()))
+        );
+        assert_eq!(
+            decode.circuit_breaker().total_failures(),
+            u64::from(!decode_status.is_some_and(|status| status.is_client_error()))
+        );
+    }
+
+    fn register_pd_workers(
+        router: &PDRouter,
+        prefill_url: String,
+        decode_url: String,
+    ) -> (Arc<dyn Worker>, Arc<dyn Worker>) {
+        let prefill: Arc<dyn Worker> = Arc::from(create_test_worker(
+            prefill_url,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+        ));
+        let decode: Arc<dyn Worker> =
+            Arc::from(create_test_worker(decode_url, WorkerType::Decode, true));
+        router.worker_registry.register(Arc::clone(&prefill));
+        router.worker_registry.register(Arc::clone(&decode));
+        (prefill, decode)
+    }
+
+    async fn wait_for_prefill_lease(router: &PDRouter, url: &str) {
+        use tokio::time::{sleep, timeout, Duration};
+
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if router.reservations.views(&HashMap::new()).0.get(url) == Some(&1) {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("prefill lease was never acquired");
+    }
+
     fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry =
@@ -2073,6 +2394,7 @@ mod tests {
             api_key: Some("test_api_key".to_string()),
             enable_igw: false,
             pd_token_affinity: false,
+            pd_prefill_stage_reservation: false,
             pd_decode_inflight_cap: 2,
             load_snapshots,
             reservations: Arc::new(PDReservationTable::default()),
@@ -2162,7 +2484,7 @@ mod tests {
         router.worker_registry.register(Arc::from(decode_worker));
 
         let result = router
-            .select_pd_pair(None, None, 0, None, None, false)
+            .select_pd_pair(None, None, 0, 1, None, None, false)
             .await;
 
         assert!(result.is_ok());
@@ -2177,7 +2499,7 @@ mod tests {
         let router = create_test_pd_router();
 
         let result = router
-            .select_pd_pair(None, None, 0, None, None, false)
+            .select_pd_pair(None, None, 0, 1, None, None, false)
             .await;
 
         assert!(result.is_err());
@@ -2418,6 +2740,418 @@ mod tests {
     }
 
     #[test]
+    fn test_prefill_input_estimate_excludes_decode_output() {
+        assert!(!prefill_stage_reservation_enabled(None));
+        assert!(!prefill_stage_reservation_enabled(Some("0")));
+        assert!(prefill_stage_reservation_enabled(Some("1")));
+        assert_eq!(
+            prefill_input_tokens(Some(4096), None).saturating_add(1),
+            4097
+        );
+        assert_eq!(
+            prefill_input_tokens(None, Some("12345678")).saturating_add(1),
+            3
+        );
+        assert_eq!(prefill_input_tokens(None, None).saturating_add(1), 2);
+        assert_eq!(
+            prefill_input_tokens(Some(0), Some("1234")).saturating_add(1),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prefill_reservation_without_token_ids_uses_text_fallback() {
+        let mut router = create_test_pd_router();
+        router.pd_prefill_stage_reservation = true;
+        let (prefill, decode) = register_pd_workers(
+            &router,
+            "http://prefill:30000".to_string(),
+            "http://decode:30001".to_string(),
+        );
+        let p_tokens = prefill_input_tokens(None, Some("12345678")).saturating_add(1);
+        let (_, _, pair) = router
+            .select_pd_pair(Some("12345678"), None, 100_000, p_tokens, None, None, true)
+            .await
+            .unwrap();
+        let (active, tokens, requests) = router.reservations.views(&HashMap::new());
+        assert_eq!(active[prefill.url()], 1);
+        assert_eq!(tokens[prefill.url()], 3);
+        assert_eq!(requests[prefill.url()], 1);
+        assert!(!active.contains_key(decode.url()));
+        drop(pair);
+        assert!(router.reservations.views(&HashMap::new()).0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_prefill_reservation_uses_input_only_and_preserves_decode_soft_cap() {
+        let mut router = create_test_pd_router();
+        router.pd_token_affinity = true;
+        router.pd_prefill_stage_reservation = true;
+        router.pd_decode_inflight_cap = 1;
+        let (prefill, decode) = register_pd_workers(
+            &router,
+            "http://prefill:30000".to_string(),
+            "http://decode:30001".to_string(),
+        );
+
+        let (_, _, pair) = router
+            .select_pd_pair(None, Some(&[1, 2, 3]), 100_003, 4, None, None, true)
+            .await
+            .unwrap();
+        let (active, tokens, requests) = router.reservations.views(&HashMap::new());
+        assert_eq!(active[prefill.url()], 1);
+        assert_eq!(tokens[prefill.url()], 4);
+        assert_eq!(requests[prefill.url()], 1);
+        assert_eq!(active[decode.url()], 1);
+        assert_eq!(tokens[decode.url()], 100_003);
+        assert!(router
+            .select_pd_pair(None, Some(&[1, 2, 3]), 100_003, 4, None, None, true)
+            .await
+            .is_err());
+        assert_eq!(
+            router.reservations.views(&HashMap::new()).0[prefill.url()],
+            1
+        );
+
+        drop(pair);
+        assert!(router.reservations.views(&HashMap::new()).0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_prefill_lease_ends_at_body_completion_while_decode_streams() {
+        use http_body_util::BodyExt;
+        use std::convert::Infallible;
+
+        let (p_tx, p_rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
+        let (d_tx, d_rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
+        let p_url = mock_worker(
+            StatusCode::OK,
+            Body::from_stream(UnboundedReceiverStream::new(p_rx).map(Ok::<_, Infallible>)),
+        )
+        .await;
+        let d_url = mock_worker(
+            StatusCode::OK,
+            Body::from_stream(UnboundedReceiverStream::new(d_rx).map(Ok::<_, Infallible>)),
+        )
+        .await;
+        let mut router = create_test_pd_router();
+        router.pd_token_affinity = true;
+        router.pd_prefill_stage_reservation = true;
+        router.retry_config.max_retries = 0;
+        let (prefill, decode) = register_pd_workers(&router, p_url, d_url);
+        let router = Arc::new(router);
+        let task_router = Arc::clone(&router);
+        let raw = json!({"input_ids": [1, 2, 3], "sampling_params": {"max_new_tokens": 100}, "stream": true});
+        let typed: GenerateRequest = serde_json::from_value(raw.clone()).unwrap();
+        let request = tokio::spawn(async move {
+            task_router
+                .route_generate_raw(None, &typed, &raw, None)
+                .await
+        });
+
+        wait_for_prefill_lease(&router, prefill.url()).await;
+        assert_eq!(
+            router.reservations.views(&HashMap::new()).0[decode.url()],
+            1
+        );
+        assert_eq!(prefill.load(), 1);
+        assert!(!request.is_finished(), "P body is still pending");
+
+        p_tx.send(bytes::Bytes::from_static(b"{}")).unwrap();
+        drop(p_tx);
+        let response = tokio::time::timeout(std::time::Duration::from_secs(3), request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let (active, _, _) = router.reservations.views(&HashMap::new());
+        assert!(!active.contains_key(prefill.url()));
+        assert_eq!(active[decode.url()], 1);
+        assert_eq!(prefill.load(), 0);
+        assert_eq!(decode.load(), 1);
+
+        d_tx.send(bytes::Bytes::from_static(b"data: [DONE]\n\n"))
+            .unwrap();
+        drop(d_tx);
+        let _ = response.into_body().collect().await.unwrap();
+        assert!(router.reservations.views(&HashMap::new()).0.is_empty());
+        assert_eq!(decode.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_pending_prefill_releases_both_leases() {
+        use std::convert::Infallible;
+
+        let (_p_tx, p_rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
+        let (_d_tx, d_rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
+        let p_url = mock_worker(
+            StatusCode::OK,
+            Body::from_stream(UnboundedReceiverStream::new(p_rx).map(Ok::<_, Infallible>)),
+        )
+        .await;
+        let d_url = mock_worker(
+            StatusCode::OK,
+            Body::from_stream(UnboundedReceiverStream::new(d_rx).map(Ok::<_, Infallible>)),
+        )
+        .await;
+        let mut router = create_test_pd_router();
+        router.pd_token_affinity = true;
+        router.pd_prefill_stage_reservation = true;
+        let (prefill, decode) = register_pd_workers(&router, p_url, d_url);
+        let router = Arc::new(router);
+        let task_router = Arc::clone(&router);
+        let raw = json!({"input_ids": [1, 2, 3], "stream": true});
+        let typed: GenerateRequest = serde_json::from_value(raw.clone()).unwrap();
+        let request = tokio::spawn(async move {
+            task_router
+                .route_generate_raw(None, &typed, &raw, None)
+                .await
+        });
+
+        wait_for_prefill_lease(&router, prefill.url()).await;
+        assert_eq!(prefill.load(), 1);
+        request.abort();
+        let _ = request.await;
+        assert!(router.reservations.views(&HashMap::new()).0.is_empty());
+        assert_eq!(prefill.load(), 0);
+        assert_eq!(decode.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_prefill_error_releases_leases_and_aborts_decode() {
+        use std::convert::Infallible;
+
+        let (_d_tx, d_rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
+        let p_url = mock_worker(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Body::from("prefill failed"),
+        )
+        .await;
+        let d_url = mock_worker(
+            StatusCode::OK,
+            Body::from_stream(UnboundedReceiverStream::new(d_rx).map(Ok::<_, Infallible>)),
+        )
+        .await;
+        let mut router = create_test_pd_router();
+        router.pd_token_affinity = true;
+        router.pd_prefill_stage_reservation = true;
+        router.retry_config.max_retries = 0;
+        let (prefill, decode) = register_pd_workers(&router, p_url, d_url);
+        let raw = json!({"input_ids": [1, 2, 3], "stream": true});
+        let typed: GenerateRequest = serde_json::from_value(raw.clone()).unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            router.route_generate_raw(None, &typed, &raw, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!router
+            .reservations
+            .views(&HashMap::new())
+            .0
+            .contains_key(prefill.url()));
+        // The existing D lease remains attached to the returned response.
+        assert_eq!(
+            router.reservations.views(&HashMap::new()).0[decode.url()],
+            1
+        );
+        drop(response);
+        assert!(router.reservations.views(&HashMap::new()).0.is_empty());
+        assert_eq!(prefill.load(), 0);
+        assert_eq!(decode.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_early_decode_error_cancels_pending_prefill_body() {
+        use std::convert::Infallible;
+
+        let (_p_tx, p_rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
+        let p_url = mock_worker(
+            StatusCode::OK,
+            Body::from_stream(UnboundedReceiverStream::new(p_rx).map(Ok::<_, Infallible>)),
+        )
+        .await;
+        let d_url = mock_worker(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Body::from("decode failed"),
+        )
+        .await;
+        let mut router = create_test_pd_router();
+        router.pd_token_affinity = true;
+        router.pd_prefill_stage_reservation = true;
+        router.retry_config.max_retries = 0;
+        let (prefill, decode) = register_pd_workers(&router, p_url, d_url);
+        let raw = json!({"input_ids": [1, 2, 3], "stream": true});
+        let typed: GenerateRequest = serde_json::from_value(raw.clone()).unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            router.route_generate_raw(None, &typed, &raw, None),
+        )
+        .await
+        .expect("D rejection must not wait for the held P body");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(prefill.load(), 0);
+        assert!(!router
+            .reservations
+            .views(&HashMap::new())
+            .0
+            .contains_key(prefill.url()));
+        assert_eq!(
+            router.reservations.views(&HashMap::new()).0[decode.url()],
+            1
+        );
+        drop(response);
+        assert!(router.reservations.views(&HashMap::new()).0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_decode_400_before_prefill_headers_cancels_prefill_without_breaker_tick() {
+        assert_decode_failure_before_prefill_headers(Some(StatusCode::BAD_REQUEST), false).await;
+    }
+
+    #[tokio::test]
+    async fn test_decode_500_before_prefill_headers_cancels_prefill_without_breaker_tick() {
+        assert_decode_failure_before_prefill_headers(Some(StatusCode::INTERNAL_SERVER_ERROR), true)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_decode_transport_before_prefill_headers_cancels_prefill_without_breaker_tick() {
+        assert_decode_failure_before_prefill_headers(None, true).await;
+    }
+
+    #[tokio::test]
+    async fn test_prefill_retry_releases_previous_attempt_leases() {
+        use std::sync::atomic::AtomicUsize;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let p_url = format!("http://{}", listener.local_addr().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = Arc::clone(&calls);
+        let app = axum::Router::new().route(
+            "/generate",
+            axum::routing::post(move || {
+                let attempt = handler_calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        (StatusCode::INTERNAL_SERVER_ERROR, "prefill failed")
+                    } else {
+                        (StatusCode::OK, "{}")
+                    }
+                }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let d_url = mock_worker(StatusCode::OK, Body::from("{}")).await;
+        let mut router = create_test_pd_router();
+        router.pd_token_affinity = true;
+        router.pd_prefill_stage_reservation = true;
+        router.retry_config.max_retries = 2;
+        router.retry_config.initial_backoff_ms = 0;
+        router.retry_config.jitter_factor = 0.0;
+        let (prefill, decode) = register_pd_workers(&router, p_url, d_url);
+        let raw = json!({"input_ids": [1, 2, 3], "stream": false});
+        let typed: GenerateRequest = serde_json::from_value(raw.clone()).unwrap();
+        let response = router.route_generate_raw(None, &typed, &raw, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(!router
+            .reservations
+            .views(&HashMap::new())
+            .0
+            .contains_key(prefill.url()));
+        assert_eq!(
+            router.reservations.views(&HashMap::new()).0[decode.url()],
+            1
+        );
+        drop(response);
+        assert!(router.reservations.views(&HashMap::new()).0.is_empty());
+        assert_eq!(prefill.load(), 0);
+        assert_eq!(decode.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_nonstream_logprobs_still_merge_after_prefill_body_first() {
+        use http_body_util::BodyExt;
+
+        let p_url = mock_worker(
+            StatusCode::OK,
+            Body::from(r#"{"meta_info":{"input_token_logprobs":[1]}}"#),
+        )
+        .await;
+        let d_url = mock_worker(
+            StatusCode::OK,
+            Body::from(r#"{"meta_info":{"input_token_logprobs":[2]}}"#),
+        )
+        .await;
+        let mut router = create_test_pd_router();
+        router.pd_prefill_stage_reservation = true;
+        router.retry_config.max_retries = 0;
+        register_pd_workers(&router, p_url, d_url);
+        let raw = json!({"input_ids": [1, 2, 3], "return_logprob": true, "stream": false});
+        let typed: GenerateRequest = serde_json::from_value(raw.clone()).unwrap();
+        let response = router.route_generate_raw(None, &typed, &raw, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["meta_info"]["input_token_logprobs"], json!([1, 2]));
+        assert!(router.reservations.views(&HashMap::new()).0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_streaming_logprobs_still_merge_after_prefill_body_first() {
+        use http_body_util::BodyExt;
+        use std::convert::Infallible;
+
+        let p_url = mock_worker(
+            StatusCode::OK,
+            Body::from(r#"{"meta_info":{"input_token_logprobs":[1]}}"#),
+        )
+        .await;
+        let (d_tx, d_rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
+        let d_url = mock_worker(
+            StatusCode::OK,
+            Body::from_stream(UnboundedReceiverStream::new(d_rx).map(Ok::<_, Infallible>)),
+        )
+        .await;
+        let mut router = create_test_pd_router();
+        router.pd_token_affinity = true;
+        router.pd_prefill_stage_reservation = true;
+        router.retry_config.max_retries = 0;
+        let (prefill, _) = register_pd_workers(&router, p_url, d_url);
+        let raw = json!({"input_ids": [1, 2, 3], "return_logprob": true, "stream": true});
+        let typed: GenerateRequest = serde_json::from_value(raw.clone()).unwrap();
+        let response = router.route_generate_raw(None, &typed, &raw, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!router
+            .reservations
+            .views(&HashMap::new())
+            .0
+            .contains_key(prefill.url()));
+
+        d_tx.send(bytes::Bytes::from_static(
+            b"data: {\"meta_info\":{\"input_token_logprobs\":[2]}}\n\n",
+        ))
+        .unwrap();
+        let mut body = response.into_body();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(3), body.frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let chunk = frame.into_data().unwrap();
+        let text = std::str::from_utf8(&chunk).unwrap();
+        let merged: Value = serde_json::from_str(text.trim_start_matches("data: ").trim()).unwrap();
+        assert_eq!(merged["meta_info"]["input_token_logprobs"], json!([1, 2]));
+        d_tx.send(bytes::Bytes::from_static(b"data: [DONE]\n\n"))
+            .unwrap();
+        drop(d_tx);
+        let _ = body.collect().await.unwrap();
+        assert!(router.reservations.views(&HashMap::new()).0.is_empty());
+    }
+
+    #[test]
     fn test_generate_token_ids_and_extension_fields_contract() {
         let raw = json!({
             "input_ids": [11, 12, 13, 14],
@@ -2557,12 +3291,11 @@ mod tests {
                 None,
                 false,
                 None,
-                prefill_ref.clone(),
                 decode_ref.clone(),
             );
 
-            // Guards are now attached to response body, so load should be 1
-            assert_eq!(prefill_ref.load(), 1);
+            // Only D is active for the lifetime of its streaming body.
+            assert_eq!(prefill_ref.load(), 0);
             assert_eq!(decode_ref.load(), 1);
 
             tx.send(bytes::Bytes::from("test data")).unwrap();
@@ -2570,7 +3303,7 @@ mod tests {
             sleep(Duration::from_millis(10)).await;
 
             // Load still 1 while response body exists
-            assert_eq!(prefill_ref.load(), 1);
+            assert_eq!(prefill_ref.load(), 0);
             assert_eq!(decode_ref.load(), 1);
 
             drop(tx);
