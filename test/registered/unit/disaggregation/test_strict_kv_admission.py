@@ -43,6 +43,9 @@ def make_queue(running=None):
     queue.token_to_kv_pool_allocator = SimpleNamespace(
         page_size=64, translate_kv_indices_for_transfer=lambda indices: indices
     )
+    # The NPU payload path checks the concrete pool type even when this
+    # fixture carries no model-specific state. Represent an ordinary pool.
+    queue.token_to_kv_pool = SimpleNamespace(page_size=64)
     queue.kv_manager = SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
     queue.transfer_queue = SimpleNamespace(queue=[], enable_staging=False)
     queue.scheduler = SimpleNamespace(
