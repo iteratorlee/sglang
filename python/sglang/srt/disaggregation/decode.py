@@ -134,6 +134,21 @@ if TYPE_CHECKING:
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
 
+def get_decode_execution_max_requests_per_dp(physical_limit: int) -> int:
+    """Limit ready-request execution without changing KV/transfer capacity."""
+    name = "SGLANG_PD_DECODE_EXEC_MAX_REQUESTS_PER_DP"
+    raw = os.environ.get(name, "0")
+    try:
+        configured = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"{name} must be a non-negative integer, got {raw!r}"
+        ) from None
+    if configured < 0:
+        raise ValueError(f"{name} must be a non-negative integer, got {raw!r}")
+    return min(physical_limit, configured) if configured else physical_limit
+
+
 def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
@@ -2940,6 +2955,12 @@ class SchedulerDisaggregationDecodeMixin:
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
+        # Only execution is capped; transfer and preallocation still use the
+        # physical request and KV budgets. Validate even while the queue is idle.
+        batch_size = get_decode_execution_max_requests_per_dp(
+            min(self.req_to_token_pool.size, self.max_running_requests)
+        )
+
         if len(self.waiting_queue) == 0:
             return None
 
@@ -2947,8 +2968,6 @@ class SchedulerDisaggregationDecodeMixin:
             self.policy.calc_priority(self.waiting_queue, running_batch)
 
         curr_batch_size = running_batch.batch_size()
-
-        batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
 
         num_not_used_batch = batch_size - curr_batch_size
 

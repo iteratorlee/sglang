@@ -78,6 +78,7 @@ from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
     SchedulerDisaggregationDecodeMixin,
+    get_decode_execution_max_requests_per_dp,
 )
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
@@ -5079,6 +5080,12 @@ class Scheduler(
         )
         ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            ret["effective_decode_execution_max_requests_per_dp"] = (
+                get_decode_execution_max_requests_per_dp(
+                    min(self.req_to_token_pool.size, self.max_running_requests)
+                )
+            )
 
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
