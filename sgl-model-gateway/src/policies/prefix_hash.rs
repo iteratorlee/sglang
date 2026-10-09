@@ -29,7 +29,12 @@
 //!
 //! prefix_hash trades optimal cache utilization for predictable O(log n) performance.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::{hash_map::DefaultHasher, HashMap as PlacementMap},
+    hash::{Hash, Hasher},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use super::{LoadBalancingPolicy, SelectWorkerInfo};
 use crate::{
@@ -38,6 +43,63 @@ use crate::{
 };
 
 const LOAD_SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(3);
+const PREFILL_PLACEMENT_TTL: Duration = Duration::from_secs(7200);
+const PREFILL_PLACEMENT_CAPACITY: usize = 4096;
+
+type PlacementKey = (u64, u64); // (pool fingerprint, prefix hash)
+
+#[derive(Debug)]
+struct PlacementEntry {
+    owner_url: String,
+    observed_at: Instant,
+    sequence: u64,
+}
+
+#[derive(Debug, Default)]
+struct PlacementBook {
+    entries: PlacementMap<PlacementKey, PlacementEntry>,
+    next_sequence: u64,
+}
+
+impl PlacementBook {
+    fn owner(&mut self, key: PlacementKey, now: Instant) -> Option<String> {
+        let entry = self.entries.get(&key)?;
+        if now.duration_since(entry.observed_at) >= PREFILL_PLACEMENT_TTL {
+            self.entries.remove(&key);
+            return None;
+        }
+        Some(entry.owner_url.clone())
+    }
+
+    fn record(&mut self, key: PlacementKey, owner_url: &str, now: Instant) {
+        // Keep a single map entry per prefix. At the hard cap, expire old
+        // observations and evict the oldest remaining one without a duplicate
+        // queue that can grow on repeated updates to a hot prefix.
+        if !self.entries.contains_key(&key) && self.entries.len() >= PREFILL_PLACEMENT_CAPACITY {
+            self.entries
+                .retain(|_, entry| now.duration_since(entry.observed_at) < PREFILL_PLACEMENT_TTL);
+            if self.entries.len() >= PREFILL_PLACEMENT_CAPACITY {
+                if let Some(oldest) = self
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.sequence)
+                    .map(|(key, _)| *key)
+                {
+                    self.entries.remove(&oldest);
+                }
+            }
+        }
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+        self.entries.insert(
+            key,
+            PlacementEntry {
+                owner_url: owner_url.to_owned(),
+                observed_at: now,
+                sequence: self.next_sequence,
+            },
+        );
+    }
+}
 
 /// Configuration for the PrefixHash load balancing policy
 #[derive(Debug, Clone)]
@@ -70,6 +132,7 @@ enum Branch {
     NoHealthyWorkers,
     NoTokens,
     RingHit,
+    ObservedPlacement,
     LoadBalanceWalk,
     FallbackLeastLoad,
 }
@@ -81,6 +144,7 @@ impl Branch {
             Self::NoHealthyWorkers => "no_healthy_workers",
             Self::NoTokens => "no_tokens",
             Self::RingHit => "ring_hit",
+            Self::ObservedPlacement => "observed_placement",
             Self::LoadBalanceWalk => "load_balance_walk",
             Self::FallbackLeastLoad => "fallback_least_load",
         }
@@ -100,6 +164,9 @@ pub struct PrefixHashPolicy {
     pd_prefill_affinity_slack: Option<usize>,
     pd_prefill_stage_reservation: bool,
     pd_prefill_work_tokens: Option<usize>,
+    /// Selection observations only; a dispatch can still be in flight or fail.
+    pd_prefill_placement: bool,
+    placement_book: Mutex<PlacementBook>,
 }
 
 impl PrefixHashPolicy {
@@ -120,6 +187,9 @@ impl PrefixHashPolicy {
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok())
                 .filter(|value| *value > 0),
+            pd_prefill_placement: std::env::var("SGLANG_GATEWAY_PD_PREFILL_PLACEMENT")
+                .is_ok_and(|value| value == "1"),
+            placement_book: Mutex::new(PlacementBook::default()),
         }
     }
 
@@ -289,6 +359,74 @@ impl PrefixHashPolicy {
             .is_some_and(|cap| Self::local_reservations(worker, info) >= cap)
     }
 
+    fn pool_fingerprint(workers: &[Arc<dyn Worker>]) -> u64 {
+        let mut members: Vec<_> = workers
+            .iter()
+            .map(|worker| (worker.url(), worker.model_id()))
+            .collect();
+        members.sort_unstable();
+        let mut hasher = DefaultHasher::new();
+        members.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Apply the same allowance used for a healthy ring owner.
+    fn affinity_allowed(
+        &self,
+        worker: &dyn Worker,
+        info: &SelectWorkerInfo<'_>,
+        worker_load: usize,
+        least_load: usize,
+        total_load: usize,
+        num_workers: usize,
+    ) -> bool {
+        if matches!(worker.worker_type(), WorkerType::Prefill { .. }) {
+            if let Some(slack) = self.pd_prefill_affinity_slack {
+                if worker_load <= least_load.saturating_add(slack) {
+                    return true;
+                }
+            }
+        }
+        if info.soft_cap.is_some() && worker_load <= least_load.saturating_add(1) {
+            return true;
+        }
+        self.load_ok(worker_load, total_load, num_workers)
+    }
+
+    fn observed_owner_allowed(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+        owner_url: &str,
+    ) -> Option<usize> {
+        let available: Vec<_> = workers
+            .iter()
+            .enumerate()
+            .filter(|(_, worker)| {
+                worker.is_available() && Self::under_soft_cap(worker.as_ref(), info)
+            })
+            .map(|(index, worker)| (index, worker, self.effective_load(worker.as_ref(), info)))
+            .collect();
+        let (index, worker, owner_load) = available
+            .iter()
+            .find(|(_, worker, _)| worker.url() == owner_url)?;
+        let total_load = available.iter().map(|(_, _, load)| load).sum();
+        let least_load = available
+            .iter()
+            .map(|(_, _, load)| *load)
+            .min()
+            .unwrap_or(*owner_load);
+        self.affinity_allowed(
+            worker.as_ref(),
+            info,
+            *owner_load,
+            least_load,
+            total_load,
+            available.len(),
+        )
+        .then_some(*index)
+    }
+
     /// Find worker using consistent hash ring with load balancing
     fn find_worker_with_load_balance(
         &self,
@@ -333,37 +471,19 @@ impl PrefixHashPolicy {
                 if let Some(&(idx, worker)) = healthy_url_map.get(initial_url) {
                     let worker_load = self.effective_load(worker.as_ref(), info);
 
-                    if matches!(worker.worker_type(), WorkerType::Prefill { .. }) {
-                        if let Some(slack) = self.pd_prefill_affinity_slack {
-                            let least_load = healthy_workers
-                                .iter()
-                                .map(|(_, w)| self.effective_load(w.as_ref(), info))
-                                .min()
-                                .unwrap_or(worker_load);
-                            if worker_load <= least_load.saturating_add(slack) {
-                                return (Some(idx), Branch::RingHit);
-                            }
-                        }
-                    }
-
-                    // With bounded affinity, keep the first two requests of a
-                    // hot prefix together unless the selected rank has more
-                    // than one unit of extra stage/capacity pressure. Once the
-                    // local cap is reached that rank is absent from the healthy
-                    // map and the ring walks to another DP rank.
-                    if info.soft_cap.is_some() {
-                        let least_load = healthy_workers
-                            .iter()
-                            .map(|(_, worker)| self.effective_load(worker.as_ref(), info))
-                            .min()
-                            .unwrap_or(worker_load);
-                        if worker_load <= least_load.saturating_add(1) {
-                            return (Some(idx), Branch::RingHit);
-                        }
-                    }
-
-                    // Check if initial worker has acceptable load
-                    if self.load_ok(worker_load, total_load, num_workers) {
+                    let least_load = healthy_workers
+                        .iter()
+                        .map(|(_, worker)| self.effective_load(worker.as_ref(), info))
+                        .min()
+                        .unwrap_or(worker_load);
+                    if self.affinity_allowed(
+                        worker.as_ref(),
+                        info,
+                        worker_load,
+                        least_load,
+                        total_load,
+                        num_workers,
+                    ) {
                         return (Some(idx), Branch::RingHit);
                     }
 
@@ -417,8 +537,49 @@ impl PrefixHashPolicy {
         // Compute prefix hash
         let prefix_hash = self.compute_prefix_hash(tokens);
 
-        // Find worker using ring with load balancing
-        self.find_worker_with_load_balance(workers, info, prefix_hash)
+        // Placement is opt-in for the P-only policy with stage-aware capacity.
+        // Never use a selection observation as evidence of a completed prefill.
+        if !(self.pd_prefill_placement
+            && self.pd_prefill_cache_capacity
+            && self.pd_prefill_stage_reservation
+            && workers
+                .iter()
+                .all(|worker| matches!(worker.worker_type(), WorkerType::Prefill { .. })))
+        {
+            return self.find_worker_with_load_balance(workers, info, prefix_hash);
+        }
+
+        let key = (Self::pool_fingerprint(workers), prefix_hash);
+        let owner = self
+            .placement_book
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .owner(key, Instant::now());
+        if let Some(owner_url) = owner {
+            if let Some(index) = self.observed_owner_allowed(workers, info, &owner_url) {
+                self.placement_book
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .record(key, workers[index].url(), Instant::now());
+                return (Some(index), Branch::ObservedPlacement);
+            }
+            self.placement_book
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entries
+                .remove(&key);
+        }
+
+        // An unknown or unusable owner follows the original selection path.
+        // Record the actual selected virtual URL, including a load fallback.
+        let (selection, branch) = self.find_worker_with_load_balance(workers, info, prefix_hash);
+        if let Some(index) = selection {
+            self.placement_book
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .record(key, workers[index].url(), Instant::now());
+        }
+        (selection, branch)
     }
 }
 
@@ -447,6 +608,38 @@ impl LoadBalancingPolicy for PrefixHashPolicy {
 mod tests {
     use super::*;
     use crate::core::{BasicWorkerBuilder, HashRing, WorkerType};
+
+    fn placement_policy() -> PrefixHashPolicy {
+        let mut policy = PrefixHashPolicy::with_defaults();
+        policy.pd_prefill_cache_capacity = true;
+        policy.pd_prefill_stage_reservation = true;
+        policy.pd_prefill_placement = true;
+        policy.pd_prefill_affinity_slack = Some(1);
+        policy
+    }
+
+    fn prefill_workers(urls: &[&str], model_id: &str) -> Vec<Arc<dyn Worker>> {
+        urls.iter()
+            .map(|url| {
+                Arc::new(
+                    BasicWorkerBuilder::new(*url)
+                        .worker_type(WorkerType::Prefill {
+                            bootstrap_port: Some(9000),
+                        })
+                        .label("model_id", model_id)
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect()
+    }
+
+    fn waiting_snapshot(count: usize) -> DPLoadSnapshot {
+        DPLoadSnapshot {
+            age_at_observation: Some(Duration::ZERO),
+            num_waiting_reqs: count,
+            ..Default::default()
+        }
+    }
 
     fn create_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
         urls.iter()
@@ -954,5 +1147,265 @@ mod tests {
     fn test_policy_name() {
         let policy = PrefixHashPolicy::with_defaults();
         assert_eq!(policy.name(), "prefix_hash");
+    }
+
+    #[test]
+    fn test_observed_fallback_is_reused_and_overload_refreshes_owner() {
+        let policy = placement_policy();
+        let workers = prefill_workers(&["http://p0:8000", "http://p1:8000"], "model-a");
+        let ring = Arc::new(HashRing::new(&workers));
+        let tokens = vec![17; 300];
+        let base = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            hash_ring: Some(ring.clone()),
+            ..Default::default()
+        };
+        let ring_owner = policy.select_worker_impl(&workers, &base).0.unwrap();
+        let fallback = 1 - ring_owner;
+        let key = (
+            PrefixHashPolicy::pool_fingerprint(&workers),
+            policy.compute_prefix_hash(&tokens),
+        );
+
+        let busy_ring =
+            PlacementMap::from([(workers[ring_owner].url().to_owned(), waiting_snapshot(6))]);
+        let busy_ring_info = SelectWorkerInfo {
+            load_snapshots: Some(&busy_ring),
+            ..base.clone()
+        };
+        assert_eq!(
+            policy.select_worker_impl(&workers, &busy_ring_info),
+            (Some(fallback), Branch::LoadBalanceWalk)
+        );
+        assert_eq!(
+            policy.select_worker_impl(&workers, &base),
+            (Some(fallback), Branch::ObservedPlacement)
+        );
+
+        let busy_fallback =
+            PlacementMap::from([(workers[fallback].url().to_owned(), waiting_snapshot(6))]);
+        let busy_fallback_info = SelectWorkerInfo {
+            load_snapshots: Some(&busy_fallback),
+            ..base.clone()
+        };
+        assert_eq!(
+            policy.select_worker_impl(&workers, &busy_fallback_info).0,
+            Some(ring_owner)
+        );
+        assert_eq!(
+            policy
+                .placement_book
+                .lock()
+                .unwrap()
+                .owner(key, Instant::now()),
+            Some(workers[ring_owner].url().to_owned())
+        );
+    }
+
+    #[test]
+    fn test_placement_opt_in_and_non_prefill_selection_are_unchanged() {
+        let workers = prefill_workers(&["http://p0:8000", "http://p1:8000"], "model-a");
+        let ring = Arc::new(HashRing::new(&workers));
+        let tokens = vec![18; 300];
+        let base = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            hash_ring: Some(ring.clone()),
+            ..Default::default()
+        };
+        for disabled_gate in 0..3 {
+            let mut policy = placement_policy();
+            match disabled_gate {
+                0 => policy.pd_prefill_placement = false,
+                1 => policy.pd_prefill_cache_capacity = false,
+                _ => policy.pd_prefill_stage_reservation = false,
+            }
+            let ring_owner = policy.select_worker_impl(&workers, &base).0.unwrap();
+            let busy =
+                PlacementMap::from([(workers[ring_owner].url().to_owned(), waiting_snapshot(6))]);
+            let busy_info = SelectWorkerInfo {
+                load_snapshots: Some(&busy),
+                ..base.clone()
+            };
+            assert_ne!(
+                policy.select_worker_impl(&workers, &busy_info).0,
+                Some(ring_owner)
+            );
+            assert_eq!(
+                policy.select_worker_impl(&workers, &base).0,
+                Some(ring_owner)
+            );
+            assert!(policy.placement_book.lock().unwrap().entries.is_empty());
+        }
+
+        for worker_type in [WorkerType::Decode, WorkerType::Regular] {
+            let policy = placement_policy();
+            let workers: Vec<Arc<dyn Worker>> = ["http://w0:8000", "http://w1:8000"]
+                .iter()
+                .map(|url| {
+                    Arc::new(
+                        BasicWorkerBuilder::new(*url)
+                            .worker_type(worker_type.clone())
+                            .build(),
+                    ) as Arc<dyn Worker>
+                })
+                .collect();
+            let info = SelectWorkerInfo {
+                tokens: Some(&tokens),
+                hash_ring: Some(Arc::new(HashRing::new(&workers))),
+                ..Default::default()
+            };
+            let ring_owner = policy.select_worker_impl(&workers, &info).0.unwrap();
+            let busy =
+                PlacementMap::from([(workers[ring_owner].url().to_owned(), waiting_snapshot(6))]);
+            let busy_info = SelectWorkerInfo {
+                load_snapshots: Some(&busy),
+                ..info.clone()
+            };
+            assert_ne!(
+                policy.select_worker_impl(&workers, &busy_info).0,
+                Some(ring_owner)
+            );
+            assert_eq!(
+                policy.select_worker_impl(&workers, &info).0,
+                Some(ring_owner)
+            );
+            assert!(policy.placement_book.lock().unwrap().entries.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_unavailable_or_capped_placement_owner_is_replaced() {
+        let policy = placement_policy();
+        let workers = prefill_workers(&["http://p0:8000", "http://p1:8000"], "model-a");
+        let tokens = vec![19; 300];
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            hash_ring: Some(Arc::new(HashRing::new(&workers))),
+            ..Default::default()
+        };
+        let ring_owner = policy.select_worker_impl(&workers, &info).0.unwrap();
+        let other = 1 - ring_owner;
+        let key = (
+            PrefixHashPolicy::pool_fingerprint(&workers),
+            policy.compute_prefix_hash(&tokens),
+        );
+        policy
+            .placement_book
+            .lock()
+            .unwrap()
+            .record(key, workers[other].url(), Instant::now());
+
+        workers[other].set_healthy(false);
+        assert_eq!(
+            policy.select_worker_impl(&workers, &info).0,
+            Some(ring_owner)
+        );
+        workers[other].set_healthy(true);
+        assert_eq!(
+            policy
+                .placement_book
+                .lock()
+                .unwrap()
+                .owner(key, Instant::now()),
+            Some(workers[ring_owner].url().to_owned())
+        );
+
+        policy
+            .placement_book
+            .lock()
+            .unwrap()
+            .record(key, workers[other].url(), Instant::now());
+        let reserved = PlacementMap::from([(workers[other].url().to_owned(), 2)]);
+        let capped_info = SelectWorkerInfo {
+            local_reservations: Some(&reserved),
+            soft_cap: Some(2),
+            ..info
+        };
+        assert_eq!(
+            policy.select_worker_impl(&workers, &capped_info).0,
+            Some(ring_owner)
+        );
+        assert_eq!(
+            policy
+                .placement_book
+                .lock()
+                .unwrap()
+                .owner(key, Instant::now()),
+            Some(workers[ring_owner].url().to_owned())
+        );
+    }
+
+    #[test]
+    fn test_placement_ttl_pool_namespace_and_hard_cap() {
+        let policy = placement_policy();
+        let workers = prefill_workers(&["http://p0:8000", "http://p1:8000"], "model-a");
+        let tokens = vec![20; 300];
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            hash_ring: Some(Arc::new(HashRing::new(&workers))),
+            ..Default::default()
+        };
+        let ring_owner = policy.select_worker_impl(&workers, &info).0.unwrap();
+        let key = (
+            PrefixHashPolicy::pool_fingerprint(&workers),
+            policy.compute_prefix_hash(&tokens),
+        );
+        {
+            let mut book = policy.placement_book.lock().unwrap();
+            let entry = book.entries.get_mut(&key).unwrap();
+            entry.owner_url = workers[1 - ring_owner].url().to_owned();
+            entry.observed_at = Instant::now() - PREFILL_PLACEMENT_TTL;
+        }
+        assert_eq!(
+            policy.select_worker_impl(&workers, &info),
+            (Some(ring_owner), Branch::RingHit)
+        );
+
+        let reversed = vec![workers[1].clone(), workers[0].clone()];
+        assert_eq!(
+            PrefixHashPolicy::pool_fingerprint(&workers),
+            PrefixHashPolicy::pool_fingerprint(&reversed)
+        );
+        let different_model = prefill_workers(&["http://p0:8000", "http://p1:8000"], "model-b");
+        let different_pool = prefill_workers(&["http://p0:8000", "http://p2:8000"], "model-a");
+        assert_ne!(key.0, PrefixHashPolicy::pool_fingerprint(&different_model));
+        assert_ne!(key.0, PrefixHashPolicy::pool_fingerprint(&different_pool));
+        policy.placement_book.lock().unwrap().record(
+            key,
+            workers[1 - ring_owner].url(),
+            Instant::now(),
+        );
+        for other_workers in [&different_model, &different_pool] {
+            let other_info = SelectWorkerInfo {
+                tokens: Some(&tokens),
+                hash_ring: Some(Arc::new(HashRing::new(other_workers))),
+                ..Default::default()
+            };
+            assert_eq!(
+                policy.select_worker_impl(other_workers, &other_info).1,
+                Branch::RingHit
+            );
+        }
+
+        let now = Instant::now();
+        let mut book = PlacementBook::default();
+        for prefix in 0..PREFILL_PLACEMENT_CAPACITY as u64 {
+            book.record((key.0, prefix), "http://p0:8000", now);
+        }
+        for _ in 0..1000 {
+            book.record((key.0, 0), "http://p1:8000", now);
+        }
+        assert_eq!(book.entries.len(), PREFILL_PLACEMENT_CAPACITY);
+        book.record(
+            (key.0, PREFILL_PLACEMENT_CAPACITY as u64),
+            "http://p0:8000",
+            now,
+        );
+        assert_eq!(book.entries.len(), PREFILL_PLACEMENT_CAPACITY);
+        assert!(!book.entries.contains_key(&(key.0, 1)));
+        assert_eq!(
+            book.owner((key.0, 0), now).as_deref(),
+            Some("http://p1:8000")
+        );
     }
 }
