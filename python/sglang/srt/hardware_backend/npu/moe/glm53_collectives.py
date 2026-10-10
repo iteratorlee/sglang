@@ -15,6 +15,34 @@ _last_dispatch_metadata = None
 _activation_logged = False
 
 
+def release_normal_hccl_cached_memory(x):
+    """Leave driver headroom for HCCL/CANN allocations outside torch's pool."""
+    reserve_mb = int(os.getenv("SGLANG_GLM53_NORMAL_MEMORY_HEADROOM_MB", "0"))
+    if reserve_mb < 0:
+        raise ValueError("SGLANG_GLM53_NORMAL_MEMORY_HEADROOM_MB must be non-negative")
+    if not reserve_mb or x.device.type != "npu":
+        return
+    device = x.device
+    free, _ = torch.npu.mem_get_info(device)
+    if free >= reserve_mb * 1024**2:
+        return
+    reserved = torch.npu.memory_reserved(device)
+    allocated = torch.npu.memory_allocated(device)
+    if reserved - allocated < 64 * 1024**2:
+        return
+    # The P profile is non-overlap/eager. Finish outstanding work before
+    # returning unused allocator blocks; live weights and KV are retained.
+    torch.npu.synchronize(device)
+    torch.npu.empty_cache()
+    free_after, _ = torch.npu.mem_get_info(device)
+    logger.warning(
+        "GLM normal HCCL cache release: free=%.1f->%.1f MiB "
+        "reserved=%.1f allocated=%.1f MiB headroom=%d MiB",
+        free / 1024**2, free_after / 1024**2,
+        reserved / 1024**2, allocated / 1024**2, reserve_mb,
+    )
+
+
 def normal_hccl_profile(args, limit):
     """Finite opt-in profiles; preserve the original TP16 deployment guard."""
     common = (
@@ -126,6 +154,7 @@ def collective_dispatch(group, x, ids, weights, num_experts=288):
     tokens, width = x.shape
     topk = ids.shape[1]
     if world == 8:
+        release_normal_hccl_cached_memory(x)
         _check_equal_dispatch_shapes(group, x, ids, weights, world)
 
     def gather(t):
