@@ -197,6 +197,37 @@ class NormalHcclCpuTests(unittest.TestCase):
                     layer, "w13"
                 )
 
+    def test_tp8_prefill_profile_keeps_decode_and_parallel_guards(self):
+        args = args_for_profile(enable_dp_attention=False, dp_size=1)
+        self.assertEqual(
+            self.collectives.normal_hccl_profile(args, 10), "prefill_tp8_ep8"
+        )
+        for changes in (
+            {"disaggregation_mode": "decode"}, {"disaggregation_mode": "null"},
+            {"dp_size": 4}, {"enable_dp_attention": True},
+            {"disable_overlap_schedule": False}, {"attn_cp_size": 2},
+            {"dcp_size": 2}, {"moe_dp_size": 2}, {"nnodes": 2},
+            {"enable_two_batch_overlap": True}, {"enable_eplb": True},
+        ):
+            with self.subTest(changes=changes):
+                value = vars(args).copy()
+                value.update(changes)
+                self.assertIsNone(
+                    self.collectives.normal_hccl_profile(SimpleNamespace(**value), 10)
+                )
+        with mock.patch.dict(sys.modules, self.modules), mock.patch.dict(
+            os.environ, {"SGLANG_GLM53_NORMAL_HCCL": "1"}
+        ):
+            self.args = args
+            layer = layer_weights()
+            method = self.clamped.NPUW8A8ClampedMoEMethod(10)
+            method.process_weights_after_loading(layer, "w13")
+            method.process_weights_after_loading(layer, "w2")
+            self.assertEqual(method._glm53_normal_hccl_profile, "prefill_tp8_ep8")
+            self.assertEqual(layer.w13_weight.dtype, torch.int8)
+            self.assertEqual(layer.w2_weight.dtype, torch.int8)
+            self.assertEqual(layer.dispatcher.config["dispatcher_output_dtype"], "int8")
+
     def test_target_and_draft_weights_remain_int8_with_fp32_scales(self):
         with (
             mock.patch.dict(sys.modules, self.modules),

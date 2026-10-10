@@ -60,20 +60,24 @@ def normal_hccl_profile(args, limit):
         return "tp16_ep16"
     if (
         args.tp_size == args.ep_size == 8
-        and args.enable_dp_attention
-        and args.dp_size == 4
         and args.attn_cp_size == args.dcp_size == 1
         and args.moe_dp_size == 1
         and not args.enable_prefill_cp
         and args.disaggregation_mode == "prefill"
         and args.disable_overlap_schedule
     ):
-        return "prefill_dp4_tp2_ep8"
+        if args.enable_dp_attention and args.dp_size == 4:
+            return "prefill_dp4_tp2_ep8"
+        if not args.enable_dp_attention and args.dp_size == 1:
+            # Single TP8 attention domain already gives equal local rows on
+            # every EP rank. The same checked INT8 gather/GMM/combine contract
+            # applies without the DP-specific MAX_LEN padding policy.
+            return "prefill_tp8_ep8"
     return None
 
 
 def _check_equal_dispatch_shapes(group, x, ids, weights, world):
-    # The opted-in P DP4/TP2 padding policy forces MAX_LEN for eager prefills.
+    # DP4/TP2 forces MAX_LEN padding; TP8 has equal rows within its TP domain.
     # Retain this check on every EP8 invocation before fixed-size payload
     # gathers to catch any downstream geometry or routing-contract violation.
     shape = torch.tensor(
