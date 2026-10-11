@@ -111,7 +111,7 @@ def register_glm53_kpool_state(model, token_pool, req_pool, *, parallel):
                 parallel.tp_size == 8
                 and (
                     attn_layout == (4, 2)
-                    or (attn_layout == (2, 4) and parallel.nnodes == 1)
+                    or (attn_layout in ((2, 4), (8, 1)) and parallel.nnodes == 1)
                 )
             )
         )
@@ -124,7 +124,7 @@ def register_glm53_kpool_state(model, token_pool, req_pool, *, parallel):
         raise ValueError(
             "GLM53 NPU PD state requires PP1/CP1 and TP=EP=16 with "
             "attention TP16, DP16/TP1, DP8/TP2, DP4/TP4, or DP2/TP8; "
-            "or TP=EP=8 with attention TP8, DP4/TP2, or DP2/TP4"
+            "or TP=EP=8 with attention TP8, DP4/TP2, DP2/TP4, or DP8/TP1"
         )
     pool = getattr(token_pool, "full_kv_pool", token_pool)
     if not isinstance(pool, NPUMLATokenToKVPool):

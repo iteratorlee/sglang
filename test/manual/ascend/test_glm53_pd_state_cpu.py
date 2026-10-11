@@ -195,6 +195,16 @@ UTILS.update(
     deque=deque,
 )
 
+# The real transfer functions now route through optional telemetry. Load that
+# stdlib-only adapter as well; CPU byte-copy tests keep telemetry disabled.
+telemetry_spec = importlib.util.spec_from_file_location(
+    "glm53_transfer_telemetry_under_test",
+    SRT / "disaggregation/mooncake/transfer_telemetry.py",
+)
+telemetry = importlib.util.module_from_spec(telemetry_spec)
+telemetry_spec.loader.exec_module(telemetry)
+UTILS["typed_transfer"] = telemetry.typed_transfer
+
 @dataclass(frozen=True)
 class MambaState:
     conv: list
@@ -401,8 +411,10 @@ class TestGlm53PDState(unittest.TestCase):
                 pd_state.register_glm53_kpool_state(m, pool, requests, parallel=parallel)
                 self.assertEqual(ptrs, pool.get_compress_tail_buf_infos()[0])
 
-    def test_910b_tp8_dp4tp2_and_dp2tp4_preserve_request_state(self):
-        for dp, attn_tp, enabled in ((1, 8, False), (4, 2, True), (2, 4, True)):
+    def test_910b_tp8_dp4tp2_dp2tp4_and_dp8tp1_preserve_request_state(self):
+        for dp, attn_tp, enabled in (
+            (1, 8, False), (4, 2, True), (2, 4, True), (8, 1, True)
+        ):
             with self.subTest(dp=dp, attn_tp=attn_tp):
                 parallel = types.SimpleNamespace(**(vars(PARALLEL) | dict(
                     tp_size=8, moe_ep_size=8, enable_dp_attention=enabled,
@@ -705,6 +717,36 @@ class TestGlm53PDState(unittest.TestCase):
             self.assertTrue((dest.array[:7] == 7).all())
             self.assertTrue((dest.array[8:] == 7).all())
 
+    def test_910b_tp8_to_tp1_rank_mapping_and_transfer_ownership(self):
+        rank_mapping = source_functions(
+            SRT / "disaggregation/common/conn.py", ["_resolve_rank_mapping"], {},
+            "CommonKVManager",
+        )["_resolve_rank_mapping"]
+        skip_policy = source_functions(
+            SRT / "disaggregation/mooncake/conn.py",
+            ["_get_dsa_cache_transfer_skip_flags"], {}, "MooncakeKVManager",
+        )["_get_dsa_cache_transfer_skip_flags"]
+        manager = types.SimpleNamespace(
+            attn_tp_size=1, kv_args=types.SimpleNamespace(engine_rank=0),
+            is_mla_backend=False, is_hybrid_mla_backend=True,
+            attn_cp_size=1, attn_cp_rank=0, pp_size=1, pp_rank=0,
+        )
+        info = types.SimpleNamespace(attn_tp_size=8, attn_cp_size=1, pp_size=1)
+        rank_mapping(manager, info)
+        self.assertEqual(info.target_tp_ranks, list(range(8)))
+        self.assertEqual(info.required_prefill_response_num, 8)
+        self.assertEqual(info.required_dst_info_num, 1)
+        for p_rank in range(8):
+            sender = types.SimpleNamespace(
+                attn_tp_size=8, kv_args=types.SimpleNamespace(engine_rank=p_rank),
+                is_mla_backend=False, is_hybrid_mla_backend=True,
+                _should_skip_cp_replicated_state_transfer=lambda: False,
+            )
+            self.assertEqual(
+                skip_policy(sender, types.SimpleNamespace(dst_attn_tp_size=1)),
+                (p_rank != 0, False),
+            )
+
     def test_910b_tp4_to_tp2_target_and_draft_kpool_tail(self):
         p_parallel = types.SimpleNamespace(**(vars(PARALLEL) | dict(
             tp_size=8, moe_ep_size=8, enable_dp_attention=True,
@@ -859,6 +901,8 @@ class TestGlm53PDState(unittest.TestCase):
              "dp_size": 4, "attn_dp_size": 4, "attn_tp_size": 4},
             {"tp_size": 8, "moe_ep_size": 8, "enable_dp_attention": True,
              "dp_size": 2, "attn_dp_size": 2, "attn_tp_size": 4, "nnodes": 2},
+            {"tp_size": 8, "moe_ep_size": 8, "enable_dp_attention": True,
+             "dp_size": 8, "attn_dp_size": 8, "attn_tp_size": 1, "nnodes": 2},
             {"pp_size": 2},
             {"attn_cp_size": 2},
             {"enable_dp_attention": True},
@@ -957,13 +1001,14 @@ class TestGlm53PDState(unittest.TestCase):
             self.assertFalse(d.mamba_cache.temporal.array[:, :7].any())
             self.assertFalse(d.mamba_cache.temporal.array[:, 8:].any())
 
-    def test_910b_tp4_to_tp2_mamba_conv_and_temporal_bytes(self):
-        # Each D TP rank receives two TP-sharded P states from its selected P
-        # DP domain. Conv has a row before its channel axis; temporal does not.
-        for d_tp_rank in (0, 1):
-            with self.subTest(d_tp_rank=d_tp_rank):
+    def test_910b_tp4_to_tp2_and_tp8_to_tp1_mamba_state_bytes(self):
+        # Conv has a row before its channel axis; temporal does not. A TP1 D
+        # must combine all eight P shards without overwriting neighboring rows.
+        for p_tp, d_tp, d_tp_rank in ((4, 2, 0), (4, 2, 1), (8, 1, 0)):
+            with self.subTest(p_tp=p_tp, d_tp=d_tp, d_tp_rank=d_tp_rank):
+                writers = p_tp // d_tp
                 dest = MambaPool(
-                    9, 6, True, conv_channels=12, temporal_heads=4
+                    9, 6, True, conv_channels=6 * writers, temporal_heads=2 * writers
                 )
                 src_states = []
 
@@ -972,8 +1017,8 @@ class TestGlm53PDState(unittest.TestCase):
                         ctypes.memmove(target, source, size)
                     return 0
 
-                for writer in (0, 1):
-                    p_tp_rank = d_tp_rank * 2 + writer
+                for writer in range(writers):
+                    p_tp_rank = d_tp_rank * writers + writer
                     source = MambaPool(5, 3, False)
                     pd_state.prepare_glm53_pd_mamba_state(
                         types.SimpleNamespace(mamba_pool=source),
@@ -993,7 +1038,7 @@ class TestGlm53PDState(unittest.TestCase):
                     dst_ptrs, _, dst_lens = dest.get_contiguous_buf_infos()
                     sender = types.SimpleNamespace(
                         kv_args=types.SimpleNamespace(engine_rank=p_tp_rank),
-                        attn_tp_size=4, pp_size=1,
+                        attn_tp_size=p_tp, pp_size=1,
                         _transfer_data=copy_blocks,
                     )
                     self.assertEqual(
@@ -1003,7 +1048,7 @@ class TestGlm53PDState(unittest.TestCase):
                             source.get_state_dim_per_tensor(),
                             dst_ptrs, [7], dst_lens,
                             dest.get_state_dim_per_tensor(),
-                            d_tp_rank, 2, None,
+                            d_tp_rank, d_tp, None,
                             source.get_state_slice_outer_counts(),
                             source.get_state_layer_ids(),
                             dest.get_state_layer_ids(),
