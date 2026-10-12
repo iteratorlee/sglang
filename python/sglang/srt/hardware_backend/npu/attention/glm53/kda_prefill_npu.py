@@ -49,27 +49,32 @@ def _prepare_inputs(
     lower_bound,
     H: tl.constexpr,
     D: tl.constexpr,
+    N_ROWS: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    head = row % H
-    cols = tl.arange(0, D)
-    q = tl.load(Q + row * D + cols).to(tl.float32)
-    k = tl.load(K + row * D + cols).to(tl.float32)
-    a = tl.load(A + row * D + cols).to(tl.float32)
-    b = tl.load(B + row).to(tl.float32)
-    alog = tl.load(ALOG + head).to(tl.float32)
-    bias = tl.load(BIAS + head * D + cols).to(tl.float32)
-    decay = tl.exp(alog)
-    x = a + bias
-    gate = lower_bound / (1.0 + tl.exp(-(decay * x)))
-    beta = 1.0 / (1.0 + tl.exp(-b))
-    q = q / tl.sqrt(tl.sum(q * q) + 1e-6)
-    k = k / tl.sqrt(tl.sum(k * k) + 1e-6)
-    q *= scale
-    tl.store(QN + row * D + cols, q)
-    tl.store(KN + row * D + cols, k)
-    tl.store(GDECAY + row * D + cols, tl.exp(gate))
-    tl.store(BETA + row, beta)
+    # Ascend rejects launch grids above65535 programs (H8/T8192 is65536).
+    # Rows are independent; keep each row's FP32 expressions and reductions.
+    for iteration in range(tl.cdiv(N_ROWS, 32768)):
+        row = tl.program_id(0) + iteration * tl.num_programs(0)
+        if row < N_ROWS:
+            head = row % H
+            cols = tl.arange(0, D)
+            q = tl.load(Q + row * D + cols).to(tl.float32)
+            k = tl.load(K + row * D + cols).to(tl.float32)
+            a = tl.load(A + row * D + cols).to(tl.float32)
+            b = tl.load(B + row).to(tl.float32)
+            alog = tl.load(ALOG + head).to(tl.float32)
+            bias = tl.load(BIAS + head * D + cols).to(tl.float32)
+            decay = tl.exp(alog)
+            x = a + bias
+            gate = lower_bound / (1.0 + tl.exp(-(decay * x)))
+            beta = 1.0 / (1.0 + tl.exp(-b))
+            q = q / tl.sqrt(tl.sum(q * q) + 1e-6)
+            k = k / tl.sqrt(tl.sum(k * k) + 1e-6)
+            q *= scale
+            tl.store(QN + row * D + cols, q)
+            tl.store(KN + row * D + cols, k)
+            tl.store(GDECAY + row * D + cols, tl.exp(gate))
+            tl.store(BETA + row, beta)
 
 
 @triton.jit
@@ -208,7 +213,8 @@ def run_prepared_prefill(
     normalized_k = torch.empty_like(normalized_q)
     gate_decay = torch.empty_like(normalized_q)
     beta = torch.empty(b.shape, dtype=torch.float32, device=b.device)
-    _prepare_inputs[(q.shape[1] * heads,)](
+    rows = q.shape[1] * heads
+    _prepare_inputs[(min(rows, 32768),)](
         q,
         k,
         a,
@@ -223,6 +229,7 @@ def run_prepared_prefill(
         lower_bound,
         heads,
         128,
+        rows,
         num_warps=1,
         num_stages=3,
         multibuffer=False,
