@@ -151,25 +151,27 @@ class PreparedAscendCDispatchCPU(unittest.TestCase):
             [grid for grid, _, _ in self.legacy.calls], [(2, 1, 4), (2, 1, 4)]
         )  # H8 split, BV64
 
-    def test_original_h4_only_binary_is_rejected(self):
+    def test_older_binary_without_v2_is_rejected(self):
         tensors = self.inputs(heads=4)
         old_op = Mock()
+        v1_op = Mock()
         self.torch.ops.sgl_glm53_ascend = types.SimpleNamespace(
-            prepared_recurrent=old_op
+            prepared_recurrent=old_op, prepared_recurrent_v1=v1_op
         )
         with patch.dict(
             sys.modules,
             {"sgl_glm53_ascend_ops": types.ModuleType("sgl_glm53_ascend_ops")},
         ):
-            with self.assertRaisesRegex(RuntimeError, "prepared_recurrent_v1"):
+            with self.assertRaisesRegex(RuntimeError, "prepared_recurrent_v2"):
                 self.invoke(tensors, {"SGLANG_GLM53_KDA_PREPARED_ASCENDC": "1"})
         old_op.assert_not_called()
+        v1_op.assert_not_called()
         self.assertFalse(self.legacy.calls)
 
     def test_valid_layout_calls_versioned_op_with_original_arguments(self):
         versioned = Mock()
         self.torch.ops.sgl_glm53_ascend = types.SimpleNamespace(
-            prepared_recurrent=Mock(), prepared_recurrent_v1=versioned
+            prepared_recurrent=Mock(), prepared_recurrent_v2=versioned
         )
         with patch.dict(
             sys.modules,

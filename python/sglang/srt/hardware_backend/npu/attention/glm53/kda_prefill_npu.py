@@ -24,11 +24,11 @@ def _ascendc_prepared_operator():
         import sgl_glm53_ascend_ops  # noqa: F401; registers the compiled ops
         import torch
 
-        return torch.ops.sgl_glm53_ascend.prepared_recurrent_v1
+        return torch.ops.sgl_glm53_ascend.prepared_recurrent_v2
     except (ImportError, OSError, AttributeError) as exc:
         raise RuntimeError(
-            "SGLANG_GLM53_KDA_PREPARED_ASCENDC=1 requires the prepared_recurrent_v1 "
-            "AscendC library with H4/H8 and native FP32-state layout support; "
+            "SGLANG_GLM53_KDA_PREPARED_ASCENDC=1 requires the prepared_recurrent_v2 "
+            "AscendC library with grouped H4/H8 and native FP32-state layout support; "
             "the original fixed-H4 binary is not compatible"
         ) from exc
 
@@ -239,7 +239,7 @@ def run_prepared_prefill(
         if not _ascendc_logged:
             _ascendc_logged = True
             logger.info(
-                "GLM53 AscendC prepared_recurrent_v1 active: H=%s T=%s "
+                "GLM53 AscendC prepared_recurrent_v2 active: H=%s T=%s "
                 "state_shape=%s state_stride=%s indices_dtype=%s tracking=%s",
                 heads, q.shape[1], tuple(state.shape), tuple(state.stride()),
                 indices.dtype, track_indices is not None,
