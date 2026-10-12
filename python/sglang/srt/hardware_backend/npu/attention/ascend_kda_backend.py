@@ -1,4 +1,5 @@
 import math
+import os
 from typing import Optional
 
 import torch
@@ -23,6 +24,7 @@ from sglang.srt.layers.attention.linear.kda_backend import (
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.runtime_context import get_server_args, get_spec
 
 _LOG2_E = math.log2(math.e)
 
@@ -150,6 +152,31 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             )
         )
         self.kernel_dispatcher.extend_kernel = _AscendKDAExtendKernel()
+        # Dense verify widths are constants, unlike the live accepted prefix.
+        # Sharing these read-only views removes two graph tasks per KDA layer.
+        self._glm53_verify_const_steps = 0
+        self._glm53_verify_full_steps = None
+        self._glm53_verify_dense_starts = None
+        if (
+            self.glm_bounded_recurrence
+            and get_server_args().disaggregation_mode == "decode"
+            and os.getenv("SGLANG_GLM53_VERIFY_CONST_META", "0") == "1"
+        ):
+            steps = get_spec().speculative_num_draft_tokens or 0
+            if steps > 0:
+                indices = self.verify_intermediate_state_indices
+                capacity = indices.numel()
+                self._glm53_verify_const_steps = steps
+                self._glm53_verify_full_steps = torch.full(
+                    (capacity,), steps, dtype=torch.int32, device=indices.device
+                )
+                self._glm53_verify_dense_starts = torch.arange(
+                    0,
+                    capacity * steps + 1,
+                    steps,
+                    dtype=torch.int32,
+                    device=indices.device,
+                )
 
     def _glm_recurrent(
         self,
@@ -496,19 +523,28 @@ class AscendKDAAttnBackend(KDAAttnBackend):
 
         intermediate_indices = self.verify_intermediate_state_indices[:batch_size]
         conv_states = cache.conv[0]
-        num_accepted_tokens = torch.full(
-            (batch_size,),
-            draft_token_num,
-            dtype=torch.int32,
-            device=mixed_qkv.device,
-        )
-        dense_query_start_loc = torch.arange(
-            0,
-            num_dense_tokens + 1,
-            step=draft_token_num,
-            dtype=torch.int32,
-            device=mixed_qkv.device,
-        )
+        if (
+            self._glm53_verify_full_steps is not None
+            and draft_token_num == self._glm53_verify_const_steps
+            and batch_size <= self._glm53_verify_full_steps.numel()
+            and mixed_qkv.device == self._glm53_verify_full_steps.device
+        ):
+            num_accepted_tokens = self._glm53_verify_full_steps[:batch_size]
+            dense_query_start_loc = self._glm53_verify_dense_starts[: batch_size + 1]
+        else:
+            num_accepted_tokens = torch.full(
+                (batch_size,),
+                draft_token_num,
+                dtype=torch.int32,
+                device=mixed_qkv.device,
+            )
+            dense_query_start_loc = torch.arange(
+                0,
+                num_dense_tokens + 1,
+                draft_token_num,
+                dtype=torch.int32,
+                device=mixed_qkv.device,
+            )
         processed_qkv = torch.ops.npu.causal_conv1d(
             dense_qkv.reshape(num_dense_tokens, -1).contiguous(),
             self._get_conv_weights_t(layer, mixed_qkv.dtype),
