@@ -2,6 +2,7 @@ import functools
 import importlib
 import logging
 import math
+import os
 import threading
 from typing import Tuple
 
@@ -1951,6 +1952,48 @@ def hc_pre(
     )
 
 
+_large_prefill_hc_post_logged = False
+
+
+def _use_large_prefill_hc_post(x, residual, h_post, h_res, hc_mult):
+    """Opt-in GLM P post mixing only; keep the existing <=4096 path intact."""
+    if os.environ.get("SGLANG_GLM53_PREFILL_MHC_POST", "0") != "1":
+        return False
+    if (
+        x.device.type != "npu"
+        or x.dtype != torch.bfloat16
+        or x.ndim != 2
+        or hc_mult != 4
+        or x.shape[1] != 4096
+        or not 4096 < x.shape[0] <= 16384
+    ):
+        return False
+    tokens = x.shape[0]
+    if (
+        residual.device != x.device
+        or h_post.device != x.device
+        or h_res.device != x.device
+        or residual.dtype != torch.bfloat16
+        or h_post.dtype != torch.float32
+        or h_res.dtype != torch.float32
+        or tuple(residual.shape) not in ((tokens, 16384), (tokens, 4, 4096))
+        or tuple(h_post.shape) not in ((tokens, 4), (tokens, 4, 1))
+        or tuple(h_res.shape) not in ((tokens, 16), (tokens, 4, 4))
+        or not all(t.is_contiguous() for t in (x, residual, h_post, h_res))
+    ):
+        return False
+    from sglang.srt.runtime_context import get_server_args
+
+    if get_server_args().disaggregation_mode != "prefill":
+        return False
+    # Logical contiguity does not establish the raw-pointer ND contract.
+    try:
+        import torch_npu
+    except ImportError:
+        return False
+    return all(torch_npu.get_npu_format(t) == 2 for t in (x, residual, h_post, h_res))
+
+
 def hc_post(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -1968,6 +2011,20 @@ def hc_post(
         from sglang.kernels.ops.layernorm.mhc_npu import hc_post as ascend_hc_post
 
         return ascend_hc_post(x, residual, h_post, h_res, hc_mult)
+    if _use_large_prefill_hc_post(x, residual, h_post, h_res, hc_mult):
+        from sglang.kernels.ops.layernorm.mhc_prefill_npu import hc_post_large_prefill
+
+        out = hc_post_large_prefill(x, residual, h_post, h_res, hc_mult)
+        global _large_prefill_hc_post_logged
+        if not _large_prefill_hc_post_logged:
+            logger.info(
+                "GLM53 prefill mHC post selected: SGLANG_GLM53_PREFILL_MHC_POST=1 "
+                "T=%d H=4096 hc_mult=4 physical_format=ND(2) "
+                "x/residual=BF16 post/comb=FP32 mode=prefill kernel=sequential_large",
+                x.shape[0],
+            )
+            _large_prefill_hc_post_logged = True
+        return out
     s, hidden_size = x.shape
     if s == 0:
         return x.new_zeros((s, hc_mult * hidden_size))
