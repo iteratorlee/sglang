@@ -23,6 +23,9 @@ sys.modules[SPEC.name] = HARNESS
 SPEC.loader.exec_module(HARNESS)
 
 SCORER = HARNESS.actual_function("_prefill_pooled_topk")
+SCORER.__globals__["_prefill_pooled_postop_min_keys"] = HARNESS.actual_function(
+    "_prefill_pooled_postop_min_keys"
+)
 CLAIM = HARNESS.actual_function("_claim_prefill_score_validation")
 VALIDATE = HARNESS.actual_function("_validate_prefill_score_tile")
 

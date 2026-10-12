@@ -27,6 +27,7 @@ if is_npu():
 
 logger = logging.getLogger(__name__)
 _reported_prefill_pooled_score = False
+_reported_prefill_pooled_postop = False
 _prefill_score_validation_claimed = False
 _prefill_score_validation_lock = threading.Lock()
 _PREFILL_SCORE_VALIDATE_MIN_KEYS = 16384
@@ -53,6 +54,41 @@ def _prefill_pooled_score_backend():
     from .pooled_score_prefill_npu import fused_pooled_scores, supported
 
     return fused_pooled_scores, supported
+
+
+def _prefill_pooled_postop_min_keys(device: torch.device, legacy_tile_rows: int):
+    """Opt-in P pointwise fusion; thresholds affect performance, never scores."""
+    setting = os.environ.get("SGLANG_GLM53_PREFILL_POOLED_POSTOP", "0").strip().lower()
+    if setting in ("0", "off", "false", ""):
+        return None
+    if setting not in ("1", "auto"):
+        raise ValueError("SGLANG_GLM53_PREFILL_POOLED_POSTOP must be 0 or auto")
+    if device.type != "npu" or get_server_args().disaggregation_mode != "prefill":
+        return None
+    return {32: 32768, 8: 98304}.get(legacy_tile_rows)
+
+
+def _prefill_pooled_postop_backend():
+    from .pooled_score_postop_npu import relu_gate_
+
+    return relu_gate_
+
+
+def _log_prefill_pooled_postop_once(scores, weights, tile_rows):
+    global _reported_prefill_pooled_postop
+    if _reported_prefill_pooled_postop:
+        return
+    _reported_prefill_pooled_postop = True
+    logger.info(
+        "GLM53 P prefill pooled postop active: scores_dtype=%s scores_shape=%s "
+        "weights_dtype=%s weights_shape=%s legacy_tile_rows=%s block=8192 "
+        "physical_format=2 native_matmul=true native_head_sum=true",
+        scores.dtype,
+        tuple(scores.shape),
+        weights.dtype,
+        tuple(weights.shape),
+        tile_rows,
+    )
 
 
 def _log_prefill_pooled_score_once(q, weights, keys, tile_rows):
@@ -600,6 +636,11 @@ class AscendIndexerKPoolMixin:
         if fused_scores:
             fused_pooled_scores, supported = _prefill_pooled_score_backend()
             fused_scores = supported(q, weights, compressed_by_request)
+        postop_min_keys = _prefill_pooled_postop_min_keys(q.device, legacy_tile_rows)
+        if postop_min_keys is not None:
+            if fused_scores:
+                raise ValueError("Pooled postop requires SGLANG_GLM53_PREFILL_POOLED_SCORE=0")
+            relu_gate = _prefill_pooled_postop_backend()
         validate_setting = (
             os.environ.get("SGLANG_GLM53_PREFILL_SCORE_VALIDATE", "0").strip().lower()
             if fused_scores
@@ -690,8 +731,17 @@ class AscendIndexerKPoolMixin:
                         )
                         # Preserve the original BF16 rounding after the dot,
                         # in-place weighted product, and head reduction.
-                        logits.relu_()
-                        logits.mul_(w_req[start:end].unsqueeze(-1))
+                        if postop_min_keys is not None and candidate_count >= postop_min_keys:
+                            # The helper owns its native fallback. False only
+                            # means no fused launch; never apply the gate twice.
+                            active = relu_gate(logits, w_req[start:end])
+                            if active:
+                                _log_prefill_pooled_postop_once(
+                                    logits, w_req[start:end], legacy_tile_rows
+                                )
+                        else:
+                            logits.relu_()
+                            logits.mul_(w_req[start:end].unsqueeze(-1))
                         logits = logits.sum(1)
                     logical_pos = first_pos + torch.arange(
                         start, end, device=q.device, dtype=torch.long

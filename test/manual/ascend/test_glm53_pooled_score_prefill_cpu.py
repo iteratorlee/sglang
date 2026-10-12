@@ -49,6 +49,9 @@ def actual_function(name, source=SOURCE):
 TILE_ROWS = actual_function("_prefill_topk_tile_rows")
 GUARD = actual_function("_prefill_pooled_score_enabled")
 SCORER = actual_function("_prefill_pooled_topk")
+SCORER.__globals__["_prefill_pooled_postop_min_keys"] = actual_function(
+    "_prefill_pooled_postop_min_keys"
+)
 SCORER.__globals__["_prefill_topk_tile_rows"] = TILE_ROWS
 SCORER.__globals__["_prefill_pooled_score_enabled"] = GUARD
 SUPPORTED = actual_function("supported", KERNEL_SOURCE)
