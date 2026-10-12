@@ -6,10 +6,31 @@ Only the state update remains serial. The caller preserves the original path
 for decode, speculative state snapshots and other shapes.
 """
 
+import functools
+import logging
 import os
 
 import triton
 import triton.language as tl
+
+logger = logging.getLogger(__name__)
+_ascendc_logged = False
+
+
+@functools.lru_cache(maxsize=1)
+def _ascendc_prepared_operator():
+    """Require the explicit H4/H8/state-layout ABI, never the H4-only op."""
+    try:
+        import sgl_glm53_ascend_ops  # noqa: F401; registers the compiled ops
+        import torch
+
+        return torch.ops.sgl_glm53_ascend.prepared_recurrent_v1
+    except (ImportError, OSError, AttributeError) as exc:
+        raise RuntimeError(
+            "SGLANG_GLM53_KDA_PREPARED_ASCENDC=1 requires the prepared_recurrent_v1 "
+            "AscendC library with H4/H8 and native FP32-state layout support; "
+            "the original fixed-H4 binary is not compatible"
+        ) from exc
 
 
 @triton.jit
@@ -206,6 +227,24 @@ def run_prepared_prefill(
         num_stages=3,
         multibuffer=False,
     )
+    if (
+        os.getenv("SGLANG_GLM53_KDA_PREPARED_ASCENDC", "0") == "1"
+        and _bv16_b1_layout_ok(q, k, v, a, b, output, state, indices, starts,
+                              track_indices, track_lens)
+    ):
+        op = _ascendc_prepared_operator()
+        op(normalized_q, normalized_k, v, gate_decay, beta, output, state,
+           indices, starts, track_indices, track_lens, track_indices is not None)
+        global _ascendc_logged
+        if not _ascendc_logged:
+            _ascendc_logged = True
+            logger.info(
+                "GLM53 AscendC prepared_recurrent_v1 active: H=%s T=%s "
+                "state_shape=%s state_stride=%s indices_dtype=%s tracking=%s",
+                heads, q.shape[1], tuple(state.shape), tuple(state.stride()),
+                indices.dtype, track_indices is not None,
+            )
+        return output
     # BV32 exposes16 independent value/head programs instead of8. Keep the
     # original arithmetic and FP32 state; smaller tiles failed packed oracles.
     value_tile = 32 if os.getenv("SGLANG_GLM53_KDA_PREFILL_BV32", "0") == "1" else 64
