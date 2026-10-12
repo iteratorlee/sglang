@@ -917,12 +917,14 @@ class AscendIndexerKPoolMixin:
         block_tables,
         layer_id,
     ):
-        # Accepted tokens are packed by request; rejected draft slots must not
-        # write persistent tails. Device lengths change on each graph replay.
+        # Rows keep the fixed draft window per request, including rejected
+        # slots. Only num_accept_tokens controls which rows may update tails;
+        # the graph runner updates this device tensor on every replay.
         bs = forward_batch.batch_size
         steps = self._glm53_draft_graph_steps
         lens = forward_batch.extend_seq_lens[:bs]
         starts = lens.cumsum(0) - lens
+        accepted_lens = forward_batch.spec_info.num_accept_tokens[:bs]
         raw_req = forward_batch.req_pool_indices[:bs]
         metadata = _get_full_attn_metadata(forward_batch)
         metadata.actual_seq_lengths_q = lens.cumsum(0).int()
@@ -932,7 +934,8 @@ class AscendIndexerKPoolMixin:
             device=q.device,
         )
         for step in range(steps):
-            valid = (raw_req > 0) & (step < lens)
+            # req slot 0 is graph padding, even when its accept count is full.
+            valid = (raw_req > 0) & (step < lens) & (step < accepted_lens)
             rows = (starts + step).clamp(max=q.shape[0] - 1).long()
             step_batch = copy(forward_batch)
             step_batch.req_pool_indices = torch.where(valid, raw_req, 0)
@@ -1002,8 +1005,8 @@ class AscendIndexerKPoolMixin:
             forward_batch.forward_mode.is_draft_extend_v2()
             and hasattr(self, "_glm53_draft_graph_steps")
         ):
-            # Draft extend packs up to four accepted tokens per request. The
-            # one-token decode path cannot use that layout, even in eager mode.
+            # Draft extend keeps a full window per request and masks rejected
+            # slots. The one-token decode path cannot use that row layout.
             indices = self._draft_extend_topk(
                 q,
                 key,
