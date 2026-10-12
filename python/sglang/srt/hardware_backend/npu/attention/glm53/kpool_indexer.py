@@ -19,6 +19,7 @@ from sglang.srt.runtime_context import get_device, get_server_args, get_spec
 from sglang.srt.utils import is_npu
 
 from .graph_ops import scatter_rows_
+from .kpool_tail_scatter_npu import scatter_kpool_tail_
 
 if is_npu():
     import torch_npu
@@ -302,6 +303,11 @@ class AscendIndexerKPoolMixin:
     """NPU execution for the native KPool model parameters."""
 
     def _init_ascend_kpool(self):
+        # Opt in only on D: P keeps its existing prepared/prefill behavior.
+        self._fuse_kpool_tail_scatter = (
+            get_server_args().disaggregation_mode == "decode"
+            and os.getenv("SGLANG_GLM53_FUSED_KPOOL_TAIL_SCATTER", "0") == "1"
+        )
         max_reqs = getattr(get_server_args(), "max_running_requests", None) or 2048
         # ReqToTokenPool reserves row 0 for graph padding and allocates real
         # requests in [1, max_reqs].  Mirror its +1 layout here.
@@ -804,8 +810,13 @@ class AscendIndexerKPoolMixin:
         # IndexPutV2 and npu_scatter_nd_update_ can capture the first decode
         # step's indices on this CANN version.  Read request/slot from device
         # memory in Triton so every graph replay updates the current tail.
-        scatter_rows_(self._kpool_tail_k, tail_rows, key)
-        scatter_rows_(self._kpool_tail_score, tail_rows, gate_score)
+        if self._fuse_kpool_tail_scatter:
+            scatter_kpool_tail_(
+                self._kpool_tail_k, self._kpool_tail_score, tail_rows, key, gate_score
+            )
+        else:
+            scatter_rows_(self._kpool_tail_k, tail_rows, key)
+            scatter_rows_(self._kpool_tail_score, tail_rows, gate_score)
 
         compressed = self._compress(
             self._kpool_tail_k[req], self._kpool_tail_score[req]
