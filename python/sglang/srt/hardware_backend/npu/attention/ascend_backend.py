@@ -845,13 +845,37 @@ class AscendAttnBackend(AttentionBackend):
             )
             metadata.swa_mask[:bs, 0, :].copy_(mask)
             metadata.swa_mask[bs:, :, :].fill_(True)
-        metadata.block_tables[:bs, :max_seq_pages].copy_(
-            self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
-            // self.page_size
-        )
+        block_tables_updated = False
+        if (
+            get_bool_env_var("SGLANG_GLM53_FUSED_BLOCK_TABLE_UPDATE", "0")
+            and self.use_mla
+            and self.qk_rope_head_dim == 0
+            and not self.is_hybrid_swa
+        ):
+            from sglang.srt.runtime_context import get_disagg
 
-        metadata.block_tables[:bs, max_seq_pages:].fill_(0)
-        metadata.block_tables[bs:, :].fill_(0)
+            if get_disagg().disaggregation_mode == "decode":
+                from sglang.srt.hardware_backend.npu.attention.glm53.block_table_update_npu import (
+                    try_update_block_table_,
+                )
+
+                block_tables_updated = try_update_block_table_(
+                    self.req_to_token,
+                    req_pool_indices,
+                    metadata.block_tables,
+                    bs,
+                    max_seq_pages,
+                    self.page_size,
+                )
+
+        if not block_tables_updated:
+            metadata.block_tables[:bs, :max_seq_pages].copy_(
+                self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
+                // self.page_size
+            )
+
+            metadata.block_tables[:bs, max_seq_pages:].fill_(0)
+            metadata.block_tables[bs:, :].fill_(0)
 
         if forward_mode.is_target_verify():
             seq_lens = seq_lens + self.speculative_num_draft_tokens
