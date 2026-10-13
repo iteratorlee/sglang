@@ -1805,7 +1805,7 @@ def _mhc_pre_torch(
         comb = comb / (comb.sum(-1, keepdim=True) + hc_sinkhorn_eps)
         comb = comb / (comb.sum(-2, keepdim=True) + hc_sinkhorn_eps)
 
-    layer_input = (pre.unsqueeze(-1) * residual.float()).sum(dim=1).to(dtype)
+    layer_input = (pre.unsqueeze(-1) * x_flat.view(s, n, h)).sum(dim=1).to(dtype)
     return post.unsqueeze(-1), comb, layer_input
 
 
