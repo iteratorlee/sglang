@@ -22,10 +22,10 @@ def _snapshot_kpool_tails(
     source = request * ROW_ELEMENTS + col
     destination = (row * STEPS + STEP) * ROW_ELEMENTS + col
     # Integer views preserve NaN payloads, signed zeros and subnormals too.
-    keys = tl.load(KEYS.to(tl.pointer_type(tl.uint16)) + source, valid, 0)
-    scores = tl.load(SCORES.to(tl.pointer_type(tl.uint32)) + source, valid, 0)
-    tl.store(SNAPSHOT_KEYS.to(tl.pointer_type(tl.uint16)) + destination, keys, valid)
-    tl.store(SNAPSHOT_SCORES.to(tl.pointer_type(tl.uint32)) + destination, scores, valid)
+    keys = tl.load(KEYS + source, valid, 0)
+    scores = tl.load(SCORES + source, valid, 0)
+    tl.store(SNAPSHOT_KEYS + destination, keys, valid)
+    tl.store(SNAPSHOT_SCORES + destination, scores, valid)
 
 
 def snapshot_kpool_tails_(keys, scores, requests, snapshot_keys, snapshot_scores, step):
@@ -60,7 +60,10 @@ def snapshot_kpool_tails_(keys, scores, requests, snapshot_keys, snapshot_scores
     row_elements = keys.shape[1] * keys.shape[2]
     block = min(512, triton.next_power_of_2(row_elements))
     _snapshot_kpool_tails[(requests.numel(), triton.cdiv(row_elements, block))](
-        keys, scores, requests, snapshot_keys, snapshot_scores,
+        # Metadata-only integer aliases: BiSheng cannot lower an in-kernel
+        # pointer reinterpret cast at this store. No numeric cast or copy.
+        keys.view(torch.int16), scores.view(torch.int32), requests,
+        snapshot_keys.view(torch.int16), snapshot_scores.view(torch.int32),
         ROW_ELEMENTS=row_elements, STEPS=snapshot_keys.shape[1], STEP=step,
         BLOCK=block, enable_auto_bind_sub_block=False,
     )
