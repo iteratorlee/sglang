@@ -132,7 +132,7 @@ def log_normal_hccl_activation(quant_info, profile):
         "GLM53 normal HCCL active: profile=%s rank=%d world=%d local_rows=%d width=%d "
         "x_dtype=%s dispatch_dtype=%s token_scale_dtype=%s "
         "w13=%s/%s w2=%s/%s weight_scale_dtype=%s/%s "
-        "reduce_scatter=%s",
+        "reduce_scatter=%s deterministic_local_combine=%s",
         profile,
         rank,
         world,
@@ -148,6 +148,7 @@ def log_normal_hccl_activation(quant_info, profile):
         quant_info.w13_weight_scale.dtype,
         quant_info.w2_weight_scale.dtype,
         os.getenv("SGLANG_GLM53_NORMAL_REDUCE_SCATTER", "0"),
+        os.getenv("SGLANG_GLM53_NORMAL_COMBINE_DETERMINISTIC", "0"),
     )
     _activation_logged = True
 
@@ -202,6 +203,25 @@ def collective_dispatch(group, x, ids, weights, num_experts=288):
     return recv, recv_scale, counts, state
 
 
+def _normal_combine_index_add_(out, rows, values):
+    """Opt into deterministic local accumulation without changing HCCL mode.
+
+    Repeated destination rows otherwise use nondeterministic FP32 accumulation
+    on Ascend. This switch is for the eager, non-overlap normal-phase path;
+    decode's DeepEP LL path does not call it. Restore both process flags even
+    when the backend raises, before any collective or subsequent model op.
+    """
+    if os.getenv("SGLANG_GLM53_NORMAL_COMBINE_DETERMINISTIC", "0") != "1":
+        return out.index_add_(0, rows, values)
+    enabled = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=False)
+        return out.index_add_(0, rows, values)
+    finally:
+        torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+
+
 def collective_combine(group, y, state):
     rows, weights, tokens, world, width, received = state
     # Sum each rank's expert contributions in FP32, then reduce them across EP.
@@ -209,7 +229,7 @@ def collective_combine(group, y, state):
     # that size. The final activation is BF16; expert products remain W8A8.
     out = torch.zeros((world * tokens, width), device=y.device, dtype=torch.float32)
     if received:
-        out.index_add_(0, rows, y[:received].float() * weights[:, None])
+        _normal_combine_index_add_(out, rows, y[:received].float() * weights[:, None])
     if (
         os.getenv("SGLANG_GLM53_NORMAL_REDUCE_SCATTER", "0") == "1"
         and world > 1
