@@ -59,6 +59,22 @@ class CombineDeterminism(unittest.TestCase):
             change.assert_not_called()
             self.assertTrue(torch.equal(out, torch.tensor([[2., 2.], [0., 0.]])))
 
+    def test_inverse_map_preserves_source_order_and_empty_rows(self):
+        # Input order is stable expert order, not token order.
+        rows = torch.tensor([2, 0, 2, 3, 0, 2])
+        inverse = module._normal_combine_ordered_indices(rows, 5, 8)
+        self.assertEqual(inverse.dtype, torch.int32)
+        self.assertEqual(inverse[0].tolist(), [1, 4, -1, -1, -1, -1, -1, -1])
+        self.assertEqual(inverse[2].tolist(), [0, 2, 5, -1, -1, -1, -1, -1])
+        self.assertEqual(inverse[1].tolist(), [-1] * 8)
+        self.assertEqual(inverse[3].tolist(), [3] + [-1] * 7)
+        self.assertEqual(inverse[4].tolist(), [-1] * 8)
+        self.assertTrue(torch.equal(
+            module._normal_combine_ordered_indices(torch.empty(0, dtype=torch.int64), 2, 8),
+            torch.full((2, 8), -1, dtype=torch.int32)))
+        with self.assertRaisesRegex(ValueError, "multiplicity"):
+            module._normal_combine_ordered_indices(torch.zeros(9, dtype=torch.int64), 1, 8)
+
     def test_native_combine_and_communication_scope(self):
         y = torch.tensor([[1., -2.], [3., 4.], [-1., 0.5]], dtype=torch.bfloat16)
         rows = torch.tensor([0, 1, 0])
