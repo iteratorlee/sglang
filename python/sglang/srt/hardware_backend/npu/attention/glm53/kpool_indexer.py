@@ -20,6 +20,7 @@ from sglang.srt.utils import is_npu
 
 from .graph_ops import scatter_rows_
 from .kpool_tail_scatter_npu import scatter_kpool_tail_
+from .kpool_snapshot_npu import snapshot_kpool_tails_
 
 if is_npu():
     import torch_npu
@@ -343,6 +344,10 @@ class AscendIndexerKPoolMixin:
         self._fuse_kpool_tail_scatter = (
             get_server_args().disaggregation_mode == "decode"
             and os.getenv("SGLANG_GLM53_FUSED_KPOOL_TAIL_SCATTER", "0") == "1"
+        )
+        self._fuse_kpool_verify_snapshot = (
+            get_server_args().disaggregation_mode == "decode"
+            and os.getenv("SGLANG_GLM53_FUSED_KPOOL_VERIFY_SNAPSHOT", "0") == "1"
         )
         max_reqs = getattr(get_server_args(), "max_running_requests", None) or 2048
         # ReqToTokenPool reserves row 0 for graph padding and allocates real
@@ -950,12 +955,22 @@ class AscendIndexerKPoolMixin:
                 layer_id,
             )
             outputs.append(result)
-            self._kpool_mtp_tail_k[:bs, step].copy_(
-                self._kpool_tail_k.index_select(0, req)
-            )
-            self._kpool_mtp_tail_score[:bs, step].copy_(
-                self._kpool_tail_score.index_select(0, req)
-            )
+            if self._fuse_kpool_verify_snapshot:
+                snapshot_kpool_tails_(
+                    self._kpool_tail_k,
+                    self._kpool_tail_score,
+                    req,
+                    self._kpool_mtp_tail_k,
+                    self._kpool_mtp_tail_score,
+                    step,
+                )
+            else:
+                self._kpool_mtp_tail_k[:bs, step].copy_(
+                    self._kpool_tail_k.index_select(0, req)
+                )
+                self._kpool_mtp_tail_score[:bs, step].copy_(
+                    self._kpool_tail_score.index_select(0, req)
+                )
         result = torch.stack(outputs, 1).flatten(0, 1)
         if q.shape[0] > real_shape_tokens:
             result = torch.cat(

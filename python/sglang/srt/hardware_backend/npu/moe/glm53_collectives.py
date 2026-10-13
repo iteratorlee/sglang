@@ -13,6 +13,7 @@ import torch.distributed as dist
 logger = logging.getLogger(__name__)
 _last_dispatch_metadata = None
 _activation_logged = False
+_bulk_activation_logged = False
 
 
 def release_normal_hccl_cached_memory(x):
@@ -114,8 +115,11 @@ def _check_equal_dispatch_shapes(group, x, ids, weights, world):
 
 def log_normal_hccl_activation(quant_info, profile):
     """Log actual dispatch and expert storage once per process, after dispatch."""
-    global _activation_logged
-    if _activation_logged or _last_dispatch_metadata is None:
+    global _activation_logged, _bulk_activation_logged
+    if _last_dispatch_metadata is None:
+        return
+    bulk = _last_dispatch_metadata[2] >= 512
+    if _activation_logged and (not bulk or _bulk_activation_logged):
         return
     if any(
         weight.dtype != torch.int8
@@ -129,14 +133,15 @@ def log_normal_hccl_activation(quant_info, profile):
         raise RuntimeError("GLM HCCL normal expert scales must remain FP32")
     rank, world, rows, width, x_dtype, q_dtype, scale_dtype = _last_dispatch_metadata
     logger.info(
-        "GLM53 normal HCCL active: profile=%s rank=%d world=%d local_rows=%d width=%d "
+        "GLM53 normal HCCL active: profile=%s rank=%d world=%d local_rows=%d gathered_rows=%d width=%d "
         "x_dtype=%s dispatch_dtype=%s token_scale_dtype=%s "
         "w13=%s/%s w2=%s/%s weight_scale_dtype=%s/%s "
-        "reduce_scatter=%s",
+        "reduce_scatter=%s deterministic_local_combine=%s ordered_local_combine=%s",
         profile,
         rank,
         world,
         rows,
+        rows * world,
         width,
         x_dtype,
         q_dtype,
@@ -148,8 +153,11 @@ def log_normal_hccl_activation(quant_info, profile):
         quant_info.w13_weight_scale.dtype,
         quant_info.w2_weight_scale.dtype,
         os.getenv("SGLANG_GLM53_NORMAL_REDUCE_SCATTER", "0"),
+        os.getenv("SGLANG_GLM53_NORMAL_COMBINE_DETERMINISTIC", "0"),
+        os.getenv("SGLANG_GLM53_NORMAL_COMBINE_ORDERED", "0"),
     )
     _activation_logged = True
+    _bulk_activation_logged |= bulk
 
 
 def collective_dispatch(group, x, ids, weights, num_experts=288):
@@ -190,6 +198,13 @@ def collective_dispatch(group, x, ids, weights, num_experts=288):
         recv_scale = scale.new_ones((1,))
     chosen_weights = all_weights.flatten().index_select(0, loc)
     state = (rows, chosen_weights, tokens, world, width, int(selected.numel()))
+    if os.getenv("SGLANG_GLM53_NORMAL_COMBINE_ORDERED", "0") == "1":
+        if not (world == 8 and topk == 8 and width == 4096 and x.dtype == torch.bfloat16):
+            raise ValueError("Ordered GLM combine is validated only for EP8/topk8/BF16 H4096")
+        # selected is already CPU-resident in stable expert order. No extra
+        # device synchronization: construct a small inverse map during routing.
+        indices = _normal_combine_ordered_indices(selected // topk, world * tokens, topk)
+        state += (indices.to(device=x.device),)
     _last_dispatch_metadata = (
         rank,
         world,
@@ -202,14 +217,52 @@ def collective_dispatch(group, x, ids, weights, num_experts=288):
     return recv, recv_scale, counts, state
 
 
+def _normal_combine_ordered_indices(rows, count, topk):
+    """CPU [token, contribution] map, preserving stable expert order exactly."""
+    order = torch.argsort(rows, stable=True)
+    sorted_rows = rows[order]
+    counts = torch.bincount(rows, minlength=count)
+    if counts.numel() > count or (counts.numel() and int(counts.max()) > topk):
+        raise ValueError("Invalid GLM route multiplicity")
+    offsets = counts.cumsum(0) - counts
+    slot = torch.arange(rows.numel(), dtype=torch.int64) - offsets[sorted_rows]
+    indices = torch.full((count, topk), -1, dtype=torch.int32)
+    indices[sorted_rows, slot] = order.to(torch.int32)
+    return indices
+
+
+def _normal_combine_index_add_(out, rows, values):
+    """Opt into deterministic local accumulation without changing HCCL mode.
+
+    Repeated destination rows otherwise use nondeterministic FP32 accumulation
+    on Ascend. This switch is for the eager, non-overlap normal-phase path;
+    decode's DeepEP LL path does not call it. Restore both process flags even
+    when the backend raises, before any collective or subsequent model op.
+    """
+    if os.getenv("SGLANG_GLM53_NORMAL_COMBINE_DETERMINISTIC", "0") != "1":
+        return out.index_add_(0, rows, values)
+    enabled = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=False)
+        return out.index_add_(0, rows, values)
+    finally:
+        torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+
+
 def collective_combine(group, y, state):
-    rows, weights, tokens, world, width, received = state
+    rows, weights, tokens, world, width, received = state[:6]
     # Sum each rank's expert contributions in FP32, then reduce them across EP.
     # This keeps the workspace bounded by tokens*hidden, rather than topk times
     # that size. The final activation is BF16; expert products remain W8A8.
-    out = torch.zeros((world * tokens, width), device=y.device, dtype=torch.float32)
-    if received:
-        out.index_add_(0, rows, y[:received].float() * weights[:, None])
+    if len(state) == 7:
+        from .glm53_ordered_combine import ordered_combine
+
+        out = ordered_combine(y[:received], weights, state[6], world * tokens, width)
+    else:
+        out = torch.zeros((world * tokens, width), device=y.device, dtype=torch.float32)
+        if received:
+            _normal_combine_index_add_(out, rows, y[:received].float() * weights[:, None])
     if (
         os.getenv("SGLANG_GLM53_NORMAL_REDUCE_SCATTER", "0") == "1"
         and world > 1
