@@ -89,6 +89,13 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         import torch_npu  # noqa: F401  (verifies NPU availability)
 
         trace_memory = get_bool_env_var("SGLANG_NPU_GRAPH_MEMORY_TRACE")
+        release_warmup_cache = get_bool_env_var(
+            "SGLANG_NPU_GRAPH_RELEASE_WARMUP_CACHE"
+        )
+        if release_warmup_cache:
+            self._device_module.synchronize()
+            self._tp_group.barrier()
+            self._device_module.empty_cache()
         if trace_memory:
             free_before = self._device_module.mem_get_info()[0]
             allocated_before = self._device_module.memory_allocated()
@@ -102,6 +109,16 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             forward_fn()
             if post_warmup_hook is not None:
                 post_warmup_hook()
+
+        # Warmup uses the ordinary allocator, while capture creates a private
+        # graph pool. On a nearly full NPU, inactive warmup blocks can otherwise
+        # leave no physical memory for that pool or native HCCL workspaces.
+        # Release only inactive blocks, outside capture and serving; all live
+        # graph inputs, recurrent state, weights and KV buffers remain owned.
+        if release_warmup_cache:
+            self._device_module.synchronize()
+            self._tp_group.barrier()
+            self._device_module.empty_cache()
 
         graph = torch.npu.NPUGraph()
 
