@@ -539,6 +539,7 @@ class DecodeWiringTests(unittest.TestCase):
             glm53_decode_prefix_profile=object(),
             tree_cache=object(),
             retracted_queue=[],
+            strict_kv_fair_scan=False,
             pending_reqs=[],
             _check_if_req_exceed_kv_capacity=lambda req: False,
             _create_receiver_and_enqueue=lambda req, is_rebootstrap: (
@@ -693,6 +694,47 @@ class DecodeWiringTests(unittest.TestCase):
 
         self.assertEqual(match(queue, req), "match")
         self.assertTrue(calls[0][1]["cow_mamba"])
+
+
+class TestGlm53DecodeStateBudget(unittest.TestCase):
+    def ratio(self, cfg, model=None, disabled=False):
+        fn = extract_class_method(
+            "python/sglang/srt/mem_cache/kv_cache_configurator.py",
+            "KVCacheConfigurator",
+            "_calculate_mamba_ratio",
+            get_memory=lambda: NS(disable_radix_cache=disabled),
+            resolving_view=lambda args: args,
+            envs=NS(SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=NS(get=lambda: False)),
+            get_exec=lambda: NS(mamba=NS(enable_mamba_extra_buffer=True,
+                                        enable_mamba_extra_buffer_lazy=False)),
+            get_schedule=lambda: NS(disable_overlap_schedule=True),
+            MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO=3,
+            MAMBA_CACHE_BASE_RATIO_DROP_ON_SKIP=1,
+            MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP=1,
+        )
+        return fn(NS(server_args=cfg, model_config=model or target_model()))
+
+    def test_validated_token_only_decode_preserves_two_active_slots(self):
+        # Global 8 slots / four DP domains: generic ratio 4 would yield zero.
+        for tp, dp, ep in [(8, 4, 8), (16, 8, 16)]:
+            cfg = target_cfg(tp_size=tp, dp_size=dp, ep_size=ep,
+                             disaggregation_decode_enable_radix_cache=True)
+            self.assertEqual(self.ratio(cfg), 1)
+            self.assertEqual((2 * dp // dp) // self.ratio(cfg), 2)
+
+    def test_generic_checkpoint_budget_remains_conservative(self):
+        for overrides in [dict(disaggregation_mode="prefill"),
+                          dict(speculative_num_draft_tokens=5),
+                          dict(tp_size=8, dp_size=8, ep_size=8),
+                          dict(disaggregation_decode_enable_radix_cache=False)]:
+            cfg = target_cfg(disaggregation_decode_enable_radix_cache=True)
+            cfg.__dict__.update(overrides)
+            self.assertEqual(self.ratio(cfg), 4)
+        self.assertEqual(self.ratio(target_cfg(disaggregation_decode_enable_radix_cache=True),
+                                    model=NS(hf_config=NS(architectures=["OtherModel"]))), 4)
+
+    def test_private_decode_budget_is_unchanged(self):
+        self.assertEqual(self.ratio(target_cfg(), disabled=True), 1)
 
 
 if __name__ == "__main__":

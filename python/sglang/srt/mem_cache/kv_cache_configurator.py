@@ -2229,6 +2229,20 @@ class KVCacheConfigurator:
         if get_memory().disable_radix_cache:
             return 1
 
+        # This validated PD layout caches token KV only. Its active recurrent
+        # state is transferred from P into an independent request-owned slot;
+        # it does not retain Mamba checkpoints or allocate checkpoint COW slots.
+        # Use the same state budget as private-KV decode, rather than applying
+        # the generic Mamba prefix-cache multiplier to a token-only radix tree.
+        cfg = resolving_view(self.server_args)
+        if cfg.disaggregation_decode_enable_radix_cache:
+            from sglang.srt.disaggregation.glm53_decode_prefix import (
+                glm53_pd_decode_prefix_profile,
+            )
+
+            if glm53_pd_decode_prefix_profile(cfg, self.model_config) is not None:
+                return 1
+
         skip_decode_lock = envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
         base = MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO - (
             MAMBA_CACHE_BASE_RATIO_DROP_ON_SKIP if skip_decode_lock else 0
