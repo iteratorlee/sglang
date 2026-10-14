@@ -286,6 +286,16 @@ def mamba_extra_buffer_of(cfg: Any) -> bool:
     function by the declaration in ``arg_groups/fields/exec_.py``. Resolution
     needs it before there is a bag to read, which is why it is still a
     function."""
+    if getattr(cfg, "disaggregation_decode_enable_radix_cache", False):
+        from sglang.srt.disaggregation.glm53_decode_prefix import (
+            glm53_pd_decode_prefix_profile,
+        )
+
+        if glm53_pd_decode_prefix_profile(cfg, model_config_of(cfg)) is not None:
+            # GLM PD decode retains token KV only. P supplies fresh recurrent
+            # state; allocating ping-pong checkpoints here doubles both target
+            # and draft state pools without serving a cache component.
+            return False
     return cfg.disable_radix_cache is False and cfg.mamba_radix_cache_strategy in (
         "extra_buffer",
         "extra_buffer_lazy",

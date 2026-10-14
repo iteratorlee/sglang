@@ -541,6 +541,17 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
     if view.disable_radix_cache:
         return {}
 
+    if getattr(view, "disaggregation_decode_enable_radix_cache", False):
+        from sglang.srt.disaggregation.glm53_decode_prefix import (
+            glm53_pd_decode_prefix_profile,
+        )
+
+        if glm53_pd_decode_prefix_profile(view, model_config_of(view)) is not None:
+            # This is a paged token-only D cache, not either Mamba radix
+            # strategy. Generic no_buffer validation requires page_size=1;
+            # the independently validated GLM pool uses physical page64.
+            return {"uses_mamba_radix_cache": False}
+
     declared: Dict[str, Any] = {"uses_mamba_radix_cache": True}
     if view.mamba_radix_cache_strategy == "auto":
         wants_overlap = not view.disable_overlap_schedule

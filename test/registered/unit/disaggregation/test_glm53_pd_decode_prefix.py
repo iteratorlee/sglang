@@ -697,6 +697,24 @@ class DecodeWiringTests(unittest.TestCase):
 
 
 class TestGlm53DecodeStateBudget(unittest.TestCase):
+    def test_token_only_decode_does_not_allocate_checkpoint_ping_pong(self):
+        def extra(cfg):
+            fn = extract_module_function(
+                "python/sglang/srt/arg_groups/model_override_base.py",
+                "mamba_extra_buffer_of", model_config_of=lambda cfg: target_model(),
+            )
+            return fn(cfg)
+        for tp, dp, ep in [(8, 4, 8), (16, 8, 16)]:
+            cfg = target_cfg(tp_size=tp, dp_size=dp, ep_size=ep,
+                disaggregation_decode_enable_radix_cache=True,
+                disable_radix_cache=False, mamba_radix_cache_strategy="extra_buffer")
+            self.assertFalse(extra(cfg))
+            for change in [dict(disaggregation_mode="prefill"),
+                           dict(speculative_num_draft_tokens=5),
+                           dict(disaggregation_decode_enable_radix_cache=False)]:
+                other = NS(**dict(cfg.__dict__, **change))
+                self.assertTrue(extra(other))
+
     def ratio(self, cfg, model=None, disabled=False):
         fn = extract_class_method(
             "python/sglang/srt/mem_cache/kv_cache_configurator.py",
