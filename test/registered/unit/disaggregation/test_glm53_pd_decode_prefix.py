@@ -697,6 +697,23 @@ class DecodeWiringTests(unittest.TestCase):
 
 
 class TestGlm53DecodeStateBudget(unittest.TestCase):
+    def test_paged_decode_skips_generic_mamba_no_buffer_validation(self):
+        registry = NS(get_linear_attn_spec_by_arch=lambda arch: NS(uses_mamba_radix_cache=True))
+        fn = extract_module_function(
+            "python/sglang/srt/arg_groups/overrides.py", "_mamba_radix_cache_resolution",
+            model_config_of=lambda cfg: target_model(),
+            _MAMBA_RADIX_CACHE_ARCHS={"Glm5NextForConditionalGeneration"},
+        )
+        cfg = target_cfg(tp_size=8, dp_size=4, ep_size=8,
+            disaggregation_decode_enable_radix_cache=True,
+            disable_radix_cache=False, mamba_radix_cache_strategy="extra_buffer")
+        with mock.patch.dict("sys.modules", {
+            "sglang.srt.configs.linear_attn_model_registry": registry,
+        }):
+            self.assertEqual(fn(cfg), {"uses_mamba_radix_cache": False})
+            cfg.disaggregation_mode = "prefill"
+            self.assertEqual(fn(cfg), {"uses_mamba_radix_cache": True})
+
     def test_token_only_decode_does_not_allocate_checkpoint_ping_pong(self):
         def extra(cfg):
             fn = extract_module_function(
