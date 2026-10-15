@@ -39,6 +39,18 @@ class Mode(enum.Enum):
     DRAFT_EXTEND = 5
     MIXED = 6
 
+    def is_decode(self):
+        return self == Mode.DECODE
+
+    def is_target_verify(self):
+        return self == Mode.TARGET_VERIFY
+
+    def is_draft_extend_v2(self):
+        return self == Mode.DRAFT_EXTEND
+
+    def is_idle(self):
+        return self == Mode.IDLE
+
 
 def batch(counts=(32, 0), *, mode=Mode.EXTEND):
     capacity = (max(counts) + 7) // 8 * 8
@@ -306,6 +318,131 @@ class IdleDpCpuTests(unittest.TestCase):
                     ):
                         forward(layer, None, hidden, batch(), None)
                     self.assertEqual(self.seen, [None])
+
+    def test_actual_idle_prefill_conversion_filters_on_idle_process_experts(self):
+        source = ast.parse((SRT / "model_executor/forward_batch_info.py").read_text())
+        owner = next(
+            n
+            for n in source.body
+            if isinstance(n, ast.ClassDef) and n.name == "ForwardBatch"
+        )
+        method = next(
+            n
+            for n in owner.body
+            if isinstance(n, ast.FunctionDef) and n.name == "prepare_mlp_sync_batch"
+        )
+        module = ast.Module(
+            body=[
+                ast.ImportFrom(
+                    module="__future__", names=[ast.alias(name="annotations")], level=0
+                ),
+                method,
+            ],
+            type_ignores=[],
+        )
+        max_len = NS(is_max_len=lambda: True)
+        namespace = dict(
+            torch=torch,
+            ForwardMode=Mode,
+            _is_cpu=True,
+            get_parallel=lambda: self.parallel,
+            get_exec=lambda: NS(graph=NS(cuda_graph_config=NS(prefill=NS(bs=[])))),
+            ceil_align=lambda n, unit: (n + unit - 1) // unit * unit,
+            DpPaddingMode=NS(get_dp_padding_mode=lambda *args: max_len),
+            _elastic_should_preserve_local_token_counts=lambda **kwargs: False,
+            mambaish_config=lambda cfg: object(),
+            set_dp_buffer_len=mock.Mock(),
+            set_is_extend_in_batch=mock.Mock(),
+        )
+        exec(
+            compile(
+                ast.fix_missing_locations(module),
+                "<actual MLP sync preparation>",
+                "exec",
+            ),
+            namespace,
+        )
+        tbo = ModuleType("sglang.srt.batch_overlap.two_batch_overlap")
+        tbo.TboForwardBatchPreparer = NS(prepare=lambda **kwargs: None)
+        peers = self.peers()
+        for counts, idle_rank in (((0, 32), 0), ((32, 0), 8)):
+            with self.subTest(counts=counts, idle_rank=idle_rank):
+                self.parallel.attn_dp_rank, self.parallel.attn_tp_rank = divmod(
+                    idle_rank, 8
+                )
+                fb = batch(counts, mode=Mode.IDLE)
+                original = fb.original_global_num_tokens_cpu
+                fb.global_num_tokens_cpu = list(counts)  # pre-padding CPU values
+                fb.global_num_tokens_for_logprob_cpu = list(counts)
+                fb.global_num_tokens_gpu = torch.tensor(counts, device="cpu")
+                fb.batch_size = 0
+                fb.is_extend_in_batch = True
+                fb.can_run_dp_prefill_cuda_graph = False
+                fb.spec_info = None
+                fb.seq_lens = torch.empty(0, dtype=torch.int64, device="cpu")
+                fb.orig_seq_lens = fb.seq_lens.clone()
+                fb.seq_lens_cpu = None
+                fb.global_num_token_non_padded = None
+                fb.tbo_children = None
+                fb._pad_inputs_to_size = mock.Mock()
+                runner = NS(
+                    model_config=NS(),
+                    is_draft_worker=False,
+                    attn_tp_sequence_sharded=lambda n: True,
+                )
+                with mock.patch.dict(sys.modules, {tbo.__name__: tbo}):
+                    namespace[method.name](fb, runner)
+                self.assertEqual(fb._original_forward_mode, Mode.IDLE)
+                self.assertEqual(fb.forward_mode, Mode.EXTEND)
+                self.assertIs(fb.original_global_num_tokens_cpu, original)
+                self.assertEqual(original, list(counts))
+                self.assertEqual(fb.global_num_tokens_cpu, [32, 32])
+                self.assertEqual(fb.extend_seq_lens_cpu, [32])
+                fb._pad_inputs_to_size.assert_called_once_with(runner, 32, 1)
+                layer, forward = self.decoder_forward()
+                case = self
+
+                class DispatchingMoE(type(layer.mlp)):
+                    def __call__(self, hidden, forward_batch, allocator):
+                        _, _, local_counts, state = case.dispatch(idle_rank, peers)
+                        expected_rows = sorted(
+                            (int(peers[1][src][row, k]), src * 4 + row)
+                            for src in range(16)
+                            for row in range(4)
+                            for k in range(8)
+                            if counts[src // 8] > 0
+                            and idle_rank * 18
+                            <= int(peers[1][src][row, k])
+                            < (idle_rank + 1) * 18
+                        )
+                        case.assertEqual(sum(local_counts), len(expected_rows))
+                        case.assertGreater(
+                            sum(local_counts), 0
+                        )  # active peer contributions survive
+                        case.assertEqual(
+                            state[0].tolist(), [row for _, row in expected_rows]
+                        )
+                        before = sum(
+                            int(
+                                (
+                                    (routes >= idle_rank * 18)
+                                    & (routes < (idle_rank + 1) * 18)
+                                ).sum()
+                            )
+                            for routes in peers[1]
+                        )
+                        case.assertGreater(
+                            before, sum(local_counts)
+                        )  # idle routes really removed
+                        case.assertTrue(
+                            all(counts[int(row) // 32] > 0 for row in state[0])
+                        )
+                        return super().__call__(hidden, forward_batch, allocator)
+
+                layer.mlp = DispatchingMoE()
+                forward(layer, None, torch.ones(4, 3, device="cpu"), fb, None)
+                self.assertEqual(self.seen, [counts])
+                self.assertIsNone(self.module._idle_dp_counts.get())
 
     def test_existing_mlp_context_nesting_and_exception_order(self):
         events = []
