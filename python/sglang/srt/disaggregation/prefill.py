@@ -1277,7 +1277,10 @@ class SchedulerDisaggregationPrefillMixin:
         )
 
         if not last_chunk:
-            # if not the last chunk and the last page is partial, delay the last partial page to the next send
+            # The sender infers finality from its cumulative page count. Keep
+            # the final page for the explicit last call, after metadata/state
+            # are prepared, even when the prompt ends on a page boundary.
+            end_idx = min(end_idx, max(0, transfer_input_len - 1))
             end_idx = end_idx - end_idx % page_size
             if self.enable_staging:
                 # Staging identifies chunks positionally against a uniform
