@@ -52,7 +52,8 @@ class NPUW8A8ClampedMoEMethod(NPUW8A8Int8MoEMethod):
                 ):
                     raise ValueError(
                         "GLM HCCL normal routing requires the TP16/EP16 ModelSlim "
-                        "deployment or P-only single-node TP8/EP8 or DP4/TP2/EP8 PP1/CP1 "
+                        "deployment or P-only single-node TP8/EP8 or DP4/TP2/EP8, "
+                        "or opt-in two-node DP2/TP8/EP16 PP1/CP1 "
                         "ModelSlim clamp10 without overlap/TBO/EPLB"
                     )
                 self._glm53_normal_hccl_profile = profile

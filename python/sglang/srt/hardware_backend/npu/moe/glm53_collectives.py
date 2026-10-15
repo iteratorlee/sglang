@@ -45,9 +45,9 @@ def release_normal_hccl_cached_memory(x):
 
 
 def normal_hccl_profile(args, limit):
-    """Finite opt-in profiles; preserve the original TP16 deployment guard."""
+    """Finite opt-in profiles; preserve the original single-node guards."""
     common = (
-        args.nnodes == args.pp_size == 1
+        args.pp_size == 1
         and not args.enable_two_batch_overlap
         and not args.enable_eplb
         and args.ep_num_redundant_experts == 0
@@ -56,6 +56,25 @@ def normal_hccl_profile(args, limit):
         and args.moe_a2a_backend == "deepep"
     )
     if not common:
+        return None
+    if args.nnodes == 2:
+        # Each TP8 attention domain stays on one 8-device host. Only the EP16
+        # gather/combine crosses hosts. Keep this experimental profile explicit
+        # until hardware validation; no general nnodes/EP allow-list expansion.
+        if (
+            os.getenv("SGLANG_GLM53_2NODE_PD", "0") == "1"
+            and args.tp_size == args.ep_size == 16
+            and args.enable_dp_attention
+            and args.dp_size == 2
+            and args.attn_cp_size == args.dcp_size == 1
+            and args.moe_dp_size == args.dwdp_size == 1
+            and not args.enable_prefill_cp
+            and args.disaggregation_mode == "prefill"
+            and args.disable_overlap_schedule
+        ):
+            return "prefill_2node_dp2_tp8_ep16"
+        return None
+    if args.nnodes != 1:
         return None
     if args.tp_size == args.ep_size == 16 and not args.enable_dp_attention:
         return "tp16_ep16"
@@ -78,8 +97,8 @@ def normal_hccl_profile(args, limit):
 
 
 def _check_equal_dispatch_shapes(group, x, ids, weights, world):
-    # DP4/TP2 forces MAX_LEN padding; TP8 has equal rows within its TP domain.
-    # Retain this check on every EP8 invocation before fixed-size payload
+    # DP4/TP2 and two-node DP2/TP8 force MAX_LEN padding; TP8 has equal rows
+    # within its TP domain. Retain this check before fixed-size payload
     # gathers to catch any downstream geometry or routing-contract violation.
     shape = torch.tensor(
         [
@@ -108,7 +127,7 @@ def _check_equal_dispatch_shapes(group, x, ids, weights, world):
         or expected[4] != expected[7]
     ):
         raise RuntimeError(
-            "GLM HCCL normal EP8 requires equal local rows/width/topk across "
+            f"GLM HCCL normal EP{world} requires equal local rows/width/topk across "
             f"all ranks (MAX_LEN or equal SUM_LEN); dispatch shapes={shapes}"
         )
 
@@ -165,7 +184,7 @@ def collective_dispatch(group, x, ids, weights, num_experts=288):
     world, rank = dist.get_world_size(group), dist.get_rank(group)
     tokens, width = x.shape
     topk = ids.shape[1]
-    if world == 8:
+    if world in (8, 16):
         release_normal_hccl_cached_memory(x)
         _check_equal_dispatch_shapes(group, x, ids, weights, world)
 

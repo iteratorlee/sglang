@@ -42,6 +42,7 @@ def args_for_profile(**overrides):
         attn_cp_size=1,
         dcp_size=1,
         moe_dp_size=1,
+        dwdp_size=1,
         enable_dp_attention=True,
         enable_prefill_cp=False,
         enable_two_batch_overlap=False,
@@ -197,6 +198,26 @@ class NormalHcclCpuTests(unittest.TestCase):
                     layer, "w13"
                 )
 
+    def test_two_node_prefill_is_bounded_and_explicit(self):
+        profile = self.collectives.normal_hccl_profile
+        base = dict(nnodes=2, tp_size=16, ep_size=16, dp_size=2)
+        with mock.patch.dict(os.environ, {"SGLANG_GLM53_2NODE_PD": "0"}):
+            self.assertIsNone(profile(args_for_profile(**base), 10))
+        with mock.patch.dict(os.environ, {"SGLANG_GLM53_2NODE_PD": "1"}):
+            self.assertEqual(
+                profile(args_for_profile(**base), 10),
+                "prefill_2node_dp2_tp8_ep16",
+            )
+            for change in (
+                dict(nnodes=4), dict(tp_size=8), dict(ep_size=8), dict(dp_size=4),
+                dict(disaggregation_mode="decode"), dict(enable_dp_attention=False),
+                dict(attn_cp_size=2), dict(dcp_size=2), dict(pp_size=2),
+                dict(moe_dp_size=2), dict(dwdp_size=2), dict(enable_prefill_cp=True),
+                dict(disable_overlap_schedule=False), dict(enable_two_batch_overlap=True),
+                dict(enable_eplb=True), dict(ep_num_redundant_experts=1),
+            ):
+                with self.subTest(change=change):
+                    self.assertIsNone(profile(args_for_profile(**(base | change)), 10))
     def test_tp8_prefill_profile_keeps_decode_and_parallel_guards(self):
         args = args_for_profile(enable_dp_attention=False, dp_size=1)
         self.assertEqual(
@@ -306,6 +327,8 @@ class NormalHcclCpuTests(unittest.TestCase):
                 dcp_size=1,
                 nnodes=1,
                 enable_dp_attention=True,
+                moe_dp_size=1,
+                dwdp_size=1,
             )
             values.update(overrides)
             return SimpleNamespace(**values)
@@ -362,6 +385,16 @@ class NormalHcclCpuTests(unittest.TestCase):
                     parallel = make_parallel(**changes)
                     self.assertEqual(mode.get_dp_padding_mode(True, busy), mode.SUM_LEN)
                     self.assertEqual(mode.get_dp_padding_mode(True, idle), mode.MAX_LEN)
+            parallel = make_parallel(
+                nnodes=2, tp_size=16, moe_ep_size=16, dp_size=2,
+                attn_dp_size=2, attn_tp_size=8,
+            )
+            os.environ["SGLANG_GLM53_2NODE_PD"] = "0"
+            self.assertEqual(mode.get_dp_padding_mode(True, [9216, 256]), mode.SUM_LEN)
+            os.environ["SGLANG_GLM53_2NODE_PD"] = "1"
+            self.assertEqual(mode.get_dp_padding_mode(True, [9216, 256]), mode.MAX_LEN)
+            self.assertEqual(mode.get_dp_padding_mode(True, [9216, 0]), mode.MAX_LEN)
+            os.environ.pop("SGLANG_GLM53_2NODE_PD")
             parallel = make_parallel(
                 tp_size=16,
                 moe_ep_size=16,
@@ -470,6 +503,29 @@ class NormalHcclCpuTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "equal local rows"):
                 self.collectives.collective_dispatch(
                     object(), peers[0][0], peers[1][0], peers[2][0], 16
+                )
+            self.assertEqual(gathered.call_count, 1)
+            quant.assert_not_called()
+
+    def test_ep16_unequal_remote_host_rows_fail_before_payload(self):
+        peers = self.make_peers()
+        shape = self.peer_shape(peers[0][0], peers[1][0], peers[2][0])
+        shapes = [shape.clone() for _ in range(16)]
+        # The first host is internally consistent. The second host must also
+        # participate in the shape check before any fixed-size payload gather.
+        shapes[8][[0, 3, 6]] = 2
+        with (
+            mock.patch.object(self.collectives.dist, "get_world_size", return_value=16),
+            mock.patch.object(self.collectives.dist, "get_rank", return_value=0),
+            mock.patch.object(
+                self.collectives.dist, "all_gather_into_tensor",
+                side_effect=lambda out, local, group: out.copy_(torch.cat(shapes)),
+            ) as gathered,
+            mock.patch.object(torch.ops.npu, "npu_dynamic_quant", create=True) as quant,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "EP16 requires equal"):
+                self.collectives.collective_dispatch(
+                    object(), peers[0][0], peers[1][0], peers[2][0], 288
                 )
             self.assertEqual(gathered.call_count, 1)
             quant.assert_not_called()

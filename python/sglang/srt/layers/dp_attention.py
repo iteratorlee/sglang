@@ -129,11 +129,23 @@ class DpPaddingMode(IntEnum):
                 parallel = get_parallel()
                 if (
                     get_disagg().disaggregation_mode == "prefill"
-                    and parallel.nnodes == 1
-                    and parallel.tp_size == parallel.moe_ep_size == 8
-                    and parallel.dp_size == parallel.attn_dp_size == 4
+                    and (
+                        (
+                            parallel.nnodes == 1
+                            and parallel.tp_size == parallel.moe_ep_size == 8
+                            and parallel.dp_size == parallel.attn_dp_size == 4
+                            and parallel.attn_tp_size == 2
+                        )
+                        or (
+                            os.getenv("SGLANG_GLM53_2NODE_PD", "0") == "1"
+                            and parallel.nnodes == 2
+                            and parallel.tp_size == parallel.moe_ep_size == 16
+                            and parallel.dp_size == parallel.attn_dp_size == 2
+                            and parallel.attn_tp_size == 8
+                            and parallel.moe_dp_size == parallel.dwdp_size == 1
+                        )
+                    )
                     and parallel.enable_dp_attention
-                    and parallel.attn_tp_size == 2
                     and parallel.pp_size
                     == parallel.attn_cp_size
                     == parallel.dcp_size
