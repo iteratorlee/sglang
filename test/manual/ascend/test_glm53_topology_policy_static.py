@@ -9,8 +9,10 @@ nor torch and does not initialize a device or distributed process group.
 
 import ast
 import math
+import os
 import types
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from glm53_topology_test_schema import (
@@ -278,6 +280,24 @@ class PrefixTopologyPolicyTests(unittest.TestCase):
         ):
             with self.subTest(required=required):
                 self.assertIn(required, text)
+
+    def test_two_node_cache_uses_bounded_host_local_tp8_domains(self):
+        base = dict(
+            nnodes=2, tp_size=16, ep_size=16, dp_size=2,
+            attn_dp_size=2, attn_tp_size=8, enable_dp_attention=True, dcp_size=1,
+        )
+        with patch.dict(os.environ, {"SGLANG_GLM53_2NODE_PD": "0"}):
+            self.assertFalse(POLICY(parallel(**base)))
+        with patch.dict(os.environ, {"SGLANG_GLM53_2NODE_PD": "1"}):
+            self.assertTrue(POLICY(parallel(**base)))
+            self.assertEqual(PAGE_SIZE(NS(index_kpool=4), "npu", 64, 64, True), 256)
+            for change in (
+                dict(nnodes=4), dict(dp_size=4, attn_dp_size=4, attn_tp_size=4),
+                dict(attn_tp_size=4), dict(attn_dp_size=1), dict(dcp_size=2),
+                dict(moe_dp_size=2), dict(dwdp_size=2), dict(ep_size=8),
+            ):
+                with self.subTest(change=change):
+                    self.assertFalse(POLICY(parallel(**(base | change))))
 
     def test_page_size_helper_still_requires_glm_npu_and_physical_page64(self):
         glm = NS(index_kpool=4)

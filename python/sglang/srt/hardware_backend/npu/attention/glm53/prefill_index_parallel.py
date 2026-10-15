@@ -154,7 +154,7 @@ def _pd_prefill_mode():
 
 
 def _pd_prefill_topology_supported(args):
-    """Preserve DP1 and admit only audited single-node DP-attention layouts."""
+    """Preserve DP1; the opt-in two-node layout keeps each TP8 group local."""
     if args.attn_cp_size != 1 or args.enable_prefill_cp:
         return False
     if args.dp_size == 1:
@@ -164,7 +164,16 @@ def _pd_prefill_topology_supported(args):
         )
     return (
         args.enable_dp_attention
-        and args.nnodes == 1
+        and (
+            args.nnodes == 1
+            or (
+                os.getenv("SGLANG_GLM53_2NODE_PD", "0") == "1"
+                and args.nnodes == 2
+                and args.tp_size == args.ep_size == 16
+                and args.dp_size == 2
+                and args.dcp_size == 1
+            )
+        )
         and (args.tp_size, args.ep_size) in ((16, 16), (8, 8))
         and args.pp_size == 1
         and args.moe_dp_size == args.dwdp_size == 1
@@ -205,7 +214,15 @@ def enabled(q, forward_batch):
             or (args.tp_size == args.ep_size == 8
                 and args.disaggregation_mode == "prefill")
         )
-        and args.nnodes == 1
+        and (
+            args.nnodes == 1
+            or (
+                args.nnodes == 2
+                and args.disaggregation_mode == "prefill"
+                and args.enable_dp_attention
+                and _pd_prefill_topology_supported(args)
+            )
+        )
         and args.pp_size == 1
         and not args.enable_two_batch_overlap
         and args.disable_overlap_schedule

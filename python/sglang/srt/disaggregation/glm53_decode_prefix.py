@@ -76,7 +76,19 @@ def glm53_pd_decode_prefix_profile(
             and getattr(cfg, "pp_size", None) == 1
             and getattr(cfg, "dcp_size", None) == 1
             and getattr(cfg, "attn_cp_size", None) == 1
-            and getattr(cfg, "nnodes", None) == 1
+            and (
+                getattr(cfg, "nnodes", None) == 1
+                or (
+                    os.getenv("SGLANG_GLM53_2NODE_PD", "0") == "1"
+                    and getattr(cfg, "nnodes", None) == 2
+                    and (getattr(cfg, "tp_size", None),
+                         getattr(cfg, "dp_size", None),
+                         getattr(cfg, "ep_size", None)) == (16, 8, 16)
+                    and getattr(cfg, "moe_dp_size", None) == 1
+                    and getattr(cfg, "dwdp_size", None) == 1
+                    and not bool(getattr(cfg, "enable_prefill_cp", False))
+                )
+            )
             and bool(getattr(cfg, "enable_dp_attention", False))
             and getattr(cfg, "page_size", None) == GLM53_PHYSICAL_PAGE_SIZE
             and not bool(getattr(cfg, "enable_hierarchical_cache", False))

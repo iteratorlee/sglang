@@ -153,6 +153,23 @@ class ProfileTests(unittest.TestCase):
                     target_cfg(**(topology | change)), target_model()
                 ))
 
+    def test_two_node_decode_prefix_preserves_mtp_and_page_contract(self):
+        base = dict(nnodes=2, moe_dp_size=1, dwdp_size=1, enable_prefill_cp=False)
+        with mock.patch.dict(os.environ, {"SGLANG_GLM53_2NODE_PD": "0"}):
+            self.assertIsNone(glm53_pd_decode_prefix_profile(target_cfg(**base), target_model()))
+        with mock.patch.dict(os.environ, {"SGLANG_GLM53_2NODE_PD": "1"}):
+            self.assertIsNotNone(glm53_pd_decode_prefix_profile(target_cfg(**base), target_model()))
+            for change in (
+                dict(tp_size=8, dp_size=4, ep_size=8), dict(nnodes=4),
+                dict(moe_dp_size=2), dict(dwdp_size=2), dict(enable_prefill_cp=True),
+                dict(speculative_num_draft_tokens=5), dict(page_size=128),
+                dict(enable_hierarchical_cache=True), dict(dcp_size=2),
+            ):
+                with self.subTest(change=change):
+                    self.assertIsNone(glm53_pd_decode_prefix_profile(
+                        target_cfg(**(base | change)), target_model()
+                    ))
+
     def test_every_unadapted_dimension_stays_rejected(self):
         cases = {
             "device": "cuda",

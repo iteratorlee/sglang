@@ -226,14 +226,26 @@ _GLM53_VALIDATED_PREFILL_DP_TOPOLOGIES = frozenset(((2, 8), (4, 4), (2, 4), (4, 
 
 
 def _glm53_npu_prefill_prefix_topology_supported(parallel):
-    """Keep DP1 behavior and narrowly admit single-node DP-attention P layouts."""
+    """Keep DP1; opt into two host-local TP8 cache groups, never global EP16."""
+    import os
+
     if parallel.attn_cp_size != 1 or parallel.pp_size != 1:
         return False
     if parallel.dp_size == 1:
         return True
     return (
         parallel.enable_dp_attention
-        and parallel.nnodes == 1
+        and (
+            parallel.nnodes == 1
+            or (
+                os.getenv("SGLANG_GLM53_2NODE_PD", "0") == "1"
+                and parallel.nnodes == 2
+                and parallel.tp_size == parallel.ep_size == 16
+                and parallel.dp_size == 2
+                and parallel.attn_tp_size == 8
+                and parallel.dcp_size == 1
+            )
+        )
         and (parallel.tp_size, parallel.ep_size) in ((16, 16), (8, 8))
         and parallel.attn_dp_size == parallel.dp_size
         and parallel.moe_dp_size == parallel.dwdp_size == 1

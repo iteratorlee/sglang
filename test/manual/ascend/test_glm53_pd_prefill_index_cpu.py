@@ -164,7 +164,7 @@ class TestPartition(unittest.TestCase):
         self.assertEqual(rows, list(range(sum(lengths))))
 
     def test_long_prefills_and_scheduler_chunks(self):
-        for world in (1, 2, 4, 16):
+        for world in (1, 2, 4, 8, 16):
             for lengths, ends in (
                 ([65536], [65536]),
                 ([131072], [131072]),
@@ -290,6 +290,28 @@ class TestFlagsAndOracle(unittest.TestCase):
         self.config = args()
         for mode in ("decode", "idle", "target_verify", "draft_extend_v2", "mixed"):
             self.assertFalse(INDEX.enabled(query(), batch(mode=mode)))
+
+    def test_two_node_tp8_keeps_verify_and_performance_gates(self):
+        base = dict(nnodes=2, dp_size=2, enable_dp_attention=True, disable_radix_cache=False)
+        self.config = args(**base)
+        os.environ["SGLANG_GLM53_PD_PREFILL_INDEX_TP"] = "1"
+        os.environ["SGLANG_GLM53_PREFILL_INDEX_VERIFY_DIR"] = "/tmp/oracle"
+        self.assertFalse(INDEX.enabled(query(), batch()))
+        os.environ["SGLANG_GLM53_2NODE_PD"] = "1"
+        self.assertTrue(INDEX.enabled(query(), batch()))
+        os.environ["SGLANG_GLM53_PD_PREFILL_INDEX_TP_MODE"] = "performance"
+        self.assertFalse(INDEX.enabled(query(), batch()))
+        os.environ["SGLANG_GLM53_PD_PREFILL_INDEX_TP_DP_PERFORMANCE"] = "1"
+        self.assertTrue(INDEX.enabled(query(), batch()))
+        for change in (
+            dict(nnodes=4), dict(dp_size=4), dict(tp_size=8, ep_size=8),
+            dict(dcp_size=2), dict(attn_cp_size=2), dict(pp_size=2),
+            dict(disaggregation_mode="decode"), dict(disaggregation_mode="null"),
+            dict(moe_dp_size=2), dict(dwdp_size=2), dict(enable_prefill_cp=True),
+        ):
+            with self.subTest(change=change):
+                self.config = args(**(base | change))
+                self.assertFalse(INDEX.enabled(query(), batch()))
 
     def test_topology_schedule_quantization_guards(self):
         os.environ["SGLANG_GLM53_PD_PREFILL_INDEX_TP"] = "1"
