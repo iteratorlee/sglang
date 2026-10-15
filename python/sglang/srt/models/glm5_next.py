@@ -1,4 +1,5 @@
 import logging
+import os
 from contextlib import nullcontext
 from functools import partial
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
@@ -657,6 +658,20 @@ class Glm5NextDecoderLayer(nn.Module):
                 swiglu_limit=config.swiglu_limit,
             )
 
+        self._normal_skip_idle_dp = False
+        if (
+            self.is_layer_sparse
+            and os.getenv("SGLANG_GLM53_NORMAL_SKIP_IDLE_DP", "0") == "1"
+        ):
+            from sglang.srt.utils import is_npu
+
+            if is_npu():
+                from sglang.srt.hardware_backend.npu.moe.glm53_collectives import (
+                    normal_hccl_skip_idle_dp_enabled,
+                )
+
+                self._normal_skip_idle_dp = normal_hccl_skip_idle_dp_enabled()
+
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -830,6 +845,13 @@ class Glm5NextDecoderLayer(nn.Module):
             _mlp_ctx = moe_output_buffer_ctx(hidden_states_orig)
         else:
             _mlp_ctx = nullcontext()
+
+        if self._normal_skip_idle_dp:
+            from sglang.srt.hardware_backend.npu.moe.glm53_collectives import (
+                normal_hccl_idle_dp_scope,
+            )
+
+            _mlp_ctx = normal_hccl_idle_dp_scope(forward_batch, _mlp_ctx)
 
         with get_forward().scoped(
             fuse_mlp_allreduce=should_allreduce_fusion,

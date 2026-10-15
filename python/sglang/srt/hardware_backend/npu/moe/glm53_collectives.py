@@ -6,6 +6,8 @@ path is explicitly enabled for GLM W8A8 layers; decode still uses DeepEP LL.
 
 import logging
 import os
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 
 import torch
 import torch.distributed as dist
@@ -14,6 +16,8 @@ logger = logging.getLogger(__name__)
 _last_dispatch_metadata = None
 _activation_logged = False
 _bulk_activation_logged = False
+_idle_dp_counts = ContextVar("glm53_normal_hccl_idle_dp_counts", default=None)
+_idle_dp_logged = False
 
 
 def release_normal_hccl_cached_memory(x):
@@ -94,6 +98,95 @@ def normal_hccl_profile(args, limit):
             # applies without the DP-specific MAX_LEN padding policy.
             return "prefill_tp8_ep8"
     return None
+
+
+def normal_hccl_skip_idle_dp_enabled():
+    """Only the explicitly enabled, eager two-node P normal profile may opt in."""
+    if (
+        os.getenv("SGLANG_GLM53_NORMAL_SKIP_IDLE_DP", "0") != "1"
+        or os.getenv("SGLANG_GLM53_NORMAL_HCCL", "0") != "1"
+    ):
+        return False
+    from sglang.srt.runtime_context import get_server_args
+
+    args = get_server_args()
+    return (
+        normal_hccl_profile(args, 10.0) == "prefill_2node_dp2_tp8_ep16"
+        and args.deepep_mode == "normal"
+        and args.disable_cuda_graph
+        and not args.enable_single_batch_overlap
+    )
+
+
+@contextmanager
+def normal_hccl_idle_dp_scope(forward_batch, mlp_context=None):
+    """Publish immutable original CPU counts for just this GLM MLP invocation."""
+    counts = None
+    if normal_hccl_skip_idle_dp_enabled():
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        if forward_batch.forward_mode == ForwardMode.EXTEND:
+            original = getattr(forward_batch, "original_global_num_tokens_cpu", None)
+            padded = getattr(forward_batch, "global_num_tokens_cpu", None)
+            for name, values in (("original", original), ("padded", padded)):
+                if (
+                    not isinstance(values, (list, tuple))
+                    or len(values) != 2
+                    or any(type(value) is not int or value < 0 for value in values)
+                ):
+                    raise ValueError(
+                        f"GLM idle DP requires two nonnegative CPU {name} counts"
+                    )
+            if (
+                not forward_batch.dp_padding_mode.is_max_len()
+                or padded[0] != padded[1]
+                or any(real > capacity for real, capacity in zip(original, padded))
+            ):
+                raise ValueError("GLM idle DP requires matching MAX_LEN padded counts")
+            counts = tuple(original)
+    with nullcontext() if mlp_context is None else mlp_context:
+        token = _idle_dp_counts.set(counts)
+        try:
+            yield
+        finally:
+            _idle_dp_counts.reset(token)
+
+
+def _normal_skip_idle_dp_routes(selected, group, world, rank, tokens, topk):
+    """Filter CPU route offsets; retain every route in a positive-count domain."""
+    counts = _idle_dp_counts.get()
+    if counts is None:
+        return selected, 0, None
+    from sglang.srt.runtime_context import get_parallel
+
+    parallel = get_parallel()
+    ep = parallel.moe_ep_group
+    tp_ranks = parallel.tp_group.ranks
+    # With PP/CP/DCP/MoE-DP all one, EP and TP have the same ascending rank
+    # order. Attention DP d owns eight consecutive source-rank payload blocks.
+    # These are CPU group attributes: no device read or new collective.
+    if (
+        world != 16
+        or ep.world_size != 16
+        or ep.device_group is not group
+        or len(tp_ranks) != 16
+        or list(ep.ranks) != list(tp_ranks)
+        or list(ep.ranks) != list(range(ep.ranks[0], ep.ranks[0] + 16))
+        or ep.rank_in_group != rank
+        or parallel.attn_dp_size != 2
+        or parallel.attn_tp_size != 8
+        or parallel.attn_dp_rank != rank // 8
+        or parallel.attn_tp_rank != rank % 8
+        or selected.device.type != "cpu"
+    ):
+        raise RuntimeError("GLM idle DP requires the native DP2/TP8/EP16 rank mapping")
+    before = selected.numel()
+    span = 8 * tokens * topk
+    for domain, count in enumerate(counts):
+        if count == 0:
+            start = domain * span
+            selected = selected[(selected < start) | (selected >= start + span)]
+    return selected, before - selected.numel(), counts
 
 
 def _check_equal_dispatch_shapes(group, x, ids, weights, world):
@@ -180,7 +273,7 @@ def log_normal_hccl_activation(quant_info, profile):
 
 
 def collective_dispatch(group, x, ids, weights, num_experts=288):
-    global _last_dispatch_metadata
+    global _last_dispatch_metadata, _idle_dp_logged
     world, rank = dist.get_world_size(group), dist.get_rank(group)
     tokens, width = x.shape
     topk = ids.shape[1]
@@ -203,9 +296,25 @@ def collective_dispatch(group, x, ids, weights, num_experts=288):
     experts = num_experts // world
     low = rank * experts
     selected = ((flat >= low) & (flat < low + experts)).nonzero().flatten()
+    discarded, idle_counts = 0, None
+    if os.getenv("SGLANG_GLM53_NORMAL_SKIP_IDLE_DP", "0") == "1":
+        selected, discarded, idle_counts = _normal_skip_idle_dp_routes(
+            selected, group, world, rank, tokens, topk
+        )
     order = torch.argsort(flat[selected], stable=True)
     selected = selected[order]
     counts = torch.bincount(flat[selected] - low, minlength=experts).tolist()
+    if idle_counts is not None and 0 in idle_counts and not _idle_dp_logged:
+        logger.info(
+            "GLM53 normal HCCL skip idle DP: rank=%d world=%d valid_dp_counts=%s "
+            "discarded_padded_routes=%d countsum=%d",
+            rank,
+            world,
+            idle_counts,
+            discarded,
+            sum(counts),
+        )
+        _idle_dp_logged = True
     loc = selected.to(device=x.device, dtype=torch.int64)
     rows = torch.div(loc, topk, rounding_mode="floor")
     if selected.numel():
