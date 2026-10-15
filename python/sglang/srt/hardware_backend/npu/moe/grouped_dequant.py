@@ -1,5 +1,6 @@
 """Graph-safe FP32 dequantization for grouped INT8 expert GEMMs."""
 
+import os
 import torch
 import triton
 import triton.language as tl
@@ -67,6 +68,22 @@ def dequantize_grouped_int32(accum, weight_scale, token_scale, counts, output_dt
     Inputs are contiguous ND tensors; counts describe grouped token rows.
     """
     rows, channels = accum.shape
+    if os.getenv("SGLANG_GLM53_DEBUG_GROUPED_DEQUANT", "0") == "1":
+        # Explicit diagnostic mode only. Never enabled in measured services.
+        import json
+        torch.npu.synchronize()
+        values = counts.detach().cpu().tolist()
+        tensors = {}
+        for name, tensor in (("accum", accum), ("weight_scale", weight_scale),
+                             ("token_scale", token_scale), ("counts", counts)):
+            tensors[name] = dict(shape=list(tensor.shape), stride=list(tensor.stride()),
+                                 dtype=str(tensor.dtype), offset=tensor.storage_offset(),
+                                 storage_bytes=tensor.untyped_storage().nbytes())
+        print("GLM53_DEQUANT_DEBUG " + json.dumps(dict(tensors=tensors, counts=values)), flush=True)
+        assert len(values) == weight_scale.shape[0]
+        assert all(v >= 0 for v in values)
+        assert sum(values) <= min(rows, token_scale.numel())
+        assert weight_scale.numel() == len(values) * channels
     if rows >= 256:
         # DeepEP LL reserves a large buffer but only group_list.sum() rows
         # participate in GEMM/combine. Fill padding efficiently, then process
