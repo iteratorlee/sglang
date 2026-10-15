@@ -2950,6 +2950,12 @@ class SchedulerDisaggregationDecodeMixin:
         self: Scheduler, running_batch: ScheduleBatch
     ) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
+        # Benchmark preparation only: KV allocation and transfer continue in
+        # process_decode_queue, but no request emits its first D token until
+        # the client releases the gate. Default/off does not change batching.
+        if getattr(self, "_benchmark_decode_admission_hold", False):
+            return None
+
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
             for req in ready_grammar_requests:

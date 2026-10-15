@@ -5081,6 +5081,10 @@ class Scheduler(
         ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
         if self.disaggregation_mode == DisaggregationMode.DECODE:
+            ret["benchmark_decode_admission_hold"] = bool(
+                getattr(self, "_benchmark_decode_admission_hold", False)
+            )
+            ret["benchmark_decode_ready_requests"] = len(self.waiting_queue)
             ret["effective_decode_execution_max_requests_per_dp"] = (
                 get_decode_execution_max_requests_per_dp(
                     min(self.req_to_token_pool.size, self.max_running_requests)
@@ -5131,6 +5135,7 @@ class Scheduler(
                 "speculative_accept_threshold_acc",
                 "dspark_force_budget_frac",
                 "dspark_clear_info_records",
+                "benchmark_decode_admission_hold",
             ]
         )
 
@@ -5163,6 +5168,18 @@ class Scheduler(
                     )
                     if_success = False
                     break
+            elif k == "benchmark_decode_admission_hold" and (
+                self.disaggregation_mode != DisaggregationMode.DECODE
+                or type(v) is not int
+                or v not in (0, 1)
+                or (v == 1 and not self.running_batch.is_empty())
+            ):
+                logging.warning(
+                    "benchmark_decode_admission_hold requires decode mode, "
+                    "integer 0/1, and an idle running batch when enabling."
+                )
+                if_success = False
+                break
             elif k == "dspark_clear_info_records":
                 if not self.spec_algorithm.is_dspark() or not hasattr(
                     self.draft_worker, "clear_info_records"
@@ -5189,6 +5206,10 @@ class Scheduler(
             # DSpark control keys are worker commands, not server args; route
             # them to the draft worker and keep them out of the override.
             remaining = dict(server_args_dict)
+            if "benchmark_decode_admission_hold" in remaining:
+                self._benchmark_decode_admission_hold = bool(
+                    remaining.pop("benchmark_decode_admission_hold")
+                )
             frac = remaining.pop("dspark_force_budget_frac", None)
             if "dspark_force_budget_frac" in server_args_dict:
                 self.draft_worker.set_dspark_forced_budget_frac(
