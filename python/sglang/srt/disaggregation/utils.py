@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
+import logging
+import os
 import random
+import time
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
@@ -47,6 +51,11 @@ if is_npu():
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 _IS_HIP = is_hip()
+logger = logging.getLogger(__name__)
+
+# Host-only diagnostic bookkeeping, bounded independently in each TP process.
+_PD_TRANSFER_DIAGNOSTIC_LIMIT = 256
+_PD_TRANSFER_DIAGNOSTIC_ROOMS = {}
 
 
 def poll_and_all_reduce_pp(
@@ -209,7 +218,9 @@ def _is_fake_transfer(req: Req) -> bool:
     )
 
 
-def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
+def _apply_metadata_gate(
+    polls, decode_reqs, metadata_buffers, observed_metadata_rooms=None
+) -> None:
     """Downgrade Success → Transferring for requests whose metadata hasn't landed.
 
     Mutates `polls` in-place. Called before all-reduce so that MIN across TP
@@ -223,8 +234,84 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
             actual_room = metadata_buffers.bootstrap_room[
                 decode_req.metadata_buffer_index, 0
             ].item()
+            if (
+                observed_metadata_rooms is not None
+                and i < _PD_TRANSFER_DIAGNOSTIC_LIMIT
+            ):
+                # Reuse the native readiness read; diagnostics must never issue
+                # another device read or synchronization.
+                observed_metadata_rooms[i] = actual_room
             if actual_room == 0:
                 polls[i] = int(KVPoll.Transferring)
+
+
+def _log_pending_transfer_diagnostics(
+    decode_reqs, raw_polls, local_polls, reduced_polls, observed_metadata_rooms
+) -> None:
+    """Log bounded host snapshots after 10s pending, then every 60s per room.
+
+    Run after TP consensus so a locally ready rank also reports when its peer
+    holds the request. The normal logger formatter retains each process's rank.
+    Only the first 256 queue entries are sampled; no request objects are retained.
+    """
+    now = time.monotonic()
+    active = set()
+    for i, raw_poll in enumerate(raw_polls[:_PD_TRANSFER_DIAGNOSTIC_LIMIT]):
+        if reduced_polls[i] in (KVPoll.Success, KVPoll.Failed):
+            continue
+        decode_req = decode_reqs[i]
+        receiver = decode_req.kv_receiver
+        room = receiver.bootstrap_room
+        key = (id(receiver), room)
+        active.add(key)
+
+    for key in tuple(_PD_TRANSFER_DIAGNOSTIC_ROOMS):
+        if key not in active:
+            del _PD_TRANSFER_DIAGNOSTIC_ROOMS[key]
+
+    for i, raw_poll in enumerate(raw_polls[:_PD_TRANSFER_DIAGNOSTIC_LIMIT]):
+        if reduced_polls[i] in (KVPoll.Success, KVPoll.Failed):
+            continue
+        decode_req = decode_reqs[i]
+        receiver = decode_req.kv_receiver
+        room = receiver.bootstrap_room
+        key = (id(receiver), room)
+        first_seen, last_logged = _PD_TRANSFER_DIAGNOSTIC_ROOMS.setdefault(
+            key, (now, None)
+        )
+        if now - first_seen < 10 or (
+            last_logged is not None and now - last_logged < 60
+        ):
+            continue
+        _PD_TRANSFER_DIAGNOSTIC_ROOMS[key] = (first_seen, now)
+        mgr = receiver.kv_mgr
+        # Copy before sorting: the control thread adds ACKs concurrently.
+        acks = sorted(set(mgr.prefill_response_tracker.get(room, ())))
+        record = {
+            "rid": decode_req.req.rid,
+            "room": room,
+            "request_room": decode_req.req.bootstrap_room,
+            "metadata_index": decode_req.metadata_buffer_index,
+            "pending_s": round(now - first_seen, 3),
+            "raw_poll": int(raw_poll),
+            "local_poll": int(local_polls[i]),
+            "reduced_poll": int(reduced_polls[i]),
+            "manager_status": mgr.request_status.get(room),
+            "receiver_conclude_state": receiver.conclude_state,
+            "ack_set": acks,
+            "ack_count": len(acks),
+            "expected_acks": mgr.required_prefill_response_num_table.get(room),
+            "metadata_sampled": i in observed_metadata_rooms,
+            "metadata_room": observed_metadata_rooms.get(i),
+            "prefill_dp_rank": getattr(receiver, "prefill_dp_rank", None),
+            "target_tp_ranks": getattr(receiver, "target_tp_ranks", None),
+            "target_cp_ranks": getattr(receiver, "target_cp_ranks", None),
+            "target_pp_ranks": getattr(receiver, "target_pp_ranks", None),
+            "attn_dp_rank": mgr.attn_dp_rank,
+            "attn_tp_rank": mgr.attn_tp_rank,
+            "attn_tp_size": mgr.attn_tp_size,
+        }
+        logger.warning("GLM53_PD_TRANSFER_DIAGNOSTICS %s", json.dumps(record))
 
 
 def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
@@ -245,6 +332,17 @@ def poll_and_all_reduce(
 
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
     if decode_reqs is not None and metadata_buffers is not None:
+        if os.environ.get("SGLANG_GLM53_PD_TRANSFER_DIAGNOSTICS") == "1":
+            raw_polls = polls[:_PD_TRANSFER_DIAGNOSTIC_LIMIT]
+            observed_metadata_rooms = {}
+            _apply_metadata_gate(
+                polls, decode_reqs, metadata_buffers, observed_metadata_rooms
+            )
+            reduced_polls = _all_reduce_polls(polls, gloo_group)
+            _log_pending_transfer_diagnostics(
+                decode_reqs, raw_polls, polls, reduced_polls, observed_metadata_rooms
+            )
+            return reduced_polls
         _apply_metadata_gate(polls, decode_reqs, metadata_buffers)
     return _all_reduce_polls(polls, gloo_group)
 
