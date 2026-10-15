@@ -121,9 +121,12 @@ def init_torch_distributed(
         if get_exec().comm.pre_warm_nccl and (
             ps.tp_size > 1 or ps.pp_size > 1 or ps.moe_ep_size > 1
         ):
-            _prewarm_nccl(
-                tp_size=ps.tp_size, pp_size=ps.pp_size, moe_ep_size=ps.moe_ep_size
-            )
+            if device == "npu":
+                _prewarm_hccl(gpu_id=ps.gpu_id)
+            else:
+                _prewarm_nccl(
+                    tp_size=ps.tp_size, pp_size=ps.pp_size, moe_ep_size=ps.moe_ep_size
+                )
 
         # CUDA graph capture enables the PyNCCL communicator for TP LM-head
         # all-to-all. Exercise that exact send/recv path before measuring
@@ -305,6 +308,37 @@ def _init_parallel_groups(
     initialize_layernorm_sp(model_config=model_config)
     if is_npu():
         register_sgl_tp_rank(gpu_id)
+
+
+def _prewarm_hccl(*, gpu_id: int) -> None:
+    """Charge lazy HCCL transport buffers before the KV memory profile.
+
+    Attention DP has a separate attention TP communicator, and NPU EP
+    deliberately owns a separate communicator even when its ranks match TP.
+    All ranks visit these groups in the same order; aliases are warmed once.
+    This is startup-only and follows the existing --pre-warm-nccl opt-in.
+    """
+    from sglang.srt.distributed import get_attn_tp_group, get_moe_ep_group
+
+    start = time.perf_counter()
+    tensor = torch.zeros(1, device=f"npu:{gpu_id}")
+    seen = set()
+    warmed = []
+    for name, group in (
+        ("tp", get_tp_group()),
+        ("attention_tp", get_attn_tp_group()),
+        ("moe_ep", get_moe_ep_group()),
+    ):
+        handle = group.device_group
+        if group.world_size <= 1 or id(handle) in seen:
+            continue
+        seen.add(id(handle))
+        dist.all_reduce(tensor, group=handle)
+        current_platform.synchronize()
+        warmed.append((name, group.world_size))
+    del tensor
+    current_platform.empty_cache()
+    logger.info("HCCL pre-profile warmup completed: groups=%s elapsed=%.3fs", warmed, time.perf_counter() - start)
 
 
 def _prewarm_nccl(*, tp_size: int, pp_size: int, moe_ep_size: int) -> None:
