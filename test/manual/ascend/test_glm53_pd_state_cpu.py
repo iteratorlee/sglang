@@ -101,6 +101,8 @@ class NPUPool:
         self.index_head_dim = 128
         self.indexer_layer_ids = list(range(layers)) if indexed is None else indexed
         self.dsa_kv_cache_store_fp8 = packed
+        # Current production pool shares this layout flag between FP8 and C8.
+        self.dsa_kv_cache_store_quantized = packed
         self.k_buffer = [
             Tensor(np.zeros((9, 4, 5), dtype=np.uint16)) for _ in range(layers)
         ]
@@ -747,14 +749,100 @@ class TestGlm53PDState(unittest.TestCase):
                 (p_rank != 0, False),
             )
 
+    def test_two_node_tp8_to_tp2_all_global_ranks(self):
+        rank_mapping = source_functions(
+            SRT / "disaggregation/common/conn.py", ["_resolve_rank_mapping"], {},
+            "CommonKVManager",
+        )["_resolve_rank_mapping"]
+        skip_policy = source_functions(
+            SRT / "disaggregation/mooncake/conn.py",
+            ["_get_dsa_cache_transfer_skip_flags"], {}, "MooncakeKVManager",
+        )["_get_dsa_cache_transfer_skip_flags"]
+        for d_global in range(16):
+            manager = types.SimpleNamespace(
+                attn_tp_size=2, kv_args=types.SimpleNamespace(engine_rank=d_global),
+                is_mla_backend=False, is_hybrid_mla_backend=True,
+                attn_cp_size=1, attn_cp_rank=0, pp_size=1, pp_rank=0,
+            )
+            info = types.SimpleNamespace(attn_tp_size=8, attn_cp_size=1, pp_size=1)
+            rank_mapping(manager, info)
+            first = (d_global % 2) * 4
+            self.assertEqual(info.target_tp_ranks, list(range(first, first + 4)))
+            self.assertEqual(info.target_tp_rank, first)
+            self.assertEqual(info.required_prefill_response_num, 4)
+            for p_dp in range(2):
+                for p_local in info.target_tp_ranks:
+                    sender = types.SimpleNamespace(
+                        attn_tp_size=8,
+                        kv_args=types.SimpleNamespace(engine_rank=8 * p_dp + p_local),
+                        is_mla_backend=False, is_hybrid_mla_backend=True,
+                        _should_skip_cp_replicated_state_transfer=lambda: False,
+                    )
+                    self.assertEqual(
+                        skip_policy(sender, types.SimpleNamespace(dst_attn_tp_size=2)),
+                        (p_local != first, False),
+                    )
+
+    def test_c8_target_and_nextn_pages_keep_packed_bytes_and_bf16_index(self):
+        # Execute the real page-transfer planner with CPU addresses. Main and
+        # NextN use packed INT8 656-byte records; KPool remains BF16 storage.
+        sources, destinations = [], []
+        for layers in (2, 1):
+            src, dst = NPUPool(layers, packed=True), NPUPool(layers, packed=True)
+            for pool in (src, dst):
+                pool.dsa_kv_cache_store_fp8 = False
+                pool.dsa_kv_cache_store_int8 = True
+                pool.k_buffer = [
+                    Tensor(np.zeros((9, 64, 656), np.int8)) for _ in range(layers)
+                ]
+            sources.append(src)
+            destinations.append(dst)
+        src_ptrs, src_lens, dst_ptrs = [], [], []
+        pairs = []
+        for src, dst in zip(sources, destinations):
+            p, _, n = src.get_contiguous_buf_infos()
+            src_ptrs.extend(p)
+            src_lens.extend(n)
+            dst_ptrs.extend(dst.get_contiguous_buf_infos()[0])
+            pairs.extend(zip(src.k_buffer + src.index_k_buffer, dst.k_buffer + dst.index_k_buffer))
+        for entry, (src, dst) in enumerate(pairs):
+            src.array[2] = (np.arange(src.array[2].size).reshape(src.array[2].shape) + entry) % 127
+            dst.array.fill(7)
+
+        def copy_blocks(session, blocks):
+            for src, dst, count in blocks:
+                ctypes.memmove(dst, src, count)
+            return 0
+
+        sender = types.SimpleNamespace(
+            pp_size=1, enable_custom_mem_pool=False,
+            kv_args=types.SimpleNamespace(kv_data_ptrs=src_ptrs, kv_item_lens=src_lens),
+            _validate_envelope_kv_layout=lambda *a: None, _transfer_data=copy_blocks,
+        )
+        self.assertEqual(ASCEND_KV_SEND(
+            sender, "c8-tp8-to-tp2", np.array([2], np.int32), dst_ptrs,
+            np.array([7], np.int32), None, dst_attn_tp_size=2,
+        ), 0)
+        for src, dst in pairs:
+            np.testing.assert_array_equal(src.array[2], dst.array[7])
+            self.assertEqual(src.array.dtype, dst.array.dtype)
+            self.assertTrue((dst.array[:7] == 7).all())
+            self.assertTrue((dst.array[8:] == 7).all())
+
     def test_910b_tp4_to_tp2_target_and_draft_kpool_tail(self):
+        self._check_target_and_draft_kpool_tail(world=8, p_tp=4, d_dp=4, nnodes=1)
+
+    def test_two_node_tp8_to_tp2_target_and_draft_kpool_tail(self):
+        self._check_target_and_draft_kpool_tail(world=16, p_tp=8, d_dp=8, nnodes=2)
+
+    def _check_target_and_draft_kpool_tail(self, world, p_tp, d_dp, nnodes):
         p_parallel = types.SimpleNamespace(**(vars(PARALLEL) | dict(
-            tp_size=8, moe_ep_size=8, enable_dp_attention=True,
-            dp_size=2, attn_dp_size=2, attn_tp_size=4,
+            tp_size=world, moe_ep_size=world, enable_dp_attention=True, nnodes=nnodes,
+            dp_size=world // p_tp, attn_dp_size=world // p_tp, attn_tp_size=p_tp,
         )))
         d_parallel = types.SimpleNamespace(**(vars(PARALLEL) | dict(
-            tp_size=8, moe_ep_size=8, enable_dp_attention=True,
-            dp_size=4, attn_dp_size=4, attn_tp_size=2,
+            tp_size=world, moe_ep_size=world, enable_dp_attention=True, nnodes=nnodes,
+            dp_size=d_dp, attn_dp_size=d_dp, attn_tp_size=2,
         )))
         source, source_draft, _, source_buffers = make_registered(5, p_parallel)
         dest, dest_draft, _, dest_buffers = make_registered(9, d_parallel)
@@ -768,9 +856,9 @@ class TestGlm53PDState(unittest.TestCase):
             for name in ("_kpool_tail_k", "_kpool_tail_score"):
                 getattr(p, name).array[2] = entry + 1
                 getattr(d, name).array.fill(7)
-        # Both P writers hold replicated KPool tails; their writes must be
+        # P writers hold replicated KPool tails; their writes must be
         # byte-identical, including the draft's independently registered tail.
-        for _ in range(2):
+        for _ in range(p_tp // 2):
             blocks = UTILS["build_dsa_tail_transfer_blocks"](
                 source_ptrs, source_lens, dest_ptrs,
                 UTILS["get_dsa_tail_state_indices"](source, 2, 131075),
@@ -1004,7 +1092,12 @@ class TestGlm53PDState(unittest.TestCase):
     def test_910b_tp4_to_tp2_and_tp8_to_tp1_mamba_state_bytes(self):
         # Conv has a row before its channel axis; temporal does not. A TP1 D
         # must combine all eight P shards without overwriting neighboring rows.
-        for p_tp, d_tp, d_tp_rank in ((4, 2, 0), (4, 2, 1), (8, 1, 0)):
+        for p_tp, d_tp, d_tp_rank, p_dp in (
+            (4, 2, 0, 0), (4, 2, 1, 0), (8, 1, 0, 0),
+            # Both P hosts and all eight D DP domains, including global ranks
+            # 8..15 on the second D host. Transfer uses TP-local modulo ranks.
+            *((8, 2, d_rank, p_dp) for p_dp in range(2) for d_rank in range(16)),
+        ):
             with self.subTest(p_tp=p_tp, d_tp=d_tp, d_tp_rank=d_tp_rank):
                 writers = p_tp // d_tp
                 dest = MambaPool(
@@ -1018,7 +1111,7 @@ class TestGlm53PDState(unittest.TestCase):
                     return 0
 
                 for writer in range(writers):
-                    p_tp_rank = d_tp_rank * writers + writer
+                    p_tp_rank = (d_tp_rank % d_tp) * writers + writer
                     source = MambaPool(5, 3, False)
                     pd_state.prepare_glm53_pd_mamba_state(
                         types.SimpleNamespace(mamba_pool=source),
@@ -1037,7 +1130,7 @@ class TestGlm53PDState(unittest.TestCase):
                     src_ptrs, _, src_lens = source.get_contiguous_buf_infos()
                     dst_ptrs, _, dst_lens = dest.get_contiguous_buf_infos()
                     sender = types.SimpleNamespace(
-                        kv_args=types.SimpleNamespace(engine_rank=p_tp_rank),
+                        kv_args=types.SimpleNamespace(engine_rank=p_dp * p_tp + p_tp_rank),
                         attn_tp_size=p_tp, pp_size=1,
                         _transfer_data=copy_blocks,
                     )
