@@ -154,8 +154,9 @@ class Spec(msgspec.Struct):
             "DFLASH draft costs 10240 bytes/token in bf16. Setting fp8_e4m3 halves the draft "
             "pool; the saving shows up as free device memory, so raise "
             "--mem-fraction-static to convert it into KV capacity. Default follows "
-            "--kv-cache-dtype.",
-            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16"],
+            "--kv-cache-dtype. int8 supports GLM5Next zero-RoPE DSA on Ascend NPU "
+            "with page size 64 and a BF16 indexer.",
+            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "int8"],
         ),
     ] = None
     speculative_draft_window_size: A[

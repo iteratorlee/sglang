@@ -375,6 +375,7 @@ class HiCacheFile(HiCacheStorage):
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):
         self.file_path = envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get() or file_path
+        self._storage_namespace = ""
 
         tp_rank, tp_size, pp_rank, pp_size, model_name, is_mla_model = (
             storage_config.tp_rank,
@@ -447,9 +448,29 @@ class HiCacheFile(HiCacheStorage):
             ),
         )
 
+    def _bind_storage_format(self, host_pool) -> None:
+        get_namespace = getattr(host_pool, "get_storage_namespace", None)
+        namespace = get_namespace() if get_namespace is not None else ""
+        if self._storage_namespace and namespace != self._storage_namespace:
+            raise ValueError(
+                "HiCacheFile cannot rebind an incompatible MLA storage format"
+            )
+        self._storage_namespace = namespace
+
+    def register_mem_pool_host(self, mem_pool_host):
+        self._bind_storage_format(mem_pool_host)
+        super().register_mem_pool_host(mem_pool_host)
+
+    def register_mem_host_pool_v2(self, host_pool, host_pool_name):
+        if host_pool_name == PoolName.KV:
+            self._bind_storage_format(host_pool)
+        super().register_mem_host_pool_v2(host_pool, host_pool_name)
+
     def _get_suffixed_key(self, key: str) -> str:
         if key.endswith(".mamba"):
             key += self._mamba_tp_suffix
+        if self._storage_namespace:
+            key += f"_{self._storage_namespace}"
         return key + self.config_suffix
 
     def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
@@ -483,11 +504,19 @@ class HiCacheFile(HiCacheStorage):
         target_location: torch.Tensor,
         target_sizes: Optional[Any] = None,
     ) -> torch.Tensor | None:
+        if target_location.device.type != "cpu" or not target_location.is_contiguous():
+            raise ValueError("HiCacheFile read target must be a contiguous CPU tensor")
         suffixed = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
         try:
             expected = target_location.numel() * target_location.element_size()
             with open(tensor_path, "rb", buffering=0) as f:
+                actual = os.fstat(f.fileno()).st_size
+                if actual != expected:
+                    raise ValueError(
+                        f"HiCacheFile page size mismatch for {suffixed}: "
+                        f"expected {expected} bytes, found {actual}"
+                    )
                 buf = memoryview(target_location.view(torch.uint8).contiguous().numpy())
                 if f.readinto(buf) != expected:
                     raise IOError(f"Short read for {suffixed}")

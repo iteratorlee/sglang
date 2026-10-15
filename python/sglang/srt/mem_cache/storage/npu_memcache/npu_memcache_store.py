@@ -282,6 +282,8 @@ class NpuMemcacheStore(HiCacheStorage):
         self.backup_bandwidth = []
 
     def register_buffer(self, tensor: torch.Tensor):
+        if tensor.numel() == 0:
+            return
         if self.store is None:
             raise RuntimeError("Ascend MemCache store is not initialized.")
         ptr = tensor.data_ptr()
@@ -386,6 +388,10 @@ class NpuMemcacheStore(HiCacheStorage):
             self.register_buffer(buf)
 
     def _tag_keys(self, keys: List[str]) -> List[str]:
+        get_namespace = getattr(self.mem_pool_host, "get_storage_namespace", None)
+        namespace = get_namespace() if get_namespace is not None else ""
+        if namespace:
+            keys = [f"{namespace}_{key}" for key in keys]
         if self.extra_backend_tag is None:
             return keys
         return [f"{self.extra_backend_tag}_{key}" for key in keys]
@@ -411,22 +417,24 @@ class NpuMemcacheStore(HiCacheStorage):
             and getattr(self.mem_pool_host, "index_k_buffer", None) is not None
         )
 
-    def _mla_fp8_packed_kv(self) -> bool:
-        """FP8 DSA packs K/V into one buffer; v has no separate component key."""
+    def _mla_quantized_packed_kv(self) -> bool:
+        """FP8/INT8 DSA packs K/V into one buffer; v has no separate key."""
         return self.mem_pool_host is not None and getattr(
-            self.mem_pool_host, "dsa_kv_cache_store_fp8", False
+            self.mem_pool_host,
+            "dsa_kv_cache_store_quantized",
+            getattr(self.mem_pool_host, "dsa_kv_cache_store_fp8", False),
         )
 
     def _mla_key_multiplier(self) -> int:
         """Number of per-page memcache component keys for the MLA backend.
 
         Order matters and must match get_page_buffer_meta's ptr order:
-        k, [v], [index_k], [scale]. v is skipped for FP8-packed DSA where the
+        k, [v], [index_k], [scale]. v is skipped for quantized DSA where the
         device v_buffer is empty and never transferred.
         """
         if not self._mla_uses_kv_split():
             return 1
-        base = 1 if self._mla_fp8_packed_kv() else 2
+        base = 1 if self._mla_quantized_packed_kv() else 2
         return base + int(self._mla_has_index_k()) + int(self._mla_has_index_scale())
 
     def _get_hybrid_page_component_keys(
@@ -610,7 +618,7 @@ class NpuMemcacheStore(HiCacheStorage):
         for key_ in keys:
             key_list.append(f"{key_}_{self.mla_suffix}_k")
             if self._mla_uses_kv_split():
-                if not self._mla_fp8_packed_kv():
+                if not self._mla_quantized_packed_kv():
                     key_list.append(f"{key_}_{self.mla_suffix}_v")
                 if self._mla_has_index_k():
                     key_list.append(f"{key_}_{self.mla_suffix}_index_k")
@@ -870,7 +878,7 @@ class NpuMemcacheStore(HiCacheStorage):
             for key in page_keys:
                 query_keys.append(f"{key}_{self.mla_suffix}_k")
                 if self._mla_uses_kv_split():
-                    if not self._mla_fp8_packed_kv():
+                    if not self._mla_quantized_packed_kv():
                         query_keys.append(f"{key}_{self.mla_suffix}_v")
                     if self._mla_has_index_k():
                         query_keys.append(f"{key}_{self.mla_suffix}_index_k")

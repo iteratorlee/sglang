@@ -193,6 +193,24 @@ class HostPoolGroup:
         return getattr(self.anchor_entry.host_pool, "dsa_kv_cache_store_fp8", False)
 
     @property
+    def dsa_kv_cache_store_int8(self):
+        return getattr(self.anchor_entry.host_pool, "dsa_kv_cache_store_int8", False)
+
+    @property
+    def dsa_kv_cache_store_quantized(self):
+        return getattr(
+            self.anchor_entry.host_pool,
+            "dsa_kv_cache_store_quantized",
+            self.dsa_kv_cache_store_fp8 or self.dsa_kv_cache_store_int8,
+        )
+
+    def get_storage_namespace(self):
+        get_namespace = getattr(
+            self.anchor_entry.host_pool, "get_storage_namespace", None
+        )
+        return get_namespace() if get_namespace is not None else ""
+
+    @property
     def size_per_token(self):
         return self.anchor_entry.host_pool.size_per_token
 

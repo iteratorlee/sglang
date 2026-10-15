@@ -1,3 +1,4 @@
+import logging
 from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
@@ -594,22 +595,58 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             and dtype == torch.float8_e4m3fn
             and requested_kv_cache_dim is not None
         )
+        self.dsa_kv_cache_store_int8 = dtype == torch.int8
+        # CANN on 910B requires 64 physical RoPE lanes, including GLM's
+        # logically RoPE-free attention. Keep those lanes BF16 zero in the
+        # opaque C8 record; only the 512 latent channels are quantized.
+        self.packed_rope_dim = (
+            max(qk_rope_head_dim, 64)
+            if self.dsa_kv_cache_store_int8
+            else qk_rope_head_dim
+        )
+        if self.dsa_kv_cache_store_int8:
+            if not (
+                index_head_dim == 128
+                and kv_lora_rank == 512
+                and qk_rope_head_dim == 0
+                and page_size == 64
+                and not self.enable_sparsity_driven_kv_offload
+                and index_layout is None
+                and not share_zero_rope
+            ):
+                raise ValueError(
+                    "NPU INT8 KV requires GLM zero-RoPE DSA, latent512, "
+                    "index128 and page64 without sparse KV offload/compact caches"
+                )
+            expected = kv_lora_rank + self.packed_rope_dim * 2 + kv_lora_rank // 128 * 4
+            if requested_kv_cache_dim != expected:
+                raise ValueError(f"NPU INT8 packed KV width must be {expected}, got {requested_kv_cache_dim}")
+        self.dsa_kv_cache_store_quantized = (
+            self.dsa_kv_cache_store_fp8 or self.dsa_kv_cache_store_int8
+        )
         if self.dsa_kv_cache_store_fp8:
             assert index_head_dim == 128 and kv_lora_rank % 128 == 0
             assert requested_kv_cache_dim == (
                 kv_lora_rank + kv_lora_rank // 128 * 4 + qk_rope_head_dim * 2
             )
             self.store_dtype = dtype
-        self.kv_cache_dim = (
-            requested_kv_cache_dim if self.dsa_kv_cache_store_fp8 else kv_lora_rank
+        if self.dsa_kv_cache_store_int8:
+            self.store_dtype = torch.int8
+        # KPool keys retain their original precision and ranking behavior.
+        self.index_dtype = torch.bfloat16 if self.dsa_kv_cache_store_int8 else dtype
+        self.index_store_dtype = (
+            self.index_dtype if self.dsa_kv_cache_store_int8 else self.store_dtype
         )
-        self.kr_cache_dim = 0 if self.dsa_kv_cache_store_fp8 else qk_rope_head_dim
+        self.kv_cache_dim = (
+            requested_kv_cache_dim if self.dsa_kv_cache_store_quantized else kv_lora_rank
+        )
+        self.kr_cache_dim = 0 if self.dsa_kv_cache_store_quantized else qk_rope_head_dim
         # CANN sparse attention consumes physical 64-wide rotary lanes even
         # for a model with zero logical RoPE. These lanes remain immutable zero.
         self.zero_rope = (
             index_head_dim is not None
             and qk_rope_head_dim == 0
-            and not self.dsa_kv_cache_store_fp8
+            and not self.dsa_kv_cache_store_quantized
         )
         if self.zero_rope:
             self.kr_cache_dim = 64
@@ -678,7 +715,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                         1,
                         self.index_head_dim,
                     ),
-                    dtype=self.store_dtype,
+                    dtype=self.index_store_dtype,
                     device=self.device,
                 )
                 if self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0:
@@ -696,6 +733,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     )
 
         self._finalize_allocation_log(size)
+        if self.dsa_kv_cache_store_int8:
+            logging.getLogger(__name__).info(
+                "NPU C8 KV enabled: latent=int8 group=128, record=%d bytes "
+                "(RoPE=64 BF16 zero, scales=4 FP32), index=%s, layers=%d",
+                self.kv_cache_dim, self.index_dtype, self.layer_num,
+            )
 
     def get_kv_size_bytes(self):
         kv_size_bytes = 0
@@ -767,9 +810,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if getattr(self, "index_k_buffer", None) is None:
             raise RuntimeError("NPU MLA index KV cache is not allocated.")
 
-        if self.store_dtype != self.dtype:
+        if self.index_store_dtype != self.index_dtype:
             return self.index_k_buffer[self._get_indexer_slot(layer_id)].view(
-                self.dtype
+                self.index_dtype
             )
         return self.index_k_buffer[self._get_indexer_slot(layer_id)]
 
@@ -797,7 +840,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         kv_item_lens = [self.k_buffer[i][0].nbytes for i in range(self.layer_num)]
         # When DSA KV cache is packed into the FP8 k_buffer, the v_buffer is
         # intentionally empty (kr_cache_dim == 0). Its data_ptr() is null
-        if not getattr(self, "dsa_kv_cache_store_fp8", False):
+        if not self.dsa_kv_cache_store_quantized:
             kv_data_ptrs += [self.v_buffer[i].data_ptr() for i in range(self.layer_num)]
             kv_data_lens += [self.v_buffer[i].nbytes for i in range(self.layer_num)]
             kv_item_lens += [self.v_buffer[i][0].nbytes for i in range(self.layer_num)]
@@ -811,7 +854,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def get_kv_layer_ids(self):
         return (
             list(range(self.start_layer, self.start_layer + self.layer_num))
-            * (1 if self.dsa_kv_cache_store_fp8 else 2)
+            * (1 if self.dsa_kv_cache_store_quantized else 2)
             + self.get_state_layer_ids()
         )
 
@@ -853,6 +896,32 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         )
         return packed.view(self.dtype)
 
+    def _pack_dsa_int8_kv_cache(self, cache_k):
+        """CANN record: latent INT8 | zero RoPE BF16 | group FP32 scales.
+
+        Quantization is symmetric and dynamic per token and 128 channels.
+        Records are copied verbatim by PD, CPU retraction and HiCache: the
+        scale follows the exact KV slot it describes. No full-cache BF16
+        mirror or dequantization pass is allocated.
+        """
+        latent = cache_k.reshape(-1, self.kv_lora_rank).contiguous()
+        quantized, scale = torch_npu.npu_dynamic_quant(latent.view(-1, 128))
+        rows = latent.shape[0]
+        zero_rope = torch.zeros(
+            (rows, self.packed_rope_dim), dtype=torch.bfloat16, device=latent.device
+        )
+        return torch.cat(
+            (
+                quantized.reshape(rows, self.kv_lora_rank),
+                zero_rope.view(torch.int8),
+                scale.to(torch.float32)
+                .reshape(rows, self.kv_lora_rank // 128)
+                .contiguous()
+                .view(torch.int8),
+            ),
+            dim=-1,
+        )
+
     def set_kv_buffer(
         self,
         layer: "RadixAttention",
@@ -863,6 +932,14 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc, _, _ = unwrap_write_loc(loc_info)
         self._raise_if_native_kv_cache_disabled()
         layer_id = layer.layer_id
+        if self.dsa_kv_cache_store_int8:
+            packed = self._pack_dsa_int8_kv_cache(cache_k)
+            torch_npu.npu_scatter_nd_update_(
+                self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.kv_cache_dim),
+                loc.view(-1, 1),
+                packed.view(-1, 1, self.kv_cache_dim),
+            )
+            return
         if self.dsa_kv_cache_store_fp8:
             if cache_v is None:
                 cache_k, cache_v = cache_k.split(
@@ -911,11 +988,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc: torch.Tensor,
         index_k: torch.Tensor,
     ):
-        if index_k.dtype != self.dtype:
-            index_k = index_k.to(self.dtype)
+        if index_k.dtype != self.index_dtype:
+            index_k = index_k.to(self.index_dtype)
 
-        if self.store_dtype != self.dtype:
-            index_k = index_k.view(self.store_dtype)
+        if self.index_store_dtype != self.index_dtype:
+            index_k = index_k.view(self.index_store_dtype)
 
         torch_npu.npu_scatter_nd_update_(
             self.index_k_buffer[self._get_indexer_slot(layer_id)].view(

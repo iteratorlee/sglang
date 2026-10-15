@@ -1220,7 +1220,8 @@ class AscendAttnBackend(AttentionBackend):
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         if self.qk_rope_head_dim == 0:
-            q_pe = q_nope.new_zeros((*q_nope.shape[:-1], k_pe.shape[-1]))
+            rope_dim = 64 if self.kv_cache_dtype == torch.int8 else k_pe.shape[-1]
+            q_pe = q_nope.new_zeros((*q_nope.shape[:-1], rope_dim))
 
         if is_prefill:
             if self.forward_metadata.actual_seq_lengths_q is not None:
@@ -1283,9 +1284,9 @@ class AscendAttnBackend(AttentionBackend):
 
                 sparse_block_size = get_prefill_sparse_block_size(forward_batch)
             topk_indices = _expand_dsa_sparse_indices(topk_indices)
-            if self.kv_cache_dtype == torch.float8_e4m3fn:
+            if self.kv_cache_dtype in (torch.float8_e4m3fn, torch.int8):
                 assert q_nope.dtype == q_pe.dtype == torch.bfloat16
-                packed = k_nope.view(torch.float8_e4m3fn)
+                packed = k_nope.view(self.kv_cache_dtype)
                 attn_out = torch_npu.npu_kv_quant_sparse_flash_attention(
                     query=torch.cat((q_nope, q_pe), dim=-1).contiguous(),
                     key=packed,
@@ -1310,7 +1311,7 @@ class AscendAttnBackend(AttentionBackend):
                     attention_mode=2,
                     quant_scale_repo_mode=1,
                     tile_size=128,
-                    rope_head_dim=self.qk_rope_head_dim,
+                    rope_head_dim=(64 if self.kv_cache_dtype == torch.int8 else self.qk_rope_head_dim),
                 )
             else:
                 attn_out, _, _ = torch_npu.npu_sparse_flash_attention(

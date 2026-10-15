@@ -82,6 +82,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
     get_mm,
+    get_model,
     get_parallel,
     get_schedule,
     get_spec,
@@ -310,6 +311,13 @@ class KVCacheConfigurator:
 
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
         """Apply a resolved MemoryPoolConfig and initialize pools."""
+        _validate_pd_int8_draft_dtype(spec_algorithm=self.spec_algorithm)
+        if self.kv_cache_dtype == torch.int8:
+            _validate_npu_int8_kv_cache(
+                model_config=self.model_config, page_size=self.pool_page_size
+            )
+            if not self.use_mla_backend or get_exec().kernel.attention_backend != "ascend":
+                raise ValueError("INT8 KV cache requires the Ascend MLA attention backend.")
         if current_platform.is_cpu() and self.kv_cache_dtype == torch.float8_e4m3fn:
             if self.use_mla_backend:
                 raise ValueError("CPU FP8 KV cache is only supported for MHA.")
@@ -1544,9 +1552,13 @@ class KVCacheConfigurator:
                 )
                 if not dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
             )
-        use_dsa_fp8_kv_cache_storage = (
+        use_dsa_quantized_kv_cache_storage = (
             self.kv_cache_dtype == torch.float8_e4m3fn and is_arch35
-        )
+        ) or self.kv_cache_dtype == torch.int8
+        if self.kv_cache_dtype == torch.int8:
+            _validate_npu_int8_kv_cache(
+                model_config=self.model_config, page_size=self.pool_page_size
+            )
         token_to_kv_pool = NPUMLATokenToKVPool(
             max_total_num_tokens,
             page_size=self.pool_page_size,
@@ -1559,7 +1571,7 @@ class KVCacheConfigurator:
                 calculate_mla_kv_cache_dim(
                     model_config=self.model_config, kv_cache_dtype=self.kv_cache_dtype
                 )
-                if use_dsa_fp8_kv_cache_storage
+                if use_dsa_quantized_kv_cache_storage
                 else None
             ),
             layer_num=self.layer_info.num_effective_layers,
@@ -1844,6 +1856,10 @@ class KVCacheConfigurator:
         req_to_token_pool: ReqToTokenPool,
         mha_pool_class: type,
     ) -> KVCache:
+        if self.kv_cache_dtype == torch.int8:
+            _validate_npu_int8_kv_cache(
+                model_config=self.model_config, page_size=self.pool_page_size
+            )
         full_attention_layer_ids = (
             [0]
             if self.is_draft_worker
@@ -2579,11 +2595,77 @@ class KVCacheConfigurator:
         return total_rest_memory - mamba_state_memory
 
 
+def _validate_pd_int8_draft_dtype(*, spec_algorithm: SpeculativeAlgorithm) -> None:
+    if (
+        get_disagg().disaggregation_mode not in ("prefill", "decode")
+        or not spec_algorithm.is_eagle()
+    ):
+        return
+    target_dtype = get_model().kv_cache_dtype
+    draft_dtype = get_spec().speculative_draft_kv_cache_dtype
+    if draft_dtype is None:
+        draft_dtype = target_dtype
+    # PD validates the target format, but does not negotiate a separate draft
+    # format. Keep C8 MTP formats coupled until that handshake is available.
+    if (target_dtype == "int8") != (draft_dtype == "int8"):
+        raise ValueError(
+            "PD MTP requires target and draft KV caches to both use int8 or "
+            "both use non-int8 dtypes; mixed C8 target/draft formats are not "
+            "supported by the PD handshake. Set --kv-cache-dtype and "
+            "--speculative-draft-kv-cache-dtype consistently."
+        )
+
+
+def _validate_npu_int8_kv_cache(*, model_config: ModelConfig, page_size: int) -> None:
+    """C8 is an opaque Ascend GLM5Next record, never a generic INT8 cast."""
+    architectures = getattr(model_config.hf_config, "architectures", None) or ()
+    if not (
+        _is_npu
+        and any(
+            arch in (
+                "Glm5NextForConditionalGeneration",
+                "Glm5NextForConditionalGenerationNextN",
+            )
+            for arch in architectures
+        )
+        and is_deepseek_dsa(model_config.hf_config)
+        and getattr(model_config, "kv_lora_rank", None) == 512
+        and getattr(model_config, "qk_rope_head_dim", None) == 0
+        and get_dsa_index_head_dim(model_config.hf_config) == 128
+        and page_size == 64
+    ):
+        raise ValueError(
+            "INT8 KV cache requires GLM5Next/NextN on Ascend NPU with "
+            "latent512, logical RoPE0, BF16 index128 and page64."
+        )
+    if envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
+        raise ValueError("INT8 KV cache does not support sparse KV offload.")
+    from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+
+    parallel = get_parallel()
+    if (
+        parallel.attn_cp_size != 1
+        or parallel.dcp_size != 1
+        or parallel.attn_dcp_size != 1
+        or is_dsa_enable_prefill_cp()
+    ):
+        raise ValueError(
+            "INT8 KV cache requires attn CP=1, DCP=1 and DSA prefill CP disabled; "
+            "the CP attention kernel cannot consume packed INT8 KV."
+        )
+
+
 def calculate_mla_kv_cache_dim(
     *, model_config: ModelConfig, kv_cache_dtype: torch.dtype
 ) -> int:
+    if kv_cache_dtype == torch.int8:
+        _validate_npu_int8_kv_cache(
+            model_config=model_config, page_size=get_schedule().page_size
+        )
+        # CANN requires physical BF16 zero-RoPE64 even for logical RoPE0.
+        # Four latent blocks of 128 each carry an FP32 dequantization scale.
+        return 512 + 64 * torch.bfloat16.itemsize + (512 // 128) * torch.float32.itemsize
     is_dsa_model = is_deepseek_dsa(model_config.hf_config)
-    kv_cache_dtype = kv_cache_dtype
     kv_lora_rank = model_config.kv_lora_rank
     qk_rope_head_dim = model_config.qk_rope_head_dim
     kv_cache_dim = kv_lora_rank + qk_rope_head_dim  # default mla kv cache dim

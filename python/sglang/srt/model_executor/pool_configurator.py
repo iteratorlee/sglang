@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 from bisect import bisect_right
+from copy import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -241,7 +242,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(num_layers) > 0
             ):
                 draft_num_layers = int(eagle_draft_num_layers)
-                if is_deepseek_dsa(kvc.model_config.hf_config):
+                if _is_npu and (
+                    kvc.kv_cache_dtype == torch.int8
+                    or get_spec().speculative_draft_kv_cache_dtype == "int8"
+                ):
+                    self._cell_size += self._compute_npu_c8_draft_cell_size(
+                        kvc, num_layers, draft_num_layers
+                    )
+                elif is_deepseek_dsa(kvc.model_config.hf_config):
                     target_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,
                         num_layers=num_layers,
@@ -291,6 +299,47 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     * get_parallel().attn_dcp_size,
                     draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
                 )
+
+    def _compute_npu_c8_draft_cell_size(
+        self, kvc: KVCacheConfigurator, num_layers: int, draft_num_layers: int
+    ) -> int:
+        """Price an MTP draft using its dtype when either pool opts into C8."""
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            calculate_mla_kv_cache_dim,
+        )
+        from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
+
+        draft = copy(kvc)
+        draft.is_draft_worker = True
+        override = get_spec().speculative_draft_kv_cache_dtype
+        if override is not None:
+            _, draft.kv_cache_dtype = configure_kv_cache_dtype(
+                server_args_kv_cache_dtype="auto",
+                model=kvc.model,
+                model_dtype=kvc.model_dtype,
+                is_draft_worker=True,
+                is_dflash=False,
+                speculative_draft_attention_backend=get_spec().speculative_draft_attention_backend,
+                speculative_draft_kv_cache_dtype=override,
+            )
+        draft_kv_bytes = (
+            calculate_mla_kv_cache_dim(
+                model_config=draft.model_config, kv_cache_dtype=draft.kv_cache_dtype
+            )
+            * draft.kv_cache_dtype.itemsize
+            * draft_num_layers
+        )
+        # The unquantized NPU zero-RoPE pool allocates a separate 64-lane
+        # buffer. Include it on either BF16 side of a mixed BF16/C8 pair.
+        # Pure BF16/FP8 serving keeps its existing sizing path.
+        if kvc.model_config.qk_rope_head_dim == 0:
+            if draft.kv_cache_dtype in (torch.bfloat16, torch.float16):
+                draft_kv_bytes += 64 * draft.kv_cache_dtype.itemsize * draft_num_layers
+            if kvc.kv_cache_dtype in (torch.bfloat16, torch.float16):
+                draft_kv_bytes += 64 * kvc.kv_cache_dtype.itemsize * num_layers
+        return draft_kv_bytes + self._compute_dsa_indexer_cell_size(
+            kvc=draft, num_layers=draft_num_layers, allocate_all_layers=True
+        )
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""
@@ -467,6 +516,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
             dtype = kvc.kv_cache_dtype
+            if dtype == torch.int8:
+                # C8 quantizes only the main latent KV; KPool keys stay BF16.
+                dtype = torch.bfloat16
             # GPU sizing above assumes FP8 indexers; NPU also needs BF16 sizing.
             if dtype != torch.float8_e4m3fn:
                 indexer_size_per_token = index_head_dim

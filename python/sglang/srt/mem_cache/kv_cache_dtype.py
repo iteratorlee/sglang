@@ -6,13 +6,15 @@ from torch import nn
 
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.platforms import current_platform
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_npu
 
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
+_is_npu = is_npu()
 
 TORCH_DTYPE_TO_KV_CACHE_STR = {
+    torch.int8: "int8",
     torch.float8_e4m3fn: "fp8_e4m3",
     torch.float8_e4m3fnuz: "fp8_e4m3",
     torch.float8_e5m2: "fp8_e5m2",
@@ -60,6 +62,12 @@ def configure_kv_cache_dtype(
             kv_cache_dtype = torch.float8_e4m3fn
     elif server_args_kv_cache_dtype == "mxfp8":
         kv_cache_dtype = torch.float8_e4m3fn
+    elif server_args_kv_cache_dtype == "int8":
+        if not _is_npu:
+            raise ValueError("--kv-cache-dtype int8 is only supported for GLM5Next on NPU.")
+        if is_draft_worker and speculative_draft_attention_backend not in (None, "ascend"):
+            raise ValueError("INT8 draft KV cache requires the ascend attention backend.")
+        kv_cache_dtype = torch.int8
     elif server_args_kv_cache_dtype in ("bf16", "bfloat16"):
         kv_cache_dtype = torch.bfloat16
     elif server_args_kv_cache_dtype == "fp4_e2m1":

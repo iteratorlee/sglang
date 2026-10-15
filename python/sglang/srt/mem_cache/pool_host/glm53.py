@@ -9,6 +9,9 @@ the allocator and file representation expose indivisible logical pages.
 
 from __future__ import annotations
 
+import hashlib
+import json
+
 import torch
 
 from sglang.srt.mem_cache.pool_host.base import HostKVCache
@@ -20,7 +23,14 @@ def is_glm53_kpool(pool) -> bool:
         str(pool.device).split(":", 1)[0] == "npu"
         and getattr(pool, "kpool_use_compress", False)
         and getattr(pool, "index_kpool", None) == 4
-        and getattr(pool, "zero_rope", False)
+        and (
+            getattr(pool, "zero_rope", False)
+            or (
+                getattr(pool, "dsa_kv_cache_store_int8", False)
+                and pool.qk_rope_head_dim == 0
+                and pool.kv_cache_dim == 656
+            )
+        )
         and pool.page_size == 64
     )
 
@@ -56,6 +66,11 @@ class GLM53MLAPoolHost(HostKVCache):
             raise ValueError("GLM53 HiCache does not support DCP")
         self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
         self.device_pools = (device_pool, *self.mtp_draft_device_pools)
+        self.dsa_kv_cache_store_int8 = any(
+            getattr(pool, "dsa_kv_cache_store_int8", False)
+            for pool in self.device_pools
+        )
+        self.dsa_kv_cache_store_quantized = self.dsa_kv_cache_store_int8
         for pool in self.device_pools:
             if (
                 not is_glm53_kpool(pool)
@@ -85,13 +100,27 @@ class GLM53MLAPoolHost(HostKVCache):
         self.target_layer_num = self.device_pool.layer_num
         self.layer_num = sum(p.layer_num for p in self.device_pools)
         return sum(
-            (
-                p.k_buffer.shape[0] * p.k_buffer.shape[-1]
-                + p.index_k_buffer.shape[0] * p.index_k_buffer.shape[-1]
-            )
-            * p.store_dtype.itemsize
+            component.shape[0] * component.shape[-1] * component.element_size()
             for p in self.device_pools
+            for component in (p.k_buffer, p.index_k_buffer)
         )
+
+    def get_storage_namespace(self):
+        if not self.dsa_kv_cache_store_int8:
+            return ""
+        descriptor = {
+            "version": 1,
+            "format": "glm53-kpool-logical256-native-c8-656",
+            "page_size": self.page_size,
+            "components": [
+                (str(buf.dtype), list(buf.shape[1:])) for buf in self._components
+            ],
+            "indexer_layers": [
+                list(getattr(p, "indexer_layer_ids", ())) for p in self.device_pools
+            ],
+        }
+        digest = hashlib.sha256(json.dumps(descriptor, sort_keys=True).encode()).hexdigest()
+        return f"glm53_c8_v1_{digest[:32]}"
 
     def init_kv_buffer(self):
         alloc = ALLOC_MEMORY_FUNCS[self.device_pool.device]

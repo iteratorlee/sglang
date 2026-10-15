@@ -200,7 +200,8 @@ class Model(msgspec.Struct):
                 'Data type for kv cache storage. "auto" will use model data type. '
                 '"bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and '
                 '"fp8_e4m3" are supported for CUDA 11.8+. "mxfp8" is supported '
-                'by the FA4 backend. "nvfp4" selects '
+                'by the FA4 backend. "int8" supports GLM5Next zero-RoPE DSA '
+                'on Ascend NPU with page size 64; the indexer remains BF16. "nvfp4" selects '
                 'the NVFP4 FP4 E2M1 KV cache recipe; "fp4_mx_block16" '
                 "selects the MX-style block-size-16 FP4 E2M1 KV cache "
                 "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+"
@@ -212,6 +213,7 @@ class Model(msgspec.Struct):
                 "mxfp8",
                 "bf16",
                 "bfloat16",
+                "int8",
                 "nvfp4",
                 "fp4_mx_block16",
                 "fp4_e2m1",

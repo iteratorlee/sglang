@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import math
 import threading
 from typing import Optional, Sequence
 
@@ -227,17 +230,54 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def get_size_per_token(self):
         self.kv_lora_rank = self.device_pool.kv_lora_rank
         self.qk_rope_head_dim = self.device_pool.qk_rope_head_dim
-        # FP8 DSA packs K/V into the single device k_buffer (device v_buffer is
+        # Quantized DSA packs K/V into the single device k_buffer (v_buffer is
         # empty and never transferred). Exposed for the L3 store to skip the
         # dead v component when generating per-page keys/pointers.
         self.dsa_kv_cache_store_fp8 = getattr(
             self.device_pool, "dsa_kv_cache_store_fp8", False
+        )
+        self.dsa_kv_cache_store_int8 = getattr(
+            self.device_pool, "dsa_kv_cache_store_int8", False
+        )
+        self.dsa_kv_cache_store_quantized = getattr(
+            self.device_pool,
+            "dsa_kv_cache_store_quantized",
+            self.dsa_kv_cache_store_fp8 or self.dsa_kv_cache_store_int8,
+        )
+        index_buffer = getattr(self.device_pool, "index_k_buffer", None)
+        self.index_dtype = (
+            index_buffer.dtype
+            if index_buffer is not None
+            else getattr(self.device_pool, "index_store_dtype", self.dtype)
         )
         self.target_layer_num = self._effective_host_layer_num()
         self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
         self.kv_cache_dim = self.override_kv_cache_dim or (
             self.kv_lora_rank + self.qk_rope_head_dim
         )
+        if self.layout == "page_first_kv_split":
+            self.k_width = (
+                self.device_pool.kv_cache_dim
+                if self.dsa_kv_cache_store_quantized
+                else self.kv_lora_rank
+            )
+            self.v_width = (
+                0 if self.dsa_kv_cache_store_quantized else self.qk_rope_head_dim
+            )
+            self.kv_cache_dim = self.k_width + self.v_width
+            if self.dsa_kv_cache_store_int8:
+                if self.dtype != torch.int8 or self.index_dtype != torch.bfloat16:
+                    raise TypeError(
+                        "INT8 MLA requires INT8 packed KV and BF16 index storage"
+                    )
+                if self.k_width != 656 or self.v_width != 0:
+                    raise ValueError(
+                        "INT8 MLA requires packed KV width 656 and empty V"
+                    )
+                if getattr(self.device_pool, "index_k_scale_buffer", None) is not None:
+                    raise ValueError(
+                        "INT8 MLA BF16 index must not have a quantization scale"
+                    )
         size_per_token = self.kv_cache_dim * self.dtype.itemsize * self.layer_num
         if (
             self.layout == "page_first_kv_split"
@@ -252,7 +292,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 num_indexer_layers = self.layer_num
             size_per_token += (
                 self.device_pool.index_head_dim
-                * self.dtype.itemsize
+                * self.index_dtype.itemsize
                 * num_indexer_layers
             )
             if getattr(self.device_pool, "index_k_scale_buffer", None) is not None:
@@ -300,37 +340,13 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 num_indexer_layers = self.layer_num
             indexer_dims = (self.page_num, num_indexer_layers, self.page_size, 1)
             alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
-            if getattr(self.device_pool, "dsa_kv_cache_store_fp8", False):
-                # FP8 DSA packs latent+RoPE+scale into the device k_buffer;
-                # mirror the packed width so the 2D memcpy row width matches.
-                k_width = self.device_pool.kv_cache_dim
-            else:
-                k_width = self.kv_lora_rank
+            k_width = self.k_width
             if _is_npu and memfabric_host_memory_enabled():
                 # Memfabric-mapped host DRAM (single switch): required by the
                 # AIV sparse-copy IO path and usable by the legacy memcpy2d
                 # path unchanged.  Size the GB-aligned reserve with the
                 # combined bytes of all buffers allocated below.
-                total_bytes = (
-                    self.page_num
-                    * self.page_size
-                    * self.layer_num
-                    * (k_width + self.qk_rope_head_dim)
-                    * self.dtype.itemsize
-                )
-                if self.device_pool.index_head_dim is not None:
-                    total_bytes += (
-                        self.page_num
-                        * self.page_size
-                        * num_indexer_layers
-                        * self.device_pool.index_head_dim
-                        * self.dtype.itemsize
-                    )
-                if getattr(self.device_pool, "index_k_scale_buffer", None) is not None:
-                    # FP32 scale mirror
-                    total_bytes += (
-                        self.page_num * self.page_size * num_indexer_layers * 4
-                    )
+                total_bytes = self.size * self.size_per_token
                 ensure_memfabric_capacity(total_bytes, torch.npu.current_device())
                 alloc_func = alloc_with_memfabric
             self.k_buffer = alloc_func(
@@ -340,18 +356,22 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
             )
-            self.v_buffer = alloc_func(
-                (*base_dims, self.qk_rope_head_dim),
-                dtype=self.dtype,
-                device=self.device,
-                pin_memory=self.pin_memory,
-                allocator=self.allocator,
+            self.v_buffer = (
+                alloc_func(
+                    (*base_dims, self.v_width),
+                    dtype=self.dtype,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+                    allocator=self.allocator,
+                )
+                if self.v_width
+                else torch.empty((*base_dims, 0), dtype=self.dtype, device=self.device)
             )
             self.index_k_buffer = None
             if self.device_pool.index_head_dim is not None:
                 self.index_k_buffer = alloc_func(
                     (*indexer_dims, self.device_pool.index_head_dim),
-                    dtype=self.dtype,
+                    dtype=self.index_dtype,
                     device=self.device,
                     pin_memory=self.pin_memory,
                     allocator=self.allocator,
@@ -368,6 +388,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     pin_memory=self.pin_memory,
                     allocator=self.allocator,
                 )
+            self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
+            self.layout_dim = self.token_stride_size * self.layer_num
             # Return k_buffer to preserve original kv_buffer and data_refs init logic,
             # though Ascend doesn't use these parameters.
             return self.k_buffer
@@ -514,6 +536,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     @staticmethod
     def _ascendc_comp_meta(dev_t, host_t, lo, hi):
         """Build the 9-int metadata tuple for one KV component."""
+        if dev_t.dtype != host_t.dtype:
+            raise TypeError("MLA byte transfer does not convert dtype")
+        if dev_t.shape[0] != host_t.shape[1] or math.prod(dev_t.shape[2:]) != math.prod(
+            host_t.shape[2:]
+        ):
+            raise ValueError("MLA device/host component payload shapes differ")
         itemsize = dev_t.dtype.itemsize
         width = 1
         for dim in dev_t.shape[2:]:
@@ -559,7 +587,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
 
         comp_meta = self._ascendc_comp_meta
         comps = [comp_meta(device_pool.k_buffer, self.k_buffer, k_lo, k_hi)]
-        # FP8 DSA packs V into the device k_buffer; the device v_buffer is
+        # Quantized DSA packs V into the device k_buffer; the device v_buffer is
         # empty and must be skipped.
         if device_pool.v_buffer.numel() > 0 and self.v_buffer.numel() > 0:
             comps.append(comp_meta(device_pool.v_buffer, self.v_buffer, k_lo, k_hi))
@@ -649,9 +677,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     ):
         if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
             return
-        assert not getattr(self, "_is_dummy", False), (
-            "load on a dummy (non-src MLA) host pool"
-        )
+        assert not getattr(
+            self, "_is_dummy", False
+        ), "load on a dummy (non-src MLA) host pool"
         host_indices = self.maybe_dcp_kernel_indices(host_indices)
         device_indices = self.maybe_dcp_kernel_indices(device_indices)
         # MTP draft layers do not participate in CP layer sharding.
@@ -776,9 +804,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         *,
         is_draft: bool = False,
     ):
-        assert not getattr(self, "_is_dummy", False), (
-            "backup on a dummy (non-src MLA) host pool"
-        )
+        assert not getattr(
+            self, "_is_dummy", False
+        ), "backup on a dummy (non-src MLA) host pool"
         # Indices arrive already translated by backup_from_device_all_layer.
         # MTP draft layers do not participate in CP layer sharding.
         host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
@@ -847,9 +875,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
-        assert not getattr(self, "_is_dummy", False), (
-            "backup on a dummy (non-src MLA) host pool"
-        )
+        assert not getattr(
+            self, "_is_dummy", False
+        ), "backup on a dummy (non-src MLA) host pool"
         host_indices = self.maybe_dcp_kernel_indices(host_indices)
         device_indices = self.maybe_dcp_kernel_indices(device_indices)
         if self._is_device_layer_sharded(device_pool):
@@ -976,12 +1004,76 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
+    def _split_page_components(self):
+        """Storage order; preserve the legacy V key except for packed KV."""
+        return [
+            (name, tensor)
+            for name in (
+                "k_buffer",
+                "v_buffer",
+                "index_k_buffer",
+                "index_k_scale_buffer",
+            )
+            if (tensor := getattr(self, name, None)) is not None
+            and not (name == "v_buffer" and self.dsa_kv_cache_store_quantized)
+        ]
+
+    def get_storage_namespace(self) -> str:
+        if (
+            self.layout != "page_first_kv_split"
+            or not self.dsa_kv_cache_store_quantized
+        ):
+            return ""
+        # Token hashes and model names alone cannot distinguish BF16, FP8 and
+        # C8 pages, even when their byte lengths happen to agree. Include the
+        # physical format and layer mapping, but exclude capacity and addresses
+        # so independent P/D and Pcache pools can share compatible pages.
+        descriptor = {
+            "version": 1,
+            "layout": self.layout,
+            "encoding": (
+                "int8"
+                if self.dsa_kv_cache_store_int8
+                else ("fp8" if self.dsa_kv_cache_store_fp8 else "native")
+            ),
+            "components": [
+                (name, str(tensor.dtype), list(tensor.shape[1:]))
+                for name, tensor in self._split_page_components()
+            ],
+            "start_layer": self.start_layer,
+            "indexer_layers": list(getattr(self.device_pool, "indexer_layer_ids", ())),
+            "logical_rope_dim": getattr(
+                self.device_pool, "logical_qk_rope_head_dim", self.qk_rope_head_dim
+            ),
+        }
+        digest = hashlib.sha256(
+            json.dumps(descriptor, sort_keys=True).encode()
+        ).hexdigest()
+        return f"mla_v1_{descriptor['encoding']}_{digest[:32]}"
+
+    def _split_page_index(self, index: int) -> int:
+        if index < 0 or index % self.page_size or index + self.page_size > self.size:
+            raise ValueError(
+                f"MLA storage requires an in-range, page-aligned index: {index}"
+            )
+        return index // self.page_size
+
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         assert self.dcp_size == 1, (
             "HiCache L3 storage paths are not yet DCP-aware (per-rank shards "
             "need dcp_rank-scoped keys); --hicache-storage-backend with "
             "--dcp-size > 1 should have been rejected at server start."
         )
+        if self.layout == "page_first_kv_split":
+            page = self._split_page_index(index)
+            # A mixed-dtype page has no homogeneous shaped view. Its public
+            # representation is always the concatenation of component bytes.
+            return torch.cat(
+                [
+                    tensor[page].contiguous().view(torch.uint8).flatten()
+                    for _, tensor in self._split_page_components()
+                ]
+            )
         if self.layout == "layer_first":
             data_page = self.kv_buffer[:, index : index + self.page_size, :, :]
         elif self.layout == "page_first":
@@ -996,6 +1088,13 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         return data_page
 
     def get_dummy_flat_data_page(self) -> torch.Tensor:
+        if self.layout == "page_first_kv_split":
+            return torch.empty(
+                self.page_size * self.size_per_token,
+                dtype=torch.uint8,
+                device=self.device,
+                pin_memory=self.pin_memory,
+            )
         return torch.zeros(
             (
                 self.layer_num,
@@ -1009,6 +1108,21 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         ).flatten()
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        if self.layout == "page_first_kv_split":
+            page = self._split_page_index(index)
+            if data_page.dtype != torch.uint8:
+                raise TypeError("MLA split storage page must have dtype torch.uint8")
+            expected = self.page_size * self.size_per_token
+            if data_page.ndim != 1 or data_page.numel() != expected:
+                raise ValueError(
+                    f"MLA split storage page must contain exactly {expected} bytes"
+                )
+            offset = 0
+            for _, tensor in self._split_page_components():
+                target = tensor[page].view(torch.uint8).flatten()
+                target.copy_(data_page[offset : offset + target.numel()])
+                offset += target.numel()
+            return
         if self.layout == "layer_first":
             self.kv_buffer[:, index : index + self.page_size, :, :] = data_page.reshape(
                 self.layer_num,
@@ -1044,86 +1158,19 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
         indices = indices.tolist()
         if self.layout == "page_first_kv_split":
-            k_buffer_data_ptr = self.k_buffer.data_ptr()
-            v_buffer_data_ptr = self.v_buffer.data_ptr()
-            index_k_buffer = getattr(self, "index_k_buffer", None)
-            index_k_buffer_data_ptr = (
-                index_k_buffer.data_ptr() if index_k_buffer is not None else None
-            )
-            scale_buffer = getattr(self, "index_k_scale_buffer", None)
-            scale_buffer_data_ptr = (
-                scale_buffer.data_ptr() if scale_buffer is not None else None
-            )
-            # k row width mirrors the device pool (packed dim for FP8 DSA).
-            k_width = self.k_buffer.shape[-1]
-            k_item_size = self.k_buffer.element_size()
-            # Indexer buffers cover only physical Indexer layers, which can be
-            # a subset of all layers (e.g. GLM 5.2: 21 of 78).
-            num_indexer_layers = (
-                index_k_buffer.shape[1] if index_k_buffer is not None else 0
-            )
-            index_k_width = (
-                index_k_buffer.shape[-1] if index_k_buffer is not None else 0
-            )
-            index_k_item_size = (
-                index_k_buffer.element_size() if index_k_buffer is not None else 0
-            )
-            # FP8 DSA packs V into k_buffer; the device v_buffer is empty and
-            # never transferred, so the host v mirror holds no valid data and
-            # must not be persisted to storage.
-            skip_v = getattr(self, "dsa_kv_cache_store_fp8", False)
-            for index in range(0, len(indices), self.page_size):
-                k_ptr = (
-                    k_buffer_data_ptr
-                    + indices[index] * self.layer_num * k_width * k_item_size
-                )
-                ptr_list.append(k_ptr)
-                if not skip_v:
-                    v_ptr = (
-                        v_buffer_data_ptr
-                        + indices[index]
-                        * self.layer_num
-                        * self.qk_rope_head_dim
-                        * self.dtype.itemsize
-                    )
-                    ptr_list.append(v_ptr)
-                if index_k_buffer_data_ptr is not None:
-                    # Host index_k layout is (page_num, num_indexer_layers,
-                    # page_size, 1, index_head_dim).
-                    ptr_list.append(
-                        index_k_buffer_data_ptr
-                        + indices[index]
-                        * num_indexer_layers
-                        * index_k_width
-                        * index_k_item_size
-                    )
-                if scale_buffer_data_ptr is not None:
-                    # Host scale layout is (page_num, num_indexer_layers,
-                    # page_size, 1, 1) FP32: one scale value per token per
-                    # indexer layer.
-                    ptr_list.append(
-                        scale_buffer_data_ptr + indices[index] * num_indexer_layers * 4
-                    )
-            k_element_size = self.layer_num * k_item_size * self.page_size * k_width
-            v_element_size = (
-                self.layer_num
-                * self.dtype.itemsize
-                * self.page_size
-                * self.qk_rope_head_dim
-            )
-            index_k_element_size = (
-                num_indexer_layers * index_k_item_size * self.page_size * index_k_width
-            )
-            scale_element_size = num_indexer_layers * 4 * self.page_size
             element_size_list = []
-            for _ in range(0, len(indices), self.page_size):
-                element_size_list.append(k_element_size)
-                if not skip_v:
-                    element_size_list.append(v_element_size)
-                if index_k_buffer_data_ptr is not None:
-                    element_size_list.append(index_k_element_size)
-                if scale_buffer_data_ptr is not None:
-                    element_size_list.append(scale_element_size)
+            components = self._split_page_components()
+            for offset in range(0, len(indices), self.page_size):
+                page = self._split_page_index(indices[offset])
+                if indices[offset : offset + self.page_size] != list(
+                    range(indices[offset], indices[offset] + self.page_size)
+                ):
+                    raise ValueError(
+                        "MLA storage indices must contain complete contiguous pages"
+                    )
+                for _, tensor in components:
+                    ptr_list.append(tensor[page].data_ptr())
+                    element_size_list.append(tensor[page].nbytes)
             return ptr_list, element_size_list
         if self.layout == "layer_first":
             for index in range(0, len(indices), self.page_size):
