@@ -5,6 +5,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
+    get_model,
     get_parallel,
     get_schedule,
     get_serving,
@@ -2929,7 +2930,33 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 and not get_exec().mamba.enable_mamba_extra_buffer_lazy
                 and "Glm5NextForConditionalGeneration"
                 in (getattr(self.model_config.hf_config, "architectures", None) or ())
-                and get_parallel().dp_size == get_parallel().pp_size == 1
+                and (
+                    get_parallel().dp_size == get_parallel().pp_size == 1
+                    or (
+                        # This finite P profile owns request/track slots within
+                        # each TP8 attention domain. EP16 routes MoE tokens; it
+                        # does not change the domain-local recurrent state or
+                        # the token depth named by its checkpoint.
+                        os.environ.get("SGLANG_GLM53_2NODE_PD") == "1"
+                        and os.environ.get("SGLANG_GLM53_NORMAL_HCCL") == "1"
+                        and get_parallel().dp_size == 2
+                        and get_parallel().nnodes == 2
+                        and get_parallel().tp_size == get_parallel().ep_size == 16
+                        and get_parallel().enable_dp_attention
+                        and get_parallel().attn_tp_size == 8
+                        and get_parallel().pp_size == 1
+                        and get_parallel().moe_dp_size == get_parallel().dwdp_size == 1
+                        and not get_parallel().enable_prefill_cp
+                        and get_schedule().disable_overlap_schedule
+                        and not get_exec().overlap.enable_two_batch_overlap
+                        and not get_exec().overlap.enable_single_batch_overlap
+                        and get_exec().moe.moe_a2a_backend == "deepep"
+                        and get_exec().moe.deepep_mode == "normal"
+                        and not get_exec().moe.enable_eplb
+                        and get_exec().moe.ep_num_redundant_experts == 0
+                        and get_model().quantization == "modelslim"
+                    )
+                )
                 and get_parallel().attn_cp_size == get_parallel().dcp_size == 1
                 and cache_chunk_size == state_chunk_size == 64
                 and checkpoint_grid
