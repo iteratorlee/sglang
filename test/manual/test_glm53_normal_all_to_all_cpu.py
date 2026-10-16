@@ -278,13 +278,52 @@ class AllToAllCpuTests(unittest.TestCase):
                         side_effect=AssertionError("payload gather used"),
                     ),
                 ):
-                    result = self.module.all_to_all_combine(
-                        self.group, outputs[rank], state
-                    )
-                self.assertEqual(exchanged.call_count, int(global_routes > 0))
-                torch.testing.assert_close(
-                    result, expected.to(torch.bfloat16), rtol=0, atol=0
+                    variants = [outputs[rank]]
+                    if state.received == 0:
+                        variants.append(torch.empty(0, 4096, dtype=torch.bfloat16))
+                    for y in variants:
+                        result = self.module.all_to_all_combine(self.group, y, state)
+                        torch.testing.assert_close(
+                            result, expected.to(torch.bfloat16), rtol=0, atol=0
+                        )
+                self.assertEqual(
+                    exchanged.call_count, len(variants) * int(global_routes > 0)
                 )
+
+    def test_combine_only_allows_zero_or_dummy_for_empty_expert_output(self):
+        state = self.module.AllToAllState(
+            [0] * 16,
+            [0] * 16,
+            torch.empty(0, dtype=torch.int64),
+            torch.empty(0),
+            torch.full((1, 8), -1, dtype=torch.int32),
+            1,
+            4096,
+            0,
+            0,
+        )
+        with mock.patch.object(self.module.dist, "all_to_all_single") as exchanged:
+            for rows in (0, 1):
+                y = torch.full((rows, 4096), float("nan"), dtype=torch.bfloat16)
+                output = self.module.all_to_all_combine(self.group, y, state)
+                self.assertTrue(torch.equal(output, torch.zeros_like(output)))
+            for received, shape, dtype in (
+                (0, (2, 4096), torch.bfloat16),
+                (0, (0, 2048), torch.bfloat16),
+                (0, (0, 4096), torch.float32),
+                (0, (4096,), torch.bfloat16),
+                (1, (0, 4096), torch.bfloat16),
+                (1, (2, 4096), torch.bfloat16),
+                (2, (1, 4096), torch.bfloat16),
+            ):
+                with self.subTest(received=received, shape=shape, dtype=dtype):
+                    with self.assertRaisesRegex(ValueError, "BF16 expert rows"):
+                        self.module.all_to_all_combine(
+                            self.group,
+                            torch.empty(shape, dtype=dtype),
+                            state._replace(received=received),
+                        )
+            exchanged.assert_not_called()
 
     def test_roundtrip_arbitrary_rank_sizes_idle_domains_and_zero_traffic(self):
         for tokens, counts, pattern in (

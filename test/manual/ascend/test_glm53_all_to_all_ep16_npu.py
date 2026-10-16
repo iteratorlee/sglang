@@ -17,8 +17,11 @@ legacy sums by EP owner then HCCL; A2A sums global expert order at source.
 Recording hooks forward actual kernel/HCCL calls unchanged and retain only
 the final FP32 tensor before casting. No fake collective/quantization/kernel.
 
-Default cases: rows32/1024 x three active-DP patterns x mixed/fullskew,
-plus both-idle at each size, and a final zero-row case. Fullskew uses expert0,
+Default geometries: rows32/1024 x three active-DP patterns x mixed/fullskew,
+plus both-idle at each size, and a final zero-row case. Each geometry runs
+with empty expert output y1 and y0 (30 cases). Every rank runs both variants,
+so real collective order is identical even when only some ranks receive0.
+Fullskew uses expert0,
 so an idle rank0 still receives active-domain work and other ranks receive0.
 At rows1024/fullskew/both-active, BF16 expert output and reverse permutation
 each take 1 GiB on rank0. This is a correctness test, not a timing benchmark.
@@ -274,9 +277,9 @@ def dispatch_checks(old, new, expected, chunk_rows):
         raise AssertionError("A2A split/global-route oracle mismatch")
 
 
-def simulate_experts(recv, scale, received, rank, chunk_rows):
-    y = torch.empty_like(recv, dtype=torch.bfloat16)
-    if not received:
+def simulate_experts(recv, scale, received, rank, chunk_rows, empty_rows=1):
+    y = recv.new_empty((received or empty_rows, recv.shape[1]), dtype=torch.bfloat16)
+    if not received and empty_rows:
         y.fill_(float("nan"))  # Neither implementation may consume the dummy.
     for start in range(0, received, chunk_rows):
         end = min(start + chunk_rows, received)
@@ -362,8 +365,10 @@ def summarize_metrics(metrics, *, group, device):
     )
 
 
-def run_case(modules, rows, active, pattern, rank, group, device, args):
-    label = f"rows={rows}/active={active}/pattern={pattern}"
+def run_case(
+    modules, rows, active, pattern, rank, group, device, args, empty_expert_rows=1
+):
+    label = f"rows={rows}/active={active}/pattern={pattern}/empty_y={empty_expert_rows}"
     phase = "inputs"
     token = modules.legacy._idle_dp_counts.set(tuple(active))
     try:
@@ -391,7 +396,9 @@ def run_case(modules, rows, active, pattern, rank, group, device, args):
         old_state, new_state = old[3], new[3]
         phase = "simulate_experts"
         # Exact dispatch equality permits one shared BF16 expert-output tensor.
-        y = simulate_experts(old[0], old[1], old_state[5], rank, args.chunk_rows)
+        y = simulate_experts(
+            old[0], old[1], old_state[5], rank, args.chunk_rows, empty_expert_rows
+        )
         del old, new, x, ids, gates, expected
 
         phase = "legacy_combine"
@@ -502,6 +509,14 @@ def main():
         default="reduce_scatter",
     )
     parser.add_argument("--chunk-rows", type=int, default=256)
+    parser.add_argument(
+        "--empty-expert-rows",
+        type=int,
+        nargs="+",
+        choices=[0, 1],
+        default=[1, 0],
+        help="empty GMM output shapes to test, on every rank (default: 1 0)",
+    )
     parser.add_argument("--timeout-seconds", type=int, default=300)
     args = parser.parse_args()
     args.module_dir = args.module_dir.resolve()
@@ -548,7 +563,11 @@ def main():
             raise RuntimeError("test requires a real HCCL world16 group")
         install_topology(group, rank)
         modules = load_candidates(args.module_dir)
-        cases = case_list(args.rows)
+        cases = [
+            (rows, active, pattern, empty_rows)
+            for rows, active, pattern in case_list(args.rows)
+            for empty_rows in args.empty_expert_rows
+        ]
         emit(
             dict(
                 event="start",
@@ -562,8 +581,10 @@ def main():
                 precision="BF16 experts; FP32 products/accumulators; report differences",
             )
         )
-        for rows, active, pattern in cases:
-            run_case(modules, rows, active, pattern, rank, group, device, args)
+        for rows, active, pattern, empty_rows in cases:
+            run_case(
+                modules, rows, active, pattern, rank, group, device, args, empty_rows
+            )
         if rank == 0:
             emit(
                 dict(

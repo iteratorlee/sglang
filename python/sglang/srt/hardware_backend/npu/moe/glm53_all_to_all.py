@@ -216,13 +216,15 @@ def all_to_all_combine(group, y, state):
     if not (
         y.dtype == torch.bfloat16
         and y.ndim == 2
-        and tuple(y.shape) == (max(1, state.received), state.width)
+        and y.shape[1] == state.width
+        and (y.shape[0] == state.received or (state.received == 0 and y.shape[0] == 1))
         and y.device == state.weights.device == state.indices.device
     ):
         raise ValueError(
             "GLM all-to-all return requires BF16 expert rows on the dispatch device"
         )
     # Undo destination's expert/source permutation, including empty experts.
+    # Zero-count GMM may return zero rows or preserve the dispatch dummy row.
     # Never read the dummy row for a rank with no received routes.
     source = y[: state.received].index_select(0, state.source_order)
     returned = y.new_empty((sum(state.send_splits), state.width))
