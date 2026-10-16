@@ -596,6 +596,22 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             from deep_ep.utils import EventOverlap
             from sglang.srt.hardware_backend.npu.moe.glm53_collectives import collective_dispatch
 
+            if os.getenv("SGLANG_GLM53_NORMAL_ALL_TO_ALL", "0") == "1":
+                from sglang.srt.hardware_backend.npu.moe.glm53_all_to_all import (
+                    all_to_all_dispatch,
+                    normal_all_to_all_enabled,
+                )
+
+                if normal_all_to_all_enabled(self.group):
+                    (
+                        recv,
+                        scale,
+                        counts,
+                        self._glm53_all_to_all_state,
+                    ) = all_to_all_dispatch(
+                        self.group, x, topk_ids, topk_weights, self.num_experts
+                    )
+                    return (recv, scale), topk_ids, topk_weights, counts, EventOverlap()
             recv, scale, counts, self._glm53_collective_state = collective_dispatch(
                 self.group, x, topk_ids, topk_weights, self.num_experts
             )
@@ -682,6 +698,14 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             from deep_ep.utils import EventOverlap
             from sglang.srt.hardware_backend.npu.moe.glm53_collectives import collective_combine
 
+            if getattr(self, "_glm53_all_to_all_state", None) is not None:
+                from sglang.srt.hardware_backend.npu.moe.glm53_all_to_all import (
+                    all_to_all_combine,
+                )
+
+                output = all_to_all_combine(self.group, x, self._glm53_all_to_all_state)
+                self._glm53_all_to_all_state = None
+                return output, EventOverlap()
             output = collective_combine(self.group, x, self._glm53_collective_state)
             self._glm53_collective_state = None
             return output, EventOverlap()
