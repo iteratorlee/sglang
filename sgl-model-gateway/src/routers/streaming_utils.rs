@@ -205,6 +205,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sse_bytes_never_terminate_the_transport_wrapper() {
+        use futures_util::FutureExt;
+
+        let w = worker();
+        let chunks = [
+            Bytes::from_static(b"data: {\"text\":\"data: [DONE]\"}\n\n"),
+            Bytes::from_static(b"data: [DO"),
+            Bytes::from_static(b"NE]"),
+            Bytes::from_static(b"\r\n\r"),
+            Bytes::from_static(b"\n"),
+        ];
+        let inner = futures_util::stream::iter(chunks.clone().map(Ok::<_, TestErr>))
+            .chain(futures_util::stream::pending());
+        let mut tracked = BreakerTrackedStream::new(inner, Arc::clone(&w), "u".into());
+        for chunk in chunks {
+            assert_eq!(tracked.next().await.unwrap().unwrap(), chunk);
+        }
+        assert!(tracked.next().now_or_never().is_none());
+        drop(tracked);
+        // Only the SSE-aware caller may mark completion before transport EOF.
+        assert_eq!(breaker_counters(&w), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn error_after_unterminated_done_records_failure() {
+        let w = worker();
+        let inner = futures_util::stream::iter(vec![
+            Ok(Bytes::from_static(b"data: [DONE]\n")),
+            Err(TestErr("missing terminator")),
+        ]);
+        let mut tracked = BreakerTrackedStream::new(inner, Arc::clone(&w), "u".into());
+        assert!(matches!(tracked.next().await, Some(Ok(_))));
+        assert!(matches!(tracked.next().await, Some(Err(_))));
+        drop(tracked);
+        assert_eq!(breaker_counters(&w), (0, 1));
+    }
+
+    #[tokio::test]
     async fn errored_is_absorbing_across_subsequent_polls() {
         let w = worker();
         let inner = futures_util::stream::iter(vec![

@@ -17,7 +17,6 @@ use axum::{
 };
 use dashmap::DashMap;
 use futures_util::StreamExt;
-use memchr::memmem;
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -51,6 +50,7 @@ use crate::{
         error,
         grpc::utils::{error_type_from_status, route_to_endpoint},
         header_utils,
+        sse::SseDoneDetector,
         streaming_utils::BreakerTrackedStream,
         RouterTrait,
     },
@@ -1596,13 +1596,17 @@ impl PDRouter {
         }
         let decode_for_log = decode.clone();
         tokio::spawn(async move {
+            let mut done_detector = SseDoneDetector::default();
             loop {
                 tokio::select! {
                     biased;
                     chunk_result = tracked.next() => {
                         match chunk_result {
                             Some(Ok(chunk)) => {
-                                let is_done = memmem::find(&chunk, b"data: [DONE]").is_some();
+                                // The sentinel and its terminating blank line may
+                                // span chunks. Inspect SSE framing without changing
+                                // the bytes passed to the client/logprob merger.
+                                let is_done = done_detector.feed(&chunk);
 
                                 let result = if return_logprob && prefill_logprobs.is_some() {
                                     Self::merge_streaming_logprobs(prefill_logprobs.clone(), &chunk)
@@ -3250,6 +3254,221 @@ mod tests {
             );
         }
         assert!(router.reservations.views(&HashMap::new()).0.is_empty());
+    }
+
+    // Keep the upstream channel open after [DONE]: completion must come from
+    // SSE framing, not transport EOF. Check each forwarded chunk before sending
+    // the next so coalescing cannot hide a prematurely dropped terminator.
+    async fn assert_sse_forwarding(chunks: &[&[u8]], status: StatusCode) {
+        use http_body_util::BodyExt;
+        use tokio::time::{timeout, Duration};
+
+        let router = create_test_pd_router();
+        let decode: Arc<dyn Worker> = Arc::from(create_test_worker(
+            "http://decode".into(),
+            WorkerType::Decode,
+            true,
+        ));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let response = router.create_streaming_response(
+            UnboundedReceiverStream::new(rx).map(Ok),
+            status,
+            None,
+            false,
+            None,
+            decode.clone(),
+        );
+        assert_eq!(decode.load(), 1);
+        let mut body = response.into_body();
+        for chunk in chunks {
+            tx.send(bytes::Bytes::copy_from_slice(chunk)).unwrap();
+            let frame = timeout(Duration::from_secs(3), body.frame())
+                .await
+                .unwrap()
+                .expect("stream ended before the complete SSE event")
+                .unwrap();
+            assert_eq!(frame.into_data().unwrap().as_ref(), *chunk);
+        }
+        timeout(Duration::from_secs(3), tx.closed()).await.unwrap();
+        // The response body, rather than the producer task, owns the load guard.
+        assert_eq!(decode.load(), 1);
+        assert!(timeout(Duration::from_secs(3), body.collect())
+            .await
+            .unwrap()
+            .unwrap()
+            .to_bytes()
+            .is_empty());
+        assert_eq!(decode.load(), 0);
+        let cb = decode.circuit_breaker();
+        let failed = status.is_server_error();
+        assert_eq!(cb.total_successes(), u64::from(!failed));
+        assert_eq!(cb.total_failures(), u64::from(failed));
+    }
+
+    #[tokio::test]
+    async fn test_sse_done_all_chunk_boundaries() {
+        for done in [&b"data: [DONE]\n\n"[..], &b"data:[DONE]\r\n\r\n"[..]] {
+            assert_sse_forwarding(&[done], StatusCode::OK).await;
+            for split in 1..done.len() {
+                assert_sse_forwarding(&[&done[..split], &done[split..]], StatusCode::OK).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sse_json_literal_and_error_status() {
+        let chunks: &[&[u8]] = &[
+            b"data: {\"text\":\"data: [DONE] and data:[DONE]\"}\n\n",
+            b"data: {\"text\":\"####4\",\"finish_reason\":\"stop\"}\n\n",
+            b"data: [DONE]\n",
+            b"\n",
+        ];
+        assert_sse_forwarding(chunks, StatusCode::OK).await;
+        assert_sse_forwarding(chunks, StatusCode::BAD_REQUEST).await;
+        assert_sse_forwarding(chunks, StatusCode::INTERNAL_SERVER_ERROR).await;
+    }
+
+    #[tokio::test]
+    async fn test_sse_split_done_preserves_logprob_merge() {
+        use http_body_util::BodyExt;
+        use tokio::time::{timeout, Duration};
+
+        let router = create_test_pd_router();
+        let decode: Arc<dyn Worker> = Arc::from(create_test_worker(
+            "http://decode".into(),
+            WorkerType::Decode,
+            true,
+        ));
+        let chunks = [
+            bytes::Bytes::from_static(b"data: {\"meta_info\":{\"input_token_logprobs\":[2]}}\n\n"),
+            bytes::Bytes::from_static(b"data: [DONE]\n"),
+            bytes::Bytes::from_static(b"\n"),
+        ];
+        let stream =
+            futures_util::stream::iter(chunks.map(Ok)).chain(futures_util::stream::pending());
+        let response = router.create_streaming_response(
+            stream,
+            StatusCode::OK,
+            Some(json!([1])),
+            true,
+            None,
+            decode.clone(),
+        );
+        let body = timeout(Duration::from_secs(3), response.into_body().collect())
+            .await
+            .unwrap()
+            .unwrap()
+            .to_bytes();
+        assert_eq!(
+            body.as_ref(),
+            b"data: {\"meta_info\":{\"input_token_logprobs\":[1,2]}}\n\ndata: [DONE]\n\n"
+        );
+        assert_eq!(decode.load(), 0);
+        assert_eq!(decode.circuit_breaker().total_successes(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_sse_incomplete_done_error_disconnect_and_eof() {
+        use http_body_util::BodyExt;
+        use tokio::time::{timeout, Duration};
+
+        for ending in ["error", "disconnect", "eof"] {
+            let router = create_test_pd_router();
+            let decode: Arc<dyn Worker> = Arc::from(create_test_worker(
+                "http://decode".into(),
+                WorkerType::Decode,
+                true,
+            ));
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let response = router.create_streaming_response(
+                UnboundedReceiverStream::new(rx),
+                StatusCode::OK,
+                None,
+                false,
+                None,
+                decode.clone(),
+            );
+            let mut body = response.into_body();
+            let partial = bytes::Bytes::from_static(b"data: [DONE]\n");
+            tx.send(Ok(partial.clone())).unwrap();
+            let frame = timeout(Duration::from_secs(3), body.frame())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(frame.into_data().unwrap(), partial);
+            assert_eq!(decode.circuit_breaker().total_successes(), 0);
+            assert_eq!(decode.load(), 1);
+
+            match ending {
+                "error" => {
+                    // Construct a reqwest error without opening any connection.
+                    let error = Client::new().get("://invalid").build().unwrap_err();
+                    tx.send(Err(error)).unwrap();
+                    assert!(timeout(Duration::from_secs(3), body.collect())
+                        .await
+                        .unwrap()
+                        .is_err());
+                    timeout(Duration::from_secs(3), tx.closed()).await.unwrap();
+                }
+                "disconnect" => {
+                    drop(body);
+                    timeout(Duration::from_secs(3), tx.closed()).await.unwrap();
+                }
+                _ => {
+                    drop(tx);
+                    assert!(timeout(Duration::from_secs(3), body.collect())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .to_bytes()
+                        .is_empty());
+                }
+            }
+            assert_eq!(decode.load(), 0);
+            let cb = decode.circuit_breaker();
+            // Preserve transport EOF semantics; do not invent an SSE terminator.
+            assert_eq!(cb.total_successes(), u64::from(ending == "eof"));
+            assert_eq!(cb.total_failures(), u64::from(ending == "error"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sse_ready_completion_wins_disconnect() {
+        for complete in [false, true] {
+            let router = create_test_pd_router();
+            let decode: Arc<dyn Worker> = Arc::from(create_test_worker(
+                "http://decode".into(),
+                WorkerType::Decode,
+                true,
+            ));
+            let chunk = if complete {
+                bytes::Bytes::from_static(b"data: [DONE]\n\n")
+            } else {
+                bytes::Bytes::from_static(b"data: [DONE]\n")
+            };
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            tx.send(chunk).unwrap();
+            let response = router.create_streaming_response(
+                UnboundedReceiverStream::new(rx).map(Ok),
+                StatusCode::OK,
+                None,
+                false,
+                None,
+                decode.clone(),
+            );
+            // Both branches are ready when the spawned task first runs.
+            drop(response);
+            tokio::time::timeout(std::time::Duration::from_secs(3), tx.closed())
+                .await
+                .unwrap();
+            assert_eq!(decode.load(), 0);
+            assert_eq!(
+                decode.circuit_breaker().total_successes(),
+                u64::from(complete)
+            );
+            assert_eq!(decode.circuit_breaker().total_failures(), 0);
+        }
     }
 
     #[tokio::test]
