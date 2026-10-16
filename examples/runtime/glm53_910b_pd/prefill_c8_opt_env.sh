@@ -29,6 +29,9 @@ export SGLANG_GLM53_NORMAL_DEVICE_ROUTING=ordered
 export SGLANG_GLM53_NORMAL_DEVICE_ROUTING_MIN_TOKENS=512
 # Fixed target-forward geometry: retain the first global shape audit, then
 # check the per-layer CPU contract. NextN keeps its independent audit.
+# The 128K/1K cold case and actual D100 content checks passed. Full GSM8K
+# scored 1264/1319 versus the fixed 1267 control; this opt-in recipe is not
+# a general accuracy sign-off. All failed trials are retained in the report.
 export SGLANG_GLM53_NORMAL_BATCH_SHAPE_AUDIT=1
 # Experiments below are not part of the recommended configuration.
 export SGLANG_GLM53_NORMAL_ALL_TO_ALL=0
