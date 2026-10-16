@@ -3,6 +3,8 @@
 One output tile owns each destination. Products and the fixed expert-order
 accumulator are FP32, with no atomic adds or process-wide determinism changes.
 The HCCL reduction and final BF16 conversion remain in the caller.
+The kernel is independent of EP size: the caller scopes EP8 mode 1 and the
+opt-in two-node P EP16 mode, both with the same row/width/topk bounds.
 """
 
 import torch

@@ -9,6 +9,8 @@ NORMAL_SHAPE_CACHE=1 replaces repeated shape audits with an invalidation vote;
 NORMAL_REDUCE_SCATTER=2node selects the scoped FP32 combine collective;
 NORMAL_REDUCE_SCATTER_CHECK=1 adds an expensive all-reduce reference check;
 NORMAL_DEVICE_ROUTING=1 keeps route sorting and expert counts on device.
+NORMAL_COMBINE_ORDERED=2node uses fixed-order FP32 Triton accumulation with
+CPU routing; it is mutually exclusive with NORMAL_DEVICE_ROUTING=1.
 Use identical collective flags on every EP rank. All experiments default off.
 """
 
@@ -30,6 +32,7 @@ _dispatch_shape_cache = {}
 _shape_cache_logged = False
 _reduce_scatter_check_logged = False
 _device_routing_logged = False
+_ordered_combine_logged = False
 
 
 def release_normal_hccl_cached_memory(x):
@@ -324,11 +327,40 @@ def log_normal_hccl_activation(quant_info, profile):
     _bulk_activation_logged |= bulk
 
 
+def _normal_ordered_combine_enabled(world, tokens, topk, width, dtype):
+    """Retain legacy EP8 opt-in and bound the new two-node P-only mode."""
+    mode = os.getenv("SGLANG_GLM53_NORMAL_COMBINE_ORDERED", "0")
+    if mode == "2node":
+        if world != 16 or _idle_dp_counts.get() is None:
+            return False
+        if os.getenv("SGLANG_GLM53_NORMAL_DEVICE_ROUTING", "0") == "1":
+            raise ValueError("GLM ORDERED=2node requires NORMAL_DEVICE_ROUTING=0")
+    elif mode == "1":
+        if world != 8:
+            raise ValueError("Ordered GLM combine mode 1 requires EP8")
+    else:
+        return False
+    # Match ordered_combine's existing kernel bound before payload allocation.
+    # EP16 admits at most 8191 local rows (131056 gathered rows), not 8192.
+    if not (
+        topk == 8
+        and width == 4096
+        and dtype == torch.bfloat16
+        and 0 <= world * tokens <= 131070
+    ):
+        raise ValueError(
+            "Ordered GLM combine requires topk8/BF16 H4096 and "
+            "0 <= gathered rows <= 131070"
+        )
+    return True
+
+
 def collective_dispatch(group, x, ids, weights, num_experts=288):
     global _last_dispatch_metadata, _idle_dp_logged, _device_routing_logged
     world, rank = dist.get_world_size(group), dist.get_rank(group)
     tokens, width = x.shape
     topk = ids.shape[1]
+    ordered = _normal_ordered_combine_enabled(world, tokens, topk, width, x.dtype)
     if world in (8, 16):
         release_normal_hccl_cached_memory(x)
         _check_equal_dispatch_shapes_cached(group, x, ids, weights, world)
@@ -388,9 +420,7 @@ def collective_dispatch(group, x, ids, weights, num_experts=288):
         recv_scale = scale.new_ones((1,))
     chosen_weights = all_weights.flatten().index_select(0, loc)
     state = (rows, chosen_weights, tokens, world, width, int(selected.numel()))
-    if os.getenv("SGLANG_GLM53_NORMAL_COMBINE_ORDERED", "0") == "1":
-        if not (world == 8 and topk == 8 and width == 4096 and x.dtype == torch.bfloat16):
-            raise ValueError("Ordered GLM combine is validated only for EP8/topk8/BF16 H4096")
+    if ordered:
         # selected is already CPU-resident in stable expert order. No extra
         # device synchronization: construct a small inverse map during routing.
         indices = _normal_combine_ordered_indices(selected // topk, world * tokens, topk)
@@ -482,6 +512,7 @@ def _check_normal_reduce_scatter(group, local_out, global_out, tokens):
 
 
 def collective_combine(group, y, state):
+    global _ordered_combine_logged
     rows, weights, tokens, world, width, received = state[:6]
     # Sum each rank's expert contributions in FP32, then reduce them across EP.
     # This keeps the workspace bounded by tokens*hidden, rather than topk times
@@ -490,6 +521,14 @@ def collective_combine(group, y, state):
         from .glm53_ordered_combine import ordered_combine
 
         out = ordered_combine(y[:received], weights, state[6], world * tokens, width)
+        if not _ordered_combine_logged:
+            logger.info(
+                "GLM53 normal ordered combine active: world=%d rows=%d "
+                "accumulator=FP32 stable_expert_order=True",
+                world,
+                world * tokens,
+            )
+            _ordered_combine_logged = True
     else:
         out = torch.zeros((world * tokens, width), device=y.device, dtype=torch.float32)
         if received:
