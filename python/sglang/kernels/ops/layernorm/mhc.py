@@ -1779,6 +1779,7 @@ def _mhc_pre_torch(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     pre_mix=None,
+    sinkhorn=None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     import torch.nn.functional as F
 
@@ -1801,16 +1802,19 @@ def _mhc_pre_torch(
     comb = comb_raw * hc_scale[2] + comb_base
 
     comb = comb.softmax(-1) + hc_sinkhorn_eps
-    comb = comb / (comb.sum(-2, keepdim=True) + hc_sinkhorn_eps)
-    for _ in range(sinkhorn_repeat - 1):
-        comb = comb / (comb.sum(-1, keepdim=True) + hc_sinkhorn_eps)
+    if sinkhorn is None:
         comb = comb / (comb.sum(-2, keepdim=True) + hc_sinkhorn_eps)
+        for _ in range(sinkhorn_repeat - 1):
+            comb = comb / (comb.sum(-1, keepdim=True) + hc_sinkhorn_eps)
+            comb = comb / (comb.sum(-2, keepdim=True) + hc_sinkhorn_eps)
+    else:
+        comb = sinkhorn(comb, sinkhorn_repeat, hc_sinkhorn_eps)
 
     if pre_mix is None:
         layer_input = (pre.unsqueeze(-1) * x_flat.view(s, n, h)).sum(dim=1).to(dtype)
     else:
         # The optional large-P path changes only this final four-stream mix.
-        # Projection, RMS scaling, coefficients and Sinkhorn stay native FP32.
+        # Projection, RMS scaling and pre/post coefficients stay native FP32.
         layer_input = pre_mix(residual, pre)
     return post.unsqueeze(-1), comb, layer_input
 
@@ -1967,6 +1971,14 @@ def hc_pre(
             hc_pre_mix_large_prefill,
         )
 
+        sinkhorn = None
+        if os.environ.get("SGLANG_GLM53_PREFILL_MHC_SINKHORN", "0") == "1":
+            from sglang.kernels.ops.layernorm.mhc_sinkhorn_npu import (
+                hc_sinkhorn_large_prefill,
+            )
+
+            sinkhorn = hc_sinkhorn_large_prefill
+
         post_mix, comb_mix, layer_input = _mhc_pre_torch(
             x.view(x.shape[0], 4, 4096),
             hc_fn,
@@ -1978,15 +1990,18 @@ def hc_pre(
             post_mult_value,
             sinkhorn_iters,
             pre_mix=hc_pre_mix_large_prefill,
+            sinkhorn=sinkhorn,
         )
         global _large_prefill_hc_pre_logged
         if not _large_prefill_hc_pre_logged:
             logger.info(
                 "GLM53 prefill mHC pre selected: SGLANG_GLM53_PREFILL_MHC_PRE=1 "
                 "T=%d H=4096 hc_mult=4 physical_format=ND(2) "
-                "projection/coefficients=FP32 kernel=sequential_mix_only "
+                "projection/coefficients=FP32 kernel=sequential_mix "
+                "sinkhorn=%s "
                 "out_norm_fused=False",
                 x.shape[0],
+                "triton_post_softmax" if sinkhorn is not None else "native",
             )
             _large_prefill_hc_pre_logged = True
         # Preserve the BF16 mixing boundary and the caller's native RMSNorm.
