@@ -33,6 +33,7 @@ import torch.distributed as dist
 logger = logging.getLogger(__name__)
 MAX_LOCAL_TOKENS = 1024
 _activation_logged = False
+_bulk_activation_logged = False
 
 
 class AllToAllState(NamedTuple):
@@ -101,7 +102,7 @@ def _receive_plan(counts, rank):
 
 
 def all_to_all_dispatch(group, x, ids, weights, num_experts=288):
-    global _activation_logged
+    global _activation_logged, _bulk_activation_logged
     from .glm53_collectives import (
         _normal_combine_ordered_indices,
         _normal_skip_idle_dp_routes,
@@ -194,19 +195,22 @@ def all_to_all_dispatch(group, x, ids, weights, num_experts=288):
         received,
         global_routes,
     )
-    if not _activation_logged:
+    bulk = tokens >= 512
+    if not _activation_logged or (bulk and not _bulk_activation_logged):
         logger.info(
             "GLM53 normal HCCL all-to-all active: rank=%d world=%d local_rows=%d "
             "sent=%d received=%d q=INT8 scale=FP32 return=BF16 "
-            "combine=source_ordered_FP32 max_local_rows=%d",
+            "combine=source_ordered_FP32 max_local_rows=%d bulk=%s",
             rank,
             world,
             tokens,
             selected.numel(),
             received,
             MAX_LOCAL_TOKENS,
+            bulk,
         )
         _activation_logged = True
+        _bulk_activation_logged |= bulk
     return recv, recv_scale, expert_counts, state
 
 
