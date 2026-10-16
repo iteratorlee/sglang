@@ -18,6 +18,8 @@ _activation_logged = False
 _bulk_activation_logged = False
 _idle_dp_counts = ContextVar("glm53_normal_hccl_idle_dp_counts", default=None)
 _idle_dp_logged = False
+_dispatch_shape_cache = {}
+_shape_cache_logged = False
 
 
 def release_normal_hccl_cached_memory(x):
@@ -225,6 +227,47 @@ def _check_equal_dispatch_shapes(group, x, ids, weights, world):
         )
 
 
+def _check_equal_dispatch_shapes_cached(group, x, ids, weights, world):
+    """Opt-in shape audit cache with collective invalidation in two-node P.
+
+    A local cache hit alone cannot skip a collective: a remote rank may have
+    changed shape or lost its cache. Every rank first votes on invalidation,
+    so all ranks either audit or skip together. This retains a scalar host
+    synchronization; it saves the full shape gather/readback on cache hits.
+    The idle-DP scope provides the existing eager/no-overlap P-only guard.
+    """
+    global _shape_cache_logged
+    if (
+        os.getenv("SGLANG_GLM53_NORMAL_SHAPE_CACHE", "0") != "1"
+        or world != 16
+        or _idle_dp_counts.get() is None
+    ):
+        _dispatch_shape_cache.pop(group, None)
+        return _check_equal_dispatch_shapes(group, x, ids, weights, world)
+
+    signature = (world,) + tuple(
+        (tuple(t.shape), t.dtype, t.device) for t in (x, ids, weights)
+    )
+    dirty = torch.tensor(
+        [int(_dispatch_shape_cache.get(group) != signature)],
+        dtype=torch.int32,
+        device=x.device,
+    )
+    dist.all_reduce(dirty, op=dist.ReduceOp.MAX, group=group)
+    if dirty.item():
+        # Never retain a prior success after a failed collective/audit.
+        _dispatch_shape_cache.pop(group, None)
+        _check_equal_dispatch_shapes(group, x, ids, weights, world)
+        _dispatch_shape_cache[group] = signature
+    if not _shape_cache_logged:
+        logger.info(
+            "GLM53 normal HCCL shape cache active: world=%d "
+            "invalidation=all_reduce_MAX scope=two_node_prefill",
+            world,
+        )
+        _shape_cache_logged = True
+
+
 def log_normal_hccl_activation(quant_info, profile):
     """Log actual dispatch and expert storage once per process, after dispatch."""
     global _activation_logged, _bulk_activation_logged
@@ -279,7 +322,7 @@ def collective_dispatch(group, x, ids, weights, num_experts=288):
     topk = ids.shape[1]
     if world in (8, 16):
         release_normal_hccl_cached_memory(x)
-        _check_equal_dispatch_shapes(group, x, ids, weights, world)
+        _check_equal_dispatch_shapes_cached(group, x, ids, weights, world)
 
     def gather(t):
         out = t.new_empty((world * t.shape[0], *t.shape[1:]))
