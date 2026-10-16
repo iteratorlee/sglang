@@ -30,9 +30,6 @@ export SGLANG_GLM53_NORMAL_DEVICE_ROUTING_MIN_TOKENS=512
 # Fixed target-forward geometry: retain the first global shape audit, then
 # check the per-layer CPU contract. NextN keeps its independent audit.
 export SGLANG_GLM53_NORMAL_BATCH_SHAPE_AUDIT=1
-# Only the post-softmax 4x4 normalizations are fused. Native projection,
-# RMS/softmax and the existing BF16 boundaries remain in place.
-export SGLANG_GLM53_PREFILL_MHC_SINKHORN=1
 # Experiments below are not part of the recommended configuration.
 export SGLANG_GLM53_NORMAL_ALL_TO_ALL=0
 export SGLANG_GLM53_NORMAL_SUM_LEN=0
