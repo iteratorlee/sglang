@@ -142,6 +142,14 @@ class DraftPrefillScopeTests(unittest.TestCase):
                 with self.helper.draft_prefill_scope(self.batch((128, 0), 0)):
                     self.fail('invalid minimum admitted')
 
+    def test_padded_4096_does_not_admit_original_4095(self):
+        with mock.patch.dict(os.environ, {'SGLANG_GLM53_NORMAL_PREFILL_DRAFT_MIN_TOKENS': '4096'}):
+            for rank in (0, 1):
+                batch = self.batch((0, 4095), rank)
+                batch.global_num_tokens_cpu = [4096, 4096]
+                with self.helper.draft_prefill_scope(batch):
+                    self.assertIsNone(self.fixture.module._idle_dp_counts.get())
+
 
 if __name__ == '__main__':
     unittest.main()
