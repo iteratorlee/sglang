@@ -75,6 +75,7 @@ class IdleDpCpuTests(unittest.TestCase):
                 "SGLANG_GLM53_NORMAL_COMBINE_ORDERED": "0",
                 "SGLANG_GLM53_NORMAL_COMBINE_DETERMINISTIC": "1",
                 "SGLANG_GLM53_NORMAL_REDUCE_SCATTER": "0",
+                "SGLANG_GLM53_NORMAL_SKIP_IDLE_ATTN": "0",
             },
         ).start()
         self.module = load_source(
@@ -108,12 +109,17 @@ class IdleDpCpuTests(unittest.TestCase):
         runtime.get_parallel = lambda: self.parallel
         forward = ModuleType("sglang.srt.model_executor.forward_batch_info")
         forward.ForwardMode = Mode
+        idle_attention = load_source(
+            "sglang.srt.hardware_backend.npu.moe.glm53_idle_attention",
+            SRT / "hardware_backend/npu/moe/glm53_idle_attention.py",
+        )
         mock.patch.dict(
             sys.modules,
             {
                 COLLECTIVES_NAME: self.module,
                 runtime.__name__: runtime,
                 forward.__name__: forward,
+                idle_attention.__name__: idle_attention,
             },
         ).start()
 
@@ -260,6 +266,7 @@ class IdleDpCpuTests(unittest.TestCase):
             return hidden, residual
 
         layer = NS(
+            is_nextn=False,
             _normal_skip_idle_dp=self.module.normal_hccl_skip_idle_dp_enabled(),
             mlp=MoE(),
             layer_scatter_modes=object(),
