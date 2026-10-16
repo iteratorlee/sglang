@@ -520,7 +520,16 @@ def collective_combine(group, y, state):
     if len(state) == 7:
         from .glm53_ordered_combine import ordered_combine
 
-        out = ordered_combine(y[:received], weights, state[6], world * tokens, width)
+        options = {}
+        if (
+            os.getenv("SGLANG_GLM53_NORMAL_COMBINE_SKIP_EMPTY", "0") == "1"
+            and world == 16
+            and _idle_dp_counts.get() is not None
+        ):
+            options["skip_empty"] = True
+        out = ordered_combine(
+            y[:received], weights, state[6], world * tokens, width, **options
+        )
         if not _ordered_combine_logged:
             logger.info(
                 "GLM53 normal ordered combine active: world=%d rows=%d "

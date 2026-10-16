@@ -31,7 +31,32 @@ def _ordered_combine(Y, W, INDEX, OUT, ROWS, WIDTH: tl.constexpr,
     tl.store(OUT + row[:, None] * WIDTH + channel[None, :], acc, (row < ROWS)[:, None])
 
 
-def ordered_combine(y, weights, indices, rows, width):
+@triton.jit
+def _ordered_combine_skip_empty(Y, W, INDEX, OUT, ROWS, WIDTH: tl.constexpr,
+                               TOPK: tl.constexpr, BLOCK_ROWS: tl.constexpr):
+    row = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    channel = tl.arange(0, WIDTH)
+    # Check the small inverse-map tile before eight full-width iterations.
+    # Inspect every slot, including maps with holes, rather than assuming
+    # callers pack all contributions at the start of each row.
+    slots = tl.arange(0, TOPK)
+    mapping = tl.load(INDEX + row[:, None] * TOPK + slots[None, :],
+                      (row < ROWS)[:, None], other=-1)
+    acc = tl.full((BLOCK_ROWS, WIDTH), 0, tl.float32)
+    if tl.sum(tl.sum((mapping >= 0).to(tl.int32), 1), 0) > 0:
+        for slot in tl.static_range(TOPK):
+            index = tl.load(INDEX + row * TOPK + slot, row < ROWS, other=-1)
+            valid = (row < ROWS) & (index >= 0)
+            safe_index = tl.maximum(index, 0)
+            value = tl.load(Y + safe_index[:, None] * WIDTH + channel[None, :],
+                            valid[:, None], other=0).to(tl.float32)
+            weight = tl.load(W + safe_index, valid, other=0).to(tl.float32)
+            product = value * weight[:, None]
+            acc = acc + product
+    tl.store(OUT + row[:, None] * WIDTH + channel[None, :], acc, (row < ROWS)[:, None])
+
+
+def ordered_combine(y, weights, indices, rows, width, *, skip_empty=False):
     if not (y.device.type == "npu" and y.dtype == torch.bfloat16
             and weights.device == indices.device == y.device
             and weights.dtype == torch.float32 and indices.dtype == torch.int32
@@ -46,7 +71,8 @@ def ordered_combine(y, weights, indices, rows, width):
         return torch.zeros((rows, width), device=y.device, dtype=torch.float32)
     out = torch.empty((rows, width), device=y.device, dtype=torch.float32)
     if rows:
-        _ordered_combine[(triton.cdiv(rows, 2),)](
+        kernel = _ordered_combine_skip_empty if skip_empty else _ordered_combine
+        kernel[(triton.cdiv(rows, 2),)](
             y, weights, indices, out, rows, width, 8, 2,
             num_warps=4, multibuffer=False, enable_fp_fusion=False,
         )

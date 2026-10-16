@@ -39,13 +39,13 @@ class Pointer:
         return Pointer(self.tensor, self.offset + offset)
 
 
-def emulate_kernel(y, weights, indices, rows, width):
+def emulate_kernel(y, weights, indices, rows, width, name="_ordered_combine"):
     """Run the unmodified kernel body; no GPU/NPU/Triton import is needed."""
     source = ast.parse(KERNEL_PATH.read_text())
     function = next(
         n
         for n in source.body
-        if isinstance(n, ast.FunctionDef) and n.name == "_ordered_combine"
+        if isinstance(n, ast.FunctionDef) and n.name == name
     )
     function.decorator_list = []
     tile = 0
@@ -63,6 +63,7 @@ def emulate_kernel(y, weights, indices, rows, width):
     tl = NS(
         constexpr=int,
         float32=torch.float32,
+        int32=torch.int32,
         program_id=lambda dim: tile,
         arange=torch.arange,
         full=lambda shape, value, dtype: torch.full(shape, value, dtype=dtype),
@@ -70,6 +71,7 @@ def emulate_kernel(y, weights, indices, rows, width):
         load=load,
         store=store,
         maximum=lambda x, value: x.clamp_min(value),
+        sum=lambda x, axis: x.sum(dim=axis),
     )
     namespace = {"tl": tl}
     exec(
@@ -400,6 +402,54 @@ class OrderedTwoNodeCpuTests(unittest.TestCase):
                                     atol=0,
                                 )
             self.assertGreater(kernel.ordered_combine.call_count, 0)
+
+
+class SkipEmptyKernelCpuTests(unittest.TestCase):
+    def test_opt_in_is_confined_to_the_ep16_prefill_scope(self):
+        fixture = idle.IdleDpCpuTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        module = fixture.module
+        kernel = ModuleType("sglang.srt.hardware_backend.npu.moe.glm53_ordered_combine")
+        kernel.ordered_combine = mock.Mock()
+        with mock.patch.dict(sys.modules, {kernel.__name__: kernel}), mock.patch.object(module.dist, "all_reduce"), mock.patch.object(module.dist, "get_rank", return_value=0):
+            for world in (8, 16):
+                for scoped in (False, True):
+                    for enabled in ("0", "1"):
+                        token = module._idle_dp_counts.set((16384, 0) if scoped else None)
+                        try:
+                            kernel.ordered_combine.reset_mock()
+                            kernel.ordered_combine.return_value = torch.zeros(world, 7)
+                            state = (torch.tensor([0]), torch.tensor([1.]), 1, world, 7, 1, torch.zeros(world, 8, dtype=torch.int32))
+                            with mock.patch.dict(os.environ, {"SGLANG_GLM53_NORMAL_COMBINE_SKIP_EMPTY": enabled, "SGLANG_GLM53_NORMAL_REDUCE_SCATTER": "0"}):
+                                module.collective_combine(fixture.group, torch.ones(1, 7, dtype=torch.bfloat16), state)
+                            expected = {"skip_empty": True} if enabled == "1" and scoped and world == 16 else {}
+                            self.assertEqual(kernel.ordered_combine.call_args.kwargs, expected)
+                        finally:
+                            module._idle_dp_counts.reset(token)
+
+    def test_empty_tiles_and_ordered_fp32_cancellation(self):
+        module = load_source("skip_empty_collectives_reference", SRT / "hardware_backend/npu/moe/glm53_collectives.py")
+        for rows in (1, 2, 3, 17):
+            for case in ("mixed", "empty", "idle_first", "idle_second"):
+                with self.subTest(rows=rows, case=case):
+                    y, w, source_rows = reference.make_inputs(rows, 9, case)
+                    index = module._normal_combine_ordered_indices(source_rows, rows, 8)
+                    actual = emulate_kernel(y, w, index, rows, 9, "_ordered_combine_skip_empty")
+                    expected = reference.sequential_reference(y, w, source_rows, rows)
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_map_with_holes_and_a_masked_partial_tile(self):
+        y = torch.tensor([[2, 3, 4], [5, 6, 7]], dtype=torch.bfloat16)
+        w = torch.tensor([0.125, 0.25], dtype=torch.float32)
+        index = torch.full((3, 8), -1, dtype=torch.int32)
+        index[0, 7] = 0
+        index[2, 5] = 1
+        expected = torch.zeros(3, 3)
+        expected[0] = y[0].float() * w[0]
+        expected[2] = y[1].float() * w[1]
+        actual = emulate_kernel(y, w, index, 3, 3, "_ordered_combine_skip_empty")
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
