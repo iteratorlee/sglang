@@ -37,7 +37,7 @@ def skip_idle_attention(batch, *, is_nextn, local_rows):
     ):
         return False
     if not (
-        0 < padded[0] == padded[1] == local_rows <= 8192
+        0 < padded[0] == padded[1] == local_rows <= 16384
         and all(real <= capacity for real, capacity in zip(original, padded))
         and sum(original) > 0
     ):

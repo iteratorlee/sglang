@@ -78,7 +78,9 @@ class IdleAttentionTests(unittest.TestCase):
         self.batch.global_num_tokens_cpu = [8192, 4096]
         self.assertFalse(self.skip())
         self.batch.global_num_tokens_cpu = [16384, 16384]
-        self.assertFalse(self.skip(local_rows=16384))
+        self.assertTrue(self.skip(local_rows=16384))
+        self.batch.global_num_tokens_cpu = [32768, 32768]
+        self.assertFalse(self.skip(local_rows=32768))
         self.batch.global_num_tokens_cpu = [8192, 8192]
         self.parallel.attn_tp_size = 2
         self.assertFalse(self.skip())
