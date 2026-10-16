@@ -15,7 +15,12 @@ from unittest import mock
 import test_glm53_normal_idle_dp_cpu as idle
 import test_glm53_normal_ordered_2node_cpu as ordered
 import torch
-from test_glm53_normal_hccl_cpu import COLLECTIVES_NAME, SRT, load_source
+from test_glm53_normal_hccl_cpu import (
+    COLLECTIVES_NAME,
+    SRT,
+    dynamic_quant_reference,
+    load_source,
+)
 
 PATH = SRT / "hardware_backend/npu/moe/glm53_device_ordered_indices.py"
 FLAG = "SGLANG_GLM53_NORMAL_DEVICE_ROUTING"
@@ -117,10 +122,17 @@ class DeviceOrderedIndicesCpuTests(unittest.TestCase):
                                 active=active,
                                 rank=rank,
                             ):
-                                selected, _ = self.helpers.select_routes(
+                                selected, counts = self.helpers.select_routes(
                                     ids, rank, active
                                 )
-                                actual = emulate_indices(ids, selected, rank * 18, 18)
+                                fp32_selected, fp32_counts = self.helpers.select_routes(
+                                    ids, rank, active, fp32_sort_keys=True
+                                )
+                                self.assertTrue(torch.equal(fp32_selected, selected))
+                                self.assertTrue(torch.equal(fp32_counts, counts))
+                                actual = emulate_indices(
+                                    ids, fp32_selected, rank * 18, 18
+                                )
                                 expected = self.module._normal_combine_ordered_indices(
                                     selected // 8, rows, 8
                                 )
@@ -185,6 +197,108 @@ class DeviceOrderedIndicesCpuTests(unittest.TestCase):
                         self.assertEqual(candidate[3][1].dtype, torch.float32)
                         self.assertEqual(candidate[3][2:6], baseline[3][2:6])
         self.assertEqual(self.kernel.device_ordered_indices.call_count, 64)
+
+    def test_only_new_mode_casts_filtered_keys_and_preserves_integer_ids(self):
+        # Run the production entry point, including its real selection/order.
+        # Huge invalid INT64 values must never be narrowed before filtering or
+        # reach the device inverse as rounded FP32 IDs.
+        sort = torch.argsort
+        for dtype in (torch.int32, torch.int64):
+            large = 2**30 if dtype == torch.int32 else 2**62
+            ids = torch.tensor(
+                [
+                    [17, 0, 17, large, -large, 288, -1, 0],
+                    [287, 270, 287, 270, 999, -7, large + 17, 18],
+                    [18, 19, 35, 18, 5, 6, 5, 7],
+                ],
+                dtype=dtype,
+            )
+            saved_ids = ids.clone()
+            x = torch.ones(3, 4096, dtype=torch.bfloat16)
+            gates = (torch.arange(24).view(3, 8).float() + 1) / 32
+            for rank in (0, 7, 15):
+                parallel = self.fixture.fixture.parallel
+                parallel.moe_ep_group.rank_in_group = rank
+                parallel.attn_dp_rank, parallel.attn_tp_rank = divmod(rank, 8)
+                for active in ((24, 0), (0, 24), (24, 24)):
+                    values = {}
+                    for mode in ("0", "1", "ordered"):
+                        keys_seen = []
+
+                        def argsort(keys, *args, **kwargs):
+                            keys_seen.append(keys.clone())
+                            self.assertIs(kwargs.get("stable"), True)
+                            return sort(keys, *args, **kwargs)
+
+                        def gather(out, local, group):
+                            self.assertIs(group, self.fixture.group)
+                            out.copy_(local.repeat((16,) + (1,) * (local.ndim - 1)))
+
+                        with (
+                            mock.patch.dict(
+                                os.environ,
+                                {
+                                    FLAG: mode,
+                                    ordered.FLAG: "0" if mode == "1" else "2node",
+                                },
+                            ),
+                            self.module.normal_hccl_idle_dp_scope(idle.batch(active)),
+                            mock.patch.object(
+                                self.module.dist, "get_world_size", return_value=16
+                            ),
+                            mock.patch.object(
+                                self.module.dist, "get_rank", return_value=rank
+                            ),
+                            mock.patch.object(
+                                self.module.dist, "all_gather_into_tensor", gather
+                            ),
+                            mock.patch.object(torch, "argsort", argsort),
+                            mock.patch.object(
+                                torch.ops.npu,
+                                "npu_dynamic_quant",
+                                side_effect=dynamic_quant_reference,
+                                create=True,
+                            ),
+                        ):
+                            values[mode] = self.module.collective_dispatch(
+                                self.fixture.group, x, ids, gates
+                            )
+                        self.assertEqual(
+                            keys_seen[0].dtype,
+                            torch.float32 if mode == "ordered" else dtype,
+                        )
+                        self.assertTrue(
+                            (
+                                (keys_seen[0] >= rank * 18)
+                                & (keys_seen[0] < rank * 18 + 18)
+                            ).all()
+                        )
+                        self.assertTrue(torch.equal(ids, saved_ids))
+                        if mode == "ordered":
+                            self.assertEqual(len(keys_seen), 1)
+                            original_ids = (
+                                self.kernel.device_ordered_indices.call_args.args[0]
+                            )
+                            self.assertEqual(original_ids.dtype, dtype)
+                            self.assertTrue(
+                                torch.equal(original_ids, saved_ids.repeat(16, 1))
+                            )
+                            self.assertEqual(values[mode][2].dtype, torch.int64)
+                    baseline = values["0"]
+                    for mode in ("1", "ordered"):
+                        actual = values[mode]
+                        for i in (0, 1):
+                            torch.testing.assert_close(
+                                actual[i], baseline[i], rtol=0, atol=0
+                            )
+                            torch.testing.assert_close(
+                                actual[3][i], baseline[3][i], rtol=0, atol=0
+                            )
+                        self.assertEqual(actual[2].tolist(), baseline[2])
+                        if mode == "ordered":
+                            torch.testing.assert_close(
+                                actual[3][6], baseline[3][6], rtol=0, atol=0
+                            )
 
     def test_wrong_mode_fails_before_payload_and_other_phases_do_not_activate(self):
         with (
@@ -292,6 +406,26 @@ class DeviceOrderedIndicesCpuTests(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 run(ids, selected, low, experts)
+
+
+    def test_small_prefix_tail_uses_cpu_map_and_boundary_uses_device(self):
+        minimum_flag = "SGLANG_GLM53_NORMAL_DEVICE_ROUTING_MIN_TOKENS"
+        with self.module.normal_hccl_idle_dp_scope(idle.batch((24, 0))):
+            with mock.patch.dict(os.environ, {FLAG: "0"}):
+                reference, _ = self.fixture.dispatch(0, 3)
+            for minimum, expected_device in ((0, True), (3, True), (4, False), (512, False)):
+                self.kernel.device_ordered_indices.reset_mock()
+                with mock.patch.dict(os.environ, {FLAG: "ordered", minimum_flag: str(minimum)}):
+                    actual, _ = self.fixture.dispatch(0, 3)
+                self.assertEqual(self.kernel.device_ordered_indices.called, expected_device)
+                counts = actual[2].tolist() if torch.is_tensor(actual[2]) else actual[2]
+                self.assertEqual(counts, reference[2])
+                for i in (0, 1):
+                    torch.testing.assert_close(actual[i], reference[i], rtol=0, atol=0)
+                torch.testing.assert_close(actual[3][6], reference[3][6], rtol=0, atol=0)
+            with mock.patch.dict(os.environ, {FLAG: "ordered", minimum_flag: "-1"}):
+                with self.assertRaisesRegex(ValueError, 'nonnegative'):
+                    self.fixture.dispatch(0, 3)
 
 
 if __name__ == "__main__":

@@ -383,6 +383,15 @@ def collective_dispatch(group, x, ids, weights, num_experts=288):
             "GLM DEVICE_ROUTING=ordered requires ORDERED=2node, "
             "288 experts, integer IDs and FP32 gates"
         )
+    if device_ordered:
+        minimum = int(os.getenv("SGLANG_GLM53_NORMAL_DEVICE_ROUTING_MIN_TOKENS", "0"))
+        if minimum < 0:
+            raise ValueError("GLM ordered device routing minimum must be nonnegative")
+        if tokens < minimum:
+            # Tiny cached-prefix tails favor the CPU route/map. Geometry is
+            # still audited below; both paths retain identical INT8 payload
+            # and stable FP32 accumulation. All P ranks use the same setting.
+            device_ordered = device_routing = False
     if world in (8, 16):
         release_normal_hccl_cached_memory(x)
         _check_equal_dispatch_shapes_cached(group, x, ids, weights, world)
@@ -410,7 +419,13 @@ def collective_dispatch(group, x, ids, weights, num_experts=288):
         selected, discarded, idle_counts = _normal_skip_idle_dp_routes(
             selected, group, world, rank, tokens, topk
         )
-    order = torch.argsort(flat[selected], stable=True)
+    sort_keys = flat[selected]
+    if device_ordered:
+        # CANN's integer ArgSort falls back to AiCPU. Only after the integer
+        # range/idle filters, keys lie in [0,287] and convert exactly to FP32.
+        # Keep original integer IDs for selection, counts and inverse mapping.
+        sort_keys = sort_keys.to(torch.float32)
+    order = torch.argsort(sort_keys, stable=True)
     selected = selected[order]
     counts = torch.bincount(flat[selected] - low, minlength=experts)
     if not device_routing:
@@ -462,12 +477,13 @@ def collective_dispatch(group, x, ids, weights, num_experts=288):
         logger.info(
             "GLM53 normal HCCL device routing active: rank=%d world=%d "
             "stable_expert_order=True counts_device=%s counts_dtype=%s "
-            "ordered_device_inverse=%s",
+            "ordered_device_inverse=%s sort_key_dtype=%s",
             rank,
             world,
             counts.device,
             counts.dtype,
             device_ordered,
+            sort_keys.dtype,
         )
         _device_routing_logged = True
     return recv, recv_scale, counts, state

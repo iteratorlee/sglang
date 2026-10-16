@@ -60,7 +60,7 @@ def make_ids(rows, case, dtype):
     return ids
 
 
-def select_routes(ids, rank, active):
+def select_routes(ids, rank, active, *, fp32_sort_keys=False):
     """Independent reference selection, usable on CPU or NPU."""
     flat, low = ids.flatten(), rank * 18
     selected = ((flat >= low) & (flat < low + 18)).nonzero().flatten()
@@ -69,7 +69,10 @@ def select_routes(ids, rank, active):
         selected = selected[selected >= half_routes]
     if not active[1]:
         selected = selected[selected < half_routes]
-    selected = selected[torch.argsort(flat[selected], stable=True)]
+    keys = flat[selected]
+    if fp32_sort_keys:
+        keys = keys.to(torch.float32)
+    selected = selected[torch.argsort(keys, stable=True)]
     counts = torch.bincount(flat[selected].to(torch.int64) - low, minlength=18)
     return selected, counts
 
@@ -132,7 +135,7 @@ def inverse_suite(args, collectives, inverse, combine, reference):
                     for rank in args.ranks:
                         selected, counts = select_routes(ids, rank, active)
                         device_selected, device_counts = select_routes(
-                            device_ids, rank, active
+                            device_ids, rank, active, fp32_sort_keys=True
                         )
                         torch.testing.assert_close(
                             device_selected.cpu(), selected, rtol=0, atol=0
@@ -159,6 +162,7 @@ def inverse_suite(args, collectives, inverse, combine, reference):
                             indices_exact=True,
                             selection_exact=True,
                             counts_exact=True,
+                            candidate_sort_key_dtype="torch.float32",
                         )
                         if rows <= 256:
                             y, gates = adversarial_values(selected // 8, 4096)
@@ -191,7 +195,7 @@ def inverse_suite(args, collectives, inverse, combine, reference):
         return selected.to(args.device), counts.to(args.device), result.to(args.device)
 
     def candidate():
-        selected, counts = select_routes(ids, rank, active)
+        selected, counts = select_routes(ids, rank, active, fp32_sort_keys=True)
         return selected, counts, inverse.device_ordered_indices(ids, selected, 0, 18)
 
     return dict(
@@ -365,6 +369,7 @@ def main():
     )
     result = dict(
         scope=__doc__,
+        candidate_variant="ordered-v2-filtered-fp32-sort-keys",
         torch_version=torch.__version__,
         torch_npu_version=torch_npu.__version__,
         source_sha256={
