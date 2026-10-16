@@ -2,6 +2,14 @@
 
 Retains the verified fallback for vendor dynamic-receive-size failures. This
 path is explicitly enabled for GLM W8A8 layers; decode still uses DeepEP LL.
+
+The following experiments require the existing NORMAL_SKIP_IDLE_DP=1 scope
+in eager two-node DP2/TP8/EP16 prefill (all names have the SGLANG_GLM53_ prefix):
+NORMAL_SHAPE_CACHE=1 replaces repeated shape audits with an invalidation vote;
+NORMAL_REDUCE_SCATTER=2node selects the scoped FP32 combine collective;
+NORMAL_REDUCE_SCATTER_CHECK=1 adds an expensive all-reduce reference check;
+NORMAL_DEVICE_ROUTING=1 keeps route sorting and expert counts on device.
+Use identical collective flags on every EP rank. All experiments default off.
 """
 
 import logging
@@ -21,6 +29,7 @@ _idle_dp_logged = False
 _dispatch_shape_cache = {}
 _shape_cache_logged = False
 _reduce_scatter_check_logged = False
+_device_routing_logged = False
 
 
 def release_normal_hccl_cached_memory(x):
@@ -156,7 +165,7 @@ def normal_hccl_idle_dp_scope(forward_batch, mlp_context=None):
 
 
 def _normal_skip_idle_dp_routes(selected, group, world, rank, tokens, topk):
-    """Filter CPU route offsets; retain every route in a positive-count domain."""
+    """Filter route offsets on their device; retain every positive-count domain."""
     counts = _idle_dp_counts.get()
     if counts is None:
         return selected, 0, None
@@ -180,7 +189,6 @@ def _normal_skip_idle_dp_routes(selected, group, world, rank, tokens, topk):
         or parallel.attn_tp_size != 8
         or parallel.attn_dp_rank != rank // 8
         or parallel.attn_tp_rank != rank % 8
-        or selected.device.type != "cpu"
     ):
         raise RuntimeError("GLM idle DP requires the native DP2/TP8/EP16 rank mapping")
     before = selected.numel()
@@ -317,7 +325,7 @@ def log_normal_hccl_activation(quant_info, profile):
 
 
 def collective_dispatch(group, x, ids, weights, num_experts=288):
-    global _last_dispatch_metadata, _idle_dp_logged
+    global _last_dispatch_metadata, _idle_dp_logged, _device_routing_logged
     world, rank = dist.get_world_size(group), dist.get_rank(group)
     tokens, width = x.shape
     topk = ids.shape[1]
@@ -335,7 +343,15 @@ def collective_dispatch(group, x, ids, weights, num_experts=288):
     if q.dtype != torch.int8 or scale.dtype != torch.float32:
         raise RuntimeError("GLM HCCL normal dispatch requires INT8 rows/FP32 scales")
     all_q, all_scale, all_ids, all_weights = map(gather, (q, scale, ids, weights))
-    flat = all_ids.cpu().flatten()
+    # The scope is published only for EXTEND in the eager, non-overlap
+    # two-node P profile. Keep all other normal profiles on the CPU reference
+    # path, even if the flag is inherited by another worker (including D).
+    device_routing = (
+        os.getenv("SGLANG_GLM53_NORMAL_DEVICE_ROUTING", "0") == "1"
+        and world == 16
+        and _idle_dp_counts.get() is not None
+    )
+    flat = (all_ids if device_routing else all_ids.cpu()).flatten()
     assert num_experts % world == 0
     experts = num_experts // world
     low = rank * experts
@@ -347,7 +363,9 @@ def collective_dispatch(group, x, ids, weights, num_experts=288):
         )
     order = torch.argsort(flat[selected], stable=True)
     selected = selected[order]
-    counts = torch.bincount(flat[selected] - low, minlength=experts).tolist()
+    counts = torch.bincount(flat[selected] - low, minlength=experts)
+    if not device_routing:
+        counts = counts.tolist()
     if idle_counts is not None and 0 in idle_counts and not _idle_dp_logged:
         logger.info(
             "GLM53 normal HCCL skip idle DP: rank=%d world=%d valid_dp_counts=%s "
@@ -356,7 +374,7 @@ def collective_dispatch(group, x, ids, weights, num_experts=288):
             world,
             idle_counts,
             discarded,
-            sum(counts),
+            selected.numel(),
         )
         _idle_dp_logged = True
     loc = selected.to(device=x.device, dtype=torch.int64)
@@ -386,6 +404,16 @@ def collective_dispatch(group, x, ids, weights, num_experts=288):
         q.dtype,
         scale.dtype,
     )
+    if device_routing and not _device_routing_logged:
+        logger.info(
+            "GLM53 normal HCCL device routing active: rank=%d world=%d "
+            "stable_expert_order=True counts_device=%s counts_dtype=%s",
+            rank,
+            world,
+            counts.device,
+            counts.dtype,
+        )
+        _device_routing_logged = True
     return recv, recv_scale, counts, state
 
 

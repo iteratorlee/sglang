@@ -116,7 +116,8 @@ class DeepEPNormalDispatchOutput(NamedTuple):
     hidden_states_scale: Optional[torch.Tensor]
     topk_ids: torch.Tensor
     topk_weights: torch.Tensor
-    num_recv_tokens_per_expert: List[int]
+    # GLM's opt-in NPU normal collective path can retain counts on device.
+    num_recv_tokens_per_expert: Union[List[int], torch.Tensor]
 
     @property
     def format(self) -> DispatchOutputFormat:

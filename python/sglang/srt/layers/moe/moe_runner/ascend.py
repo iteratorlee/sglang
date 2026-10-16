@@ -267,7 +267,8 @@ def pre_permute_deepep_normal_to_ascend(
         topk_weights,
         num_recv_tokens_per_expert,
     ) = dispatch_output
-    group_list = torch.tensor(
+    # Preserve device-resident GLM HCCL counts; DeepEP's CPU list stays valid.
+    group_list = torch.as_tensor(
         num_recv_tokens_per_expert,
         dtype=torch.int64,
         device=hidden_states.device,
