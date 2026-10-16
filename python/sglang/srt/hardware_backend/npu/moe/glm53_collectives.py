@@ -11,6 +11,8 @@ NORMAL_REDUCE_SCATTER_CHECK=1 adds an expensive all-reduce reference check;
 NORMAL_DEVICE_ROUTING=1 keeps route sorting and expert counts on device.
 NORMAL_COMBINE_ORDERED=2node uses fixed-order FP32 Triton accumulation with
 CPU routing; it is mutually exclusive with NORMAL_DEVICE_ROUTING=1.
+NORMAL_DEVICE_ROUTING=ordered explicitly enables device routing with the
+same ordered combine and a device inverse map in that two-node P scope.
 Use identical collective flags on every EP rank. All experiments default off.
 """
 
@@ -361,6 +363,26 @@ def collective_dispatch(group, x, ids, weights, num_experts=288):
     tokens, width = x.shape
     topk = ids.shape[1]
     ordered = _normal_ordered_combine_enabled(world, tokens, topk, width, x.dtype)
+    # Keep the original device-only experiment and its ordered-mode rejection.
+    # The new explicit mode needs ordered accumulation and the eager P scope.
+    routing_mode = os.getenv("SGLANG_GLM53_NORMAL_DEVICE_ROUTING", "0")
+    device_routing = (
+        routing_mode in ("1", "ordered")
+        and world == 16
+        and _idle_dp_counts.get() is not None
+    )
+    device_ordered = device_routing and routing_mode == "ordered"
+    if device_ordered and (
+        not ordered
+        or os.getenv("SGLANG_GLM53_NORMAL_COMBINE_ORDERED", "0") != "2node"
+        or num_experts != 288
+        or ids.dtype not in (torch.int32, torch.int64)
+        or weights.dtype != torch.float32
+    ):
+        raise ValueError(
+            "GLM DEVICE_ROUTING=ordered requires ORDERED=2node, "
+            "288 experts, integer IDs and FP32 gates"
+        )
     if world in (8, 16):
         release_normal_hccl_cached_memory(x)
         _check_equal_dispatch_shapes_cached(group, x, ids, weights, world)
@@ -378,11 +400,6 @@ def collective_dispatch(group, x, ids, weights, num_experts=288):
     # The scope is published only for EXTEND in the eager, non-overlap
     # two-node P profile. Keep all other normal profiles on the CPU reference
     # path, even if the flag is inherited by another worker (including D).
-    device_routing = (
-        os.getenv("SGLANG_GLM53_NORMAL_DEVICE_ROUTING", "0") == "1"
-        and world == 16
-        and _idle_dp_counts.get() is not None
-    )
     flat = (all_ids if device_routing else all_ids.cpu()).flatten()
     assert num_experts % world == 0
     experts = num_experts // world
@@ -421,10 +438,17 @@ def collective_dispatch(group, x, ids, weights, num_experts=288):
     chosen_weights = all_weights.flatten().index_select(0, loc)
     state = (rows, chosen_weights, tokens, world, width, int(selected.numel()))
     if ordered:
-        # selected is already CPU-resident in stable expert order. No extra
-        # device synchronization: construct a small inverse map during routing.
-        indices = _normal_combine_ordered_indices(selected // topk, world * tokens, topk)
-        state += (indices.to(device=x.device),)
+        if device_ordered:
+            from .glm53_device_ordered_indices import device_ordered_indices
+
+            # Filtering removes whole idle rows only. The remaining local
+            # expert routes are complete and stable, as required by the map.
+            indices = device_ordered_indices(all_ids, loc, low, experts)
+        else:
+            indices = _normal_combine_ordered_indices(
+                selected // topk, world * tokens, topk
+            ).to(device=x.device)
+        state += (indices,)
     _last_dispatch_metadata = (
         rank,
         world,
@@ -437,11 +461,13 @@ def collective_dispatch(group, x, ids, weights, num_experts=288):
     if device_routing and not _device_routing_logged:
         logger.info(
             "GLM53 normal HCCL device routing active: rank=%d world=%d "
-            "stable_expert_order=True counts_device=%s counts_dtype=%s",
+            "stable_expert_order=True counts_device=%s counts_dtype=%s "
+            "ordered_device_inverse=%s",
             rank,
             world,
             counts.device,
             counts.dtype,
+            device_ordered,
         )
         _device_routing_logged = True
     return recv, recv_scale, counts, state
