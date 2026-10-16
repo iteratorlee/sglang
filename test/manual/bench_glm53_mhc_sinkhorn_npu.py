@@ -383,9 +383,7 @@ def main():
     parser.add_argument(
         "--module-dir",
         type=Path,
-        default=(
-            Path(__file__).resolve().parents[2] / "python/sglang/kernels/ops/layernorm"
-        ),
+        default=None,
     )
     parser.add_argument(
         "--reference-file",
@@ -404,6 +402,8 @@ def main():
     parser.add_argument("--repeats", type=int, default=20)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.module_dir is None:
+        args.module_dir = Path(__file__).resolve().parents[2] / "python/sglang/kernels/ops/layernorm"
     if not args.confirm_parent_stopped_p:
         parser.error("Parent must stop P and reserve an idle NPU before running")
     if args.warmup < 2 or args.repeats < 5:
