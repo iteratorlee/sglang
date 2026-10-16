@@ -2289,6 +2289,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
         self.layer_id = layer_id
         self.is_nextn = is_nextn
+        self._glm53_normal_prefill_draft = False
         if is_nextn and getattr(config, "mla_nope", False):
             # The NextN draft must match the NoPE target layers, or its Q/K
             # and the KV it verifies against live in different spaces.
@@ -2491,6 +2492,13 @@ class DeepseekV2DecoderLayer(nn.Module):
             _mlp_ctx = moe_output_buffer_ctx(hidden_states_orig)
         else:
             _mlp_ctx = nullcontext()
+
+        if self._glm53_normal_prefill_draft:
+            from sglang.srt.hardware_backend.npu.moe.glm53_draft_prefill import (
+                draft_prefill_scope,
+            )
+
+            _mlp_ctx = draft_prefill_scope(forward_batch, _mlp_ctx)
 
         with get_forward().scoped(
             fuse_mlp_allreduce=fuse_mlp_allreduce,

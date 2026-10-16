@@ -14,6 +14,7 @@
 
 import logging
 import json
+import os
 from pathlib import Path
 from contextlib import contextmanager
 from copy import copy
@@ -92,6 +93,17 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
             self.model.decoder.self_attn.indexer._glm53_draft_graph_steps = (
                 get_spec().speculative_num_draft_tokens
             )
+            if os.getenv("SGLANG_GLM53_NORMAL_PREFILL_DRAFT_SCOPE", "0") == "1":
+                from sglang.srt.utils import is_npu
+
+                if is_npu():
+                    from sglang.srt.hardware_backend.npu.moe.glm53_collectives import (
+                        normal_hccl_skip_idle_dp_enabled,
+                    )
+
+                    self.model.decoder._glm53_normal_prefill_draft = (
+                        normal_hccl_skip_idle_dp_enabled()
+                    )
 
     @contextmanager
     def speculative_state_transaction(self):
