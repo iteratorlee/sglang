@@ -6,9 +6,11 @@ peers are fabricated EXTEND batches. Do not admit real verify/decode phases.
 """
 from contextlib import contextmanager, nullcontext
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 _logged = False
+_small_logged = False
 
 
 @contextmanager
@@ -33,6 +35,28 @@ def draft_prefill_scope(batch, mlp_context=None):
         raise ValueError("GLM P draft scope requires one-token-per-row EAGLE_DRAFT_EXTEND metadata")
     if batch.forward_mode != ForwardMode.EXTEND:
         raise ValueError("GLM P draft scope requires native EXTEND on active and idle peers")
+    minimum = int(os.getenv("SGLANG_GLM53_NORMAL_PREFILL_DRAFT_MIN_TOKENS", "0"))
+    if minimum < 0:
+        raise ValueError("GLM P draft minimum token count must be nonnegative")
+    if minimum:
+        counts = batch.original_global_num_tokens_cpu
+        if not counts or any(count < 0 for count in counts):
+            raise ValueError("GLM P draft minimum requires original per-DP token counts")
+        # Every EP rank sees the same original DP vector. Use its maximum,
+        # never this rank's active count, so idle peers choose the same path.
+        # Keep short prompts/cache tails on the original IndexAdd/all-reduce
+        # implementation; large prefill is the measured optimization scope.
+        if max(counts) < minimum:
+            global _small_logged
+            if not _small_logged:
+                logger.info(
+                    "GLM53 P draft reference path selected: original=%s minimum=%d",
+                    counts, minimum,
+                )
+                _small_logged = True
+            with nullcontext() if mlp_context is None else mlp_context:
+                yield
+            return
     with normal_hccl_idle_dp_scope(batch, mlp_context):
         global _logged
         if not _logged:

@@ -1,5 +1,6 @@
 """P draft scope consensus, fabricated idle mode and lifecycle on CPU only."""
 import ast
+import os
 from abc import ABC
 from contextlib import contextmanager
 from enum import IntEnum, auto
@@ -104,6 +105,42 @@ class DraftPrefillScopeTests(unittest.TestCase):
         glm = (SRT / 'models/glm5_next_nextn.py').read_text()
         self.assertIn('SGLANG_GLM53_NORMAL_PREFILL_DRAFT_SCOPE', glm)
         self.assertIn('normal_hccl_skip_idle_dp_enabled()', glm)
+
+    def test_minimum_uses_original_global_vector_on_active_and_idle_peers(self):
+        with mock.patch.dict(os.environ, {'SGLANG_GLM53_NORMAL_PREFILL_DRAFT_MIN_TOKENS': '4096'}):
+            for counts, admitted in [((256, 0), False), ((0, 4095), False),
+                                     ((0, 4096), True), ((16384, 7), True),
+                                     ((7, 16384), True), ((2048, 2048), False)]:
+                for rank in (0, 1):
+                    with self.subTest(counts=counts, rank=rank):
+                        batch = self.batch(counts, rank)
+                        before = vars(batch).copy()
+                        with self.helper.draft_prefill_scope(batch):
+                            self.assertEqual(self.fixture.module._idle_dp_counts.get(), counts if admitted else None)
+                            self.assertEqual(vars(batch), before)
+                        self.assertIsNone(self.fixture.module._idle_dp_counts.get())
+
+    def test_small_fallback_preserves_original_mlp_context_on_error(self):
+        events = []
+        @contextmanager
+        def context():
+            events.append('enter')
+            try:
+                yield
+            finally:
+                events.append('exit')
+        with mock.patch.dict(os.environ, {'SGLANG_GLM53_NORMAL_PREFILL_DRAFT_MIN_TOKENS': '4096'}):
+            with self.assertRaisesRegex(RuntimeError, 'body'):
+                with self.helper.draft_prefill_scope(self.batch((128, 0), 1), context()):
+                    self.assertIsNone(self.fixture.module._idle_dp_counts.get())
+                    raise RuntimeError('body')
+        self.assertEqual(events, ['enter', 'exit'])
+
+    def test_negative_minimum_rejected(self):
+        with mock.patch.dict(os.environ, {'SGLANG_GLM53_NORMAL_PREFILL_DRAFT_MIN_TOKENS': '-1'}):
+            with self.assertRaisesRegex(ValueError, 'nonnegative'):
+                with self.helper.draft_prefill_scope(self.batch((128, 0), 0)):
+                    self.fail('invalid minimum admitted')
 
 
 if __name__ == '__main__':
