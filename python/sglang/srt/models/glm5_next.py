@@ -863,7 +863,11 @@ class Glm5NextDecoderLayer(nn.Module):
                 normal_hccl_idle_dp_scope,
             )
 
-            _mlp_ctx = normal_hccl_idle_dp_scope(forward_batch, _mlp_ctx)
+            _mlp_ctx = normal_hccl_idle_dp_scope(
+                forward_batch,
+                _mlp_ctx,
+                layer_id=None if self.is_nextn else self.layer_id,
+            )
 
         with get_forward().scoped(
             fuse_mlp_allreduce=should_allreduce_fusion,
@@ -1058,33 +1062,44 @@ class Glm5NextModel(nn.Module):
                 normal_end_layer = normal_start_layer = 0
         aux_hidden_states = []
         topk_indices = None
-        for i in range(normal_start_layer, normal_end_layer):
-            # NOTE: torch dynamo does not support graph break in context manager
-            ctx = (
-                nullcontext()
-                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-                else get_global_expert_distribution_recorder().with_current_layer(i)
+        shape_audit_ctx = nullcontext()
+        if os.getenv("SGLANG_GLM53_NORMAL_BATCH_SHAPE_AUDIT", "0") == "1":
+            from sglang.srt.hardware_backend.npu.moe.glm53_collectives import (
+                normal_hccl_batch_shape_audit_scope,
             )
-            with ctx:
-                if i in self.layers_to_capture:
-                    aux_hidden_state = self._prepare_aux_hidden_state(
-                        hidden_states, residual
-                    )
-                    if self.enable_a2a_moe and i > self.first_k_dense_replace:
-                        aux_hidden_state = get_parallel().attn_tp_group.all_gather(
-                            aux_hidden_state, dim=0
-                        )
-                    aux_hidden_states.append(aux_hidden_state)
-                layer = self.layers[i]
-                hidden_states, residual, topk_indices = layer(
-                    positions,
-                    hidden_states,
-                    forward_batch,
-                    residual,
-                    zero_allocator,
-                    gemm_output_zero_allocator,
-                    prev_topk_indices=topk_indices,
+
+            shape_audit_ctx = normal_hccl_batch_shape_audit_scope(
+                forward_batch,
+                self.layers[normal_start_layer:normal_end_layer],
+            )
+        with shape_audit_ctx:
+            for i in range(normal_start_layer, normal_end_layer):
+                # NOTE: torch dynamo does not support graph break in context manager
+                ctx = (
+                    nullcontext()
+                    if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                    else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
+                with ctx:
+                    if i in self.layers_to_capture:
+                        aux_hidden_state = self._prepare_aux_hidden_state(
+                            hidden_states, residual
+                        )
+                        if self.enable_a2a_moe and i > self.first_k_dense_replace:
+                            aux_hidden_state = get_parallel().attn_tp_group.all_gather(
+                                aux_hidden_state, dim=0
+                            )
+                        aux_hidden_states.append(aux_hidden_state)
+                    layer = self.layers[i]
+                    hidden_states, residual, topk_indices = layer(
+                        positions,
+                        hidden_states,
+                        forward_batch,
+                        residual,
+                        zero_allocator,
+                        gemm_output_zero_allocator,
+                        prev_topk_indices=topk_indices,
+                    )
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(

@@ -6,6 +6,8 @@ path is explicitly enabled for GLM W8A8 layers; decode still uses DeepEP LL.
 The following experiments require the existing NORMAL_SKIP_IDLE_DP=1 scope
 in eager two-node DP2/TP8/EP16 prefill (all names have the SGLANG_GLM53_ prefix):
 NORMAL_SHAPE_CACHE=1 replaces repeated shape audits with an invalidation vote;
+NORMAL_BATCH_SHAPE_AUDIT=1 keeps that vote once per large target forward,
+with a CPU certificate for the remaining 41 MoE layers (requires SHAPE_CACHE);
 NORMAL_REDUCE_SCATTER=2node selects the scoped FP32 combine collective;
 NORMAL_REDUCE_SCATTER_CHECK=1 adds an expensive all-reduce reference check;
 NORMAL_DEVICE_ROUTING=1 keeps route sorting and expert counts on device.
@@ -32,6 +34,10 @@ _idle_dp_counts = ContextVar("glm53_normal_hccl_idle_dp_counts", default=None)
 _idle_dp_logged = False
 _dispatch_shape_cache = {}
 _shape_cache_logged = False
+_batch_shape_epoch = ContextVar("glm53_normal_batch_shape_epoch", default=None)
+_layer_shape_epoch = ContextVar("glm53_normal_layer_shape_epoch", default=None)
+_batch_shape_excluded = object()
+_batch_shape_logged = False
 _reduce_scatter_check_logged = False
 _device_routing_logged = False
 _ordered_combine_logged = False
@@ -135,36 +141,286 @@ def normal_hccl_skip_idle_dp_enabled():
     )
 
 
+def _normal_dp_shape_metadata(forward_batch):
+    original = getattr(forward_batch, "original_global_num_tokens_cpu", None)
+    padded = getattr(forward_batch, "global_num_tokens_cpu", None)
+    for name, values in (("original", original), ("padded", padded)):
+        if (
+            not isinstance(values, (list, tuple))
+            or len(values) != 2
+            or any(type(value) is not int or value < 0 for value in values)
+        ):
+            raise ValueError(f"GLM idle DP requires two nonnegative CPU {name} counts")
+    if (
+        not forward_batch.dp_padding_mode.is_max_len()
+        or padded[0] != padded[1]
+        or any(real > capacity for real, capacity in zip(original, padded))
+    ):
+        raise ValueError("GLM idle DP requires matching MAX_LEN padded counts")
+    return tuple(original), tuple(padded)
+
+
+class _BatchShapeEpoch:
+    """A single synchronous target layer loop, never a request/local hit cache.
+
+    Only a configured dense prefix followed by 42 mHC MoE layers is admitted.
+    Each MoE dispatch uses BF16 H4096, INT64 topk8 IDs and FP32 gates.
+    MAX_LEN/TP8 fixes rows; dense scopes do not dispatch or consume a vote.
+    No legal shape change exists *inside* this loop. A violation is fatal, not
+    a local cache miss: retrying an audit here could mismatch peers' payloads.
+    """
+
+    def __init__(self, batch, metadata, group, first_layer, end_layer):
+        self.batch = batch
+        self.metadata = metadata
+        self.group = group
+        self.first_layer = self.next_layer = first_layer
+        self.end_layer = end_layer
+        self.last_dense_layer = -1
+        self.signature = None
+        self.cache_entry = None
+        self.dispatched = False
+        self.failed = False
+        self.active_layer = None
+        self.parallel_signature = _batch_shape_parallel_signature()
+
+    def invalidate(self):
+        self.failed = True
+        _dispatch_shape_cache.pop(self.group, None)
+
+    def fail(self, reason):
+        self.invalidate()
+        raise RuntimeError(
+            f"GLM batch shape certificate violated: {reason}; abort forward"
+        )
+
+    def check_batch(self, batch):
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        try:
+            metadata = _normal_dp_shape_metadata(batch)
+        except ValueError:
+            self.invalidate()
+            raise
+        if (
+            self.failed
+            or _batch_shape_epoch.get() is not self
+            or _layer_shape_epoch.get() is not self
+            or batch is not self.batch
+            or batch.forward_mode != ForwardMode.EXTEND
+            or batch.can_run_tbo
+            or metadata != self.metadata
+            or _batch_shape_parallel_signature() != self.parallel_signature
+            or _idle_dp_counts.get() != self.metadata[0]
+            or os.getenv("SGLANG_GLM53_NORMAL_BATCH_SHAPE_AUDIT", "0") != "1"
+            or os.getenv("SGLANG_GLM53_NORMAL_SHAPE_CACHE", "0") != "1"
+            or os.getenv("SGLANG_GLM53_NORMAL_ALL_TO_ALL", "0") == "1"
+        ):
+            self.fail("batch metadata, scope or flags changed within forward")
+
+    def check_dispatch(self, group, signature):
+        self.check_batch(self.batch)
+        world, x, ids, weights = signature
+        rows = self.metadata[1][0] // 8
+        device = x[2]
+        if (
+            self.dispatched
+            or self.active_layer != self.next_layer
+            or group is not self.group
+            or world != 16
+            or x != ((rows, 4096), torch.bfloat16, device)
+            or ids != ((rows, 8), torch.int64, device)
+            or weights != ((rows, 8), torch.float32, device)
+        ):
+            self.fail("dispatch count, group, shape, dtype or device changed")
+        if self.signature is not None and (
+            signature != self.signature
+            or _dispatch_shape_cache.get(group) is not self.cache_entry
+            or self.cache_entry != signature
+        ):
+            self.fail("dispatch signature or global cache changed within forward")
+
+
+def _batch_shape_parallel_signature():
+    from sglang.srt.runtime_context import get_parallel
+
+    parallel = get_parallel()
+    ep = parallel.moe_ep_group
+    return (
+        ep.device_group,
+        ep.world_size,
+        tuple(ep.ranks),
+        tuple(parallel.tp_group.ranks),
+        ep.rank_in_group,
+        parallel.attn_dp_size,
+        parallel.attn_tp_size,
+        parallel.attn_dp_rank,
+        parallel.attn_tp_rank,
+    )
+
+
+def _active_batch_shape_epoch():
+    epoch = _layer_shape_epoch.get()
+    if epoch is _batch_shape_excluded:
+        return None
+    if epoch is None and _batch_shape_epoch.get() is not None:
+        _batch_shape_epoch.get().fail("dispatch outside target MLP scope")
+    if epoch is not None and (
+        epoch.active_layer is None or epoch.active_layer < epoch.first_layer
+    ):
+        epoch.fail("dispatch outside target MoE layer")
+    return epoch
+
+
 @contextmanager
-def normal_hccl_idle_dp_scope(forward_batch, mlp_context=None):
+def normal_hccl_batch_shape_audit_scope(forward_batch, layers):
+    """Own the certificate outside the target loop; FB reuse starts a new epoch.
+
+    All ranks must share flags/model and the scheduler's original DP vector.
+    Admission uses its global maximum, including on the idle attention domain.
+    The finite eager/non-overlap profile excludes concurrent cache mutation.
+    """
+    if _batch_shape_epoch.get() is not None:
+        _batch_shape_epoch.get().fail("nested target forwards")
+    epoch = None
+    if (
+        os.getenv("SGLANG_GLM53_NORMAL_BATCH_SHAPE_AUDIT", "0") == "1"
+        and os.getenv("SGLANG_GLM53_NORMAL_SHAPE_CACHE", "0") == "1"
+        and normal_hccl_skip_idle_dp_enabled()
+    ):
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        if forward_batch.forward_mode == ForwardMode.EXTEND:
+            metadata = _normal_dp_shape_metadata(forward_batch)
+            if max(metadata[0]) >= 4096:
+                from sglang.srt.layers.communicator import ScatterMode
+                from sglang.srt.layers.communicator_mhc import (
+                    AscendMHCLayerCommunicator,
+                )
+                from sglang.srt.runtime_context import get_parallel
+
+                # Unsupported model geometry is an error when opted in, never
+                # a rank-local fallback that could diverge from an admitted peer.
+                first_moe = len(layers) - 42
+                if (
+                    forward_batch.can_run_tbo
+                    or metadata[1][0] % 8
+                    or first_moe < 0
+                    or any(
+                        layer.layer_id != i
+                        or layer.is_nextn
+                        or layer.hidden_size != 4096
+                        or layer.config.num_hidden_layers != len(layers)
+                        or layer.config.first_k_dense_replace != first_moe
+                        or layer.config.moe_layer_freq != 1
+                        or layer.is_layer_sparse != (i >= first_moe)
+                        or not isinstance(
+                            layer.layer_communicator, AscendMHCLayerCommunicator
+                        )
+                        or (
+                            i >= first_moe
+                            and (
+                                not layer._normal_skip_idle_dp
+                                or layer.layer_scatter_modes.mlp_mode
+                                != ScatterMode.SCATTERED
+                                or layer.mlp.top_k != 8
+                                or layer.mlp.num_fused_shared_experts != 0
+                                or layer.config.n_routed_experts != 288
+                            )
+                        )
+                        for i, layer in enumerate(layers)
+                    )
+                    or os.getenv("SGLANG_GLM53_NORMAL_ALL_TO_ALL", "0") == "1"
+                ):
+                    raise RuntimeError(
+                        "GLM batch shape audit requires the fixed 42-MoE target loop"
+                    )
+                parallel = get_parallel()
+                ep = parallel.moe_ep_group
+                if (
+                    ep.world_size != 16
+                    or parallel.attn_dp_size != 2
+                    or parallel.attn_tp_size != 8
+                    or parallel.attn_dp_rank != ep.rank_in_group // 8
+                    or parallel.attn_tp_rank != ep.rank_in_group % 8
+                    or list(ep.ranks) != list(parallel.tp_group.ranks)
+                    or len(ep.ranks) != 16
+                    or list(ep.ranks) != list(range(ep.ranks[0], ep.ranks[0] + 16))
+                ):
+                    raise RuntimeError(
+                        "GLM batch shape audit requires native DP2/TP8/EP16"
+                    )
+                epoch = _BatchShapeEpoch(
+                    forward_batch, metadata, ep.device_group, first_moe, len(layers)
+                )
+    token = _batch_shape_epoch.set(epoch)
+    complete = False
+    try:
+        yield
+        if epoch is not None and (epoch.failed or epoch.next_layer != epoch.end_layer):
+            epoch.fail("incomplete target layer sequence")
+        complete = True
+    finally:
+        if epoch is not None and not complete:
+            epoch.invalidate()
+        _batch_shape_epoch.reset(token)
+
+
+@contextmanager
+def _normal_hccl_layer_shape_scope(forward_batch, layer_id):
+    # No layer_id means NextN/legacy invocation: explicitly mask any target
+    # certificate, including in nested contexts, and retain its old audit.
+    epoch = _batch_shape_epoch.get() if layer_id is not None else None
+    published = (
+        _batch_shape_excluded
+        if layer_id is None and _batch_shape_epoch.get() is not None
+        else epoch
+    )
+    token = _layer_shape_epoch.set(published)
+    complete = False
+    dense = epoch is not None and 0 <= layer_id < epoch.first_layer
+    try:
+        if epoch is not None:
+            epoch.check_batch(forward_batch)
+            ordered = (
+                epoch.next_layer == epoch.first_layer and layer_id > epoch.last_dense_layer
+                if dense else layer_id == epoch.next_layer
+            )
+            if not ordered or epoch.active_layer is not None:
+                epoch.fail("out-of-order or nested target MLP")
+            if dense:
+                epoch.last_dense_layer = layer_id
+            epoch.active_layer = layer_id
+            epoch.dispatched = False
+        yield
+        if epoch is not None:
+            if epoch.failed or epoch.dispatched == dense:
+                epoch.fail("target layer did not complete exactly one dispatch")
+            if not dense:
+                epoch.next_layer += 1
+        complete = True
+    finally:
+        if epoch is not None and not complete:
+            epoch.invalidate()
+        if epoch is not None:
+            epoch.active_layer = None
+        _layer_shape_epoch.reset(token)
+
+
+@contextmanager
+def normal_hccl_idle_dp_scope(forward_batch, mlp_context=None, *, layer_id=None):
     """Publish immutable original CPU counts for just this GLM MLP invocation."""
     counts = None
     if normal_hccl_skip_idle_dp_enabled():
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
         if forward_batch.forward_mode == ForwardMode.EXTEND:
-            original = getattr(forward_batch, "original_global_num_tokens_cpu", None)
-            padded = getattr(forward_batch, "global_num_tokens_cpu", None)
-            for name, values in (("original", original), ("padded", padded)):
-                if (
-                    not isinstance(values, (list, tuple))
-                    or len(values) != 2
-                    or any(type(value) is not int or value < 0 for value in values)
-                ):
-                    raise ValueError(
-                        f"GLM idle DP requires two nonnegative CPU {name} counts"
-                    )
-            if (
-                not forward_batch.dp_padding_mode.is_max_len()
-                or padded[0] != padded[1]
-                or any(real > capacity for real, capacity in zip(original, padded))
-            ):
-                raise ValueError("GLM idle DP requires matching MAX_LEN padded counts")
-            counts = tuple(original)
+            counts, _ = _normal_dp_shape_metadata(forward_batch)
     with nullcontext() if mlp_context is None else mlp_context:
         token = _idle_dp_counts.set(counts)
         try:
-            yield
+            with _normal_hccl_layer_shape_scope(forward_batch, layer_id):
+                yield
         finally:
             _idle_dp_counts.reset(token)
 
@@ -250,8 +506,9 @@ def _check_equal_dispatch_shapes_cached(group, x, ids, weights, world):
     synchronization; it saves the full shape gather/readback on cache hits.
     The idle-DP scope provides the existing eager/no-overlap P-only guard.
     """
-    global _shape_cache_logged
-    if (
+    global _shape_cache_logged, _batch_shape_logged
+    epoch = _active_batch_shape_epoch()
+    if epoch is None and (
         os.getenv("SGLANG_GLM53_NORMAL_SHAPE_CACHE", "0") != "1"
         or world != 16
         or _idle_dp_counts.get() is None
@@ -262,6 +519,15 @@ def _check_equal_dispatch_shapes_cached(group, x, ids, weights, world):
     signature = (world,) + tuple(
         (tuple(t.shape), t.dtype, t.device) for t in (x, ids, weights)
     )
+    if epoch is not None:
+        if epoch.signature is not None:
+            epoch.check_dispatch(group, signature)
+            epoch.dispatched = True
+            return
+        epoch.check_batch(epoch.batch)
+        if group is not epoch.group or world != 16:
+            epoch.fail("dispatch group or world changed")
+
     dirty = torch.tensor(
         [int(_dispatch_shape_cache.get(group) != signature)],
         dtype=torch.int32,
@@ -273,6 +539,20 @@ def _check_equal_dispatch_shapes_cached(group, x, ids, weights, world):
         _dispatch_shape_cache.pop(group, None)
         _check_equal_dispatch_shapes(group, x, ids, weights, world)
         _dispatch_shape_cache[group] = signature
+    if epoch is not None:
+        # First dispatch always completes the legacy global vote/audit before
+        # certifying the fixed local contract. Remote misses are still visible.
+        epoch.check_dispatch(group, signature)
+        epoch.signature = signature
+        epoch.cache_entry = _dispatch_shape_cache[group]
+        epoch.dispatched = True
+        if not _batch_shape_logged:
+            logger.info(
+                "GLM53 batch shape audit active: target_moe_layers=42 "
+                "votes_per_forward=1 original=%s padded=%s",
+                *epoch.metadata,
+            )
+            _batch_shape_logged = True
     if not _shape_cache_logged:
         logger.info(
             "GLM53 normal HCCL shape cache active: world=%d "
@@ -360,6 +640,9 @@ def _normal_ordered_combine_enabled(world, tokens, topk, width, dtype):
 def collective_dispatch(group, x, ids, weights, num_experts=288):
     global _last_dispatch_metadata, _idle_dp_logged, _device_routing_logged
     world, rank = dist.get_world_size(group), dist.get_rank(group)
+    epoch = _active_batch_shape_epoch()
+    if epoch is not None and (world != 16 or num_experts != 288):
+        epoch.fail("dispatch world or expert count changed")
     tokens, width = x.shape
     topk = ids.shape[1]
     ordered = _normal_ordered_combine_enabled(world, tokens, topk, width, x.dtype)

@@ -266,6 +266,7 @@ class IdleDpCpuTests(unittest.TestCase):
             return hidden, residual
 
         layer = NS(
+            layer_id=3,
             is_nextn=False,
             _normal_skip_idle_dp=self.module.normal_hccl_skip_idle_dp_enabled(),
             mlp=MoE(),
