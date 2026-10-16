@@ -16,7 +16,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[3]
 PATH = "python/sglang/srt/hardware_backend/npu/moe/glm53_collectives.py"
-BASE = "3ef9d35f79b62748345234605d7cd16bf9c38811"
+BASE = "0a289257"
 FLAG = "SGLANG_GLM53_NORMAL_REDUCE_SCATTER"
 BF16 = "bfloat16"
 SUM = object()
@@ -173,9 +173,14 @@ class TestNormalReduceScatter(unittest.TestCase):
             "os": os,
             "torch": torch,
             "dist": Collective(reduced, local, group, trace),
+            "_idle_dp_counts": types.SimpleNamespace(get=lambda: None),
         }
         module = ast.Module(
-            body=[source_node or FUNCTIONS["collective_combine"]], type_ignores=[]
+            body=[
+                FUNCTIONS["_normal_combine_index_add_"],
+                source_node or FUNCTIONS["collective_combine"],
+            ],
+            type_ignores=[],
         )
         exec(
             compile(ast.fix_missing_locations(module), "actual_glm_combine", "exec"),
@@ -263,23 +268,27 @@ class TestNormalReduceScatter(unittest.TestCase):
                 old.array.view(np.uint32), new.array.view(np.uint32)
             )
 
-    def test_dispatch_and_off_path_ast_match_frozen_parent(self):
+    def test_default_combine_matches_pre_optimization_parent(self):
         baseline = subprocess.check_output(
             ["git", "-C", str(ROOT), "show", BASE + ":" + PATH], text=True
         )
         old = nodes(baseline)
-        self.assertEqual(
-            ast.dump(old["collective_dispatch"]),
-            ast.dump(FUNCTIONS["collective_dispatch"]),
-        )
-        candidate = nodes(SOURCE)["collective_combine"]
-        candidate.body = [
-            n
-            for n in candidate.body
-            if not (isinstance(n, ast.If) and FLAG in ast.unparse(n.test))
-        ]
-        self.assertEqual(ast.dump(old["collective_combine"]), ast.dump(candidate))
-        self.assertNotIn("ordered_combine", SOURCE)
+        # The historical AST assertion predates deterministic combine and
+        # idle-DP routing. Compare observable default behavior instead.
+        for world, tokens in ((1, 3), (8, 0), (16, 7)):
+            fixture = self.fixture(world, tokens, 11, empty_rank=world - 1)
+            for rank in range(world):
+                expected, before, allocations_before = self.execute(
+                    fixture, rank, world, tokens, 11, None, old["collective_combine"]
+                )
+                actual, after, allocations_after = self.execute(
+                    fixture, rank, world, tokens, 11, None
+                )
+                np.testing.assert_array_equal(actual.array, expected.array)
+                self.assertEqual(
+                    [call[0] for call in after], [call[0] for call in before]
+                )
+                self.assertEqual(allocations_after, allocations_before)
 
     def test_fp32_reduction_reassociation_can_change_final_bf16(self):
         # A mathematical counterexample, not a simulated HCCL implementation.

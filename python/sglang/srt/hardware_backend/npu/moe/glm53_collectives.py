@@ -20,6 +20,7 @@ _idle_dp_counts = ContextVar("glm53_normal_hccl_idle_dp_counts", default=None)
 _idle_dp_logged = False
 _dispatch_shape_cache = {}
 _shape_cache_logged = False
+_reduce_scatter_check_logged = False
 
 
 def release_normal_hccl_cached_memory(x):
@@ -421,6 +422,37 @@ def _normal_combine_index_add_(out, rows, values):
         torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
 
 
+def _check_normal_reduce_scatter(group, local_out, global_out, tokens):
+    """Debug-only FP32 comparison against the original all-reduce/narrow.
+
+    Every EP rank must enable the check together. This deliberately performs
+    both collectives and a synchronized failure vote; disable it for timing.
+    Reduction trees may differ, so use an explicit FP32 tolerance instead of
+    requiring bitwise equality. This is not an end-to-end accuracy check.
+    """
+    global _reduce_scatter_check_logged
+    dist.all_reduce(global_out, group=group)
+    rank = dist.get_rank(group)
+    reference = global_out.narrow(0, rank * tokens, tokens)
+    failed = (~torch.isclose(local_out, reference, rtol=1e-5, atol=1e-5).all()).to(
+        dtype=torch.int32
+    ).reshape(1)
+    dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=group)
+    if failed.item():
+        max_abs = (local_out - reference).abs().max().item()
+        raise RuntimeError(
+            "GLM normal reduce_scatter failed FP32 all_reduce reference check "
+            f"on at least one EP rank; local rank={rank} max_abs={max_abs} "
+            "rtol=1e-5 atol=1e-5"
+        )
+    if not _reduce_scatter_check_logged:
+        logger.info(
+            "GLM53 normal reduce_scatter FP32 reference check passed: "
+            "rtol=1e-5 atol=1e-5 scope=two_node_prefill"
+        )
+        _reduce_scatter_check_logged = True
+
+
 def collective_combine(group, y, state):
     rows, weights, tokens, world, width, received = state[:6]
     # Sum each rank's expert contributions in FP32, then reduce them across EP.
@@ -434,8 +466,16 @@ def collective_combine(group, y, state):
         out = torch.zeros((world * tokens, width), device=y.device, dtype=torch.float32)
         if received:
             _normal_combine_index_add_(out, rows, y[:received].float() * weights[:, None])
+    reduce_scatter_mode = os.getenv("SGLANG_GLM53_NORMAL_REDUCE_SCATTER", "0")
     if (
-        os.getenv("SGLANG_GLM53_NORMAL_REDUCE_SCATTER", "0") == "1"
+        (
+            reduce_scatter_mode == "1"  # Preserve the existing explicit mode.
+            or (
+                reduce_scatter_mode == "2node"
+                and world == 16
+                and _idle_dp_counts.get() is not None
+            )
+        )
         and world > 1
         and tokens > 0
     ):
@@ -444,6 +484,12 @@ def collective_combine(group, y, state):
         # unchanged; HCCL may use a different reduction tree and rounding order.
         local_out = torch.empty((tokens, width), device=y.device, dtype=torch.float32)
         dist.reduce_scatter_tensor(local_out, out, op=dist.ReduceOp.SUM, group=group)
+        if (
+            os.getenv("SGLANG_GLM53_NORMAL_REDUCE_SCATTER_CHECK", "0") == "1"
+            and world == 16
+            and _idle_dp_counts.get() is not None
+        ):
+            _check_normal_reduce_scatter(group, local_out, out, tokens)
         return local_out.to(y.dtype)
     dist.all_reduce(out, group=group)
     rank = dist.get_rank(group)
