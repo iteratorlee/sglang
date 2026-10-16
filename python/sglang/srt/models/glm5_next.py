@@ -802,14 +802,26 @@ class Glm5NextDecoderLayer(nn.Module):
             forward_batch,
         )
 
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-            zero_allocator=zero_allocator,
-            layer_scatter_modes=self.layer_scatter_modes,
-            prev_topk_indices=prev_topk_indices,
-        )
+        skip_attention = False
+        if self._normal_skip_idle_dp:
+            from sglang.srt.hardware_backend.npu.moe.glm53_idle_attention import (
+                skip_idle_attention,
+            )
+
+            skip_attention = skip_idle_attention(
+                forward_batch, is_nextn=self.is_nextn, local_rows=hidden_states.shape[0]
+            )
+        if skip_attention:
+            hidden_states = torch.zeros_like(hidden_states)
+        else:
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+                layer_scatter_modes=self.layer_scatter_modes,
+                prev_topk_indices=prev_topk_indices,
+            )
         if isinstance(hidden_states, tuple):
             hidden_states, topk_indices = hidden_states
         else:
