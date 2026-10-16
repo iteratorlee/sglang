@@ -568,7 +568,14 @@ def collective_combine(group, y, state):
             and world == 16
             and _idle_dp_counts.get() is not None
         ):
-            options["skip_empty"] = True
+            minimum = int(os.getenv("SGLANG_GLM53_NORMAL_COMBINE_SKIP_EMPTY_MIN_TOKENS", "0"))
+            if minimum < 0:
+                raise ValueError("GLM skip-empty minimum token count must be nonnegative")
+            # Bound the candidate by the common original per-DP batch vector,
+            # not TP alignment or padding. Retain the reference kernel below
+            # the measured large-prefill scope on every participating rank.
+            if max(_idle_dp_counts.get()) >= minimum:
+                options["skip_empty"] = True
         out = ordered_combine(
             y[:received], weights, state[6], world * tokens, width, **options
         )

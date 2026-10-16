@@ -405,6 +405,31 @@ class OrderedTwoNodeCpuTests(unittest.TestCase):
 
 
 class SkipEmptyKernelCpuTests(unittest.TestCase):
+    def test_minimum_uses_original_counts_instead_of_padded_rows(self):
+        fixture = idle.IdleDpCpuTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        module = fixture.module
+        kernel = ModuleType("sglang.srt.hardware_backend.npu.moe.glm53_ordered_combine")
+        kernel.ordered_combine = mock.Mock(return_value=torch.zeros(8192, 7))
+        state = (torch.tensor([0]), torch.tensor([1.]), 512, 16, 7, 1, torch.zeros(8192, 8, dtype=torch.int32))
+        env = {"SGLANG_GLM53_NORMAL_COMBINE_SKIP_EMPTY": "1", "SGLANG_GLM53_NORMAL_COMBINE_SKIP_EMPTY_MIN_TOKENS": "4096", "SGLANG_GLM53_NORMAL_REDUCE_SCATTER": "0"}
+        with mock.patch.dict(sys.modules, {kernel.__name__: kernel}), mock.patch.object(module.dist, "all_reduce"), mock.patch.object(module.dist, "get_rank", return_value=0), mock.patch.dict(os.environ, env):
+            for counts, expected in [((0, 4095), {}), ((4095, 0), {}), ((2048, 2048), {}), ((0, 4096), {"skip_empty": True}), ((16384, 0), {"skip_empty": True})]:
+                token = module._idle_dp_counts.set(counts)
+                try:
+                    module.collective_combine(fixture.group, torch.ones(1, 7, dtype=torch.bfloat16), state)
+                    self.assertEqual(kernel.ordered_combine.call_args.kwargs, expected)
+                finally:
+                    module._idle_dp_counts.reset(token)
+            token = module._idle_dp_counts.set((16384, 0))
+            try:
+                with mock.patch.dict(os.environ, {"SGLANG_GLM53_NORMAL_COMBINE_SKIP_EMPTY_MIN_TOKENS": "-1"}):
+                    with self.assertRaisesRegex(ValueError, 'nonnegative'):
+                        module.collective_combine(fixture.group, torch.ones(1, 7, dtype=torch.bfloat16), state)
+            finally:
+                module._idle_dp_counts.reset(token)
+
     def test_opt_in_is_confined_to_the_ep16_prefill_scope(self):
         fixture = idle.IdleDpCpuTests()
         fixture.setUp()
