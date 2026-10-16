@@ -13,7 +13,7 @@ import triton.language as tl
 
 
 @triton.jit
-def _ordered_combine(Y, W, INDEX, OUT, ROWS: tl.constexpr, WIDTH: tl.constexpr,
+def _ordered_combine(Y, W, INDEX, OUT, ROWS, WIDTH: tl.constexpr,
                      TOPK: tl.constexpr, BLOCK_ROWS: tl.constexpr):
     row = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
     channel = tl.arange(0, WIDTH)
