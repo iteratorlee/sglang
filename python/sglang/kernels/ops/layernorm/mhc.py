@@ -1778,6 +1778,7 @@ def _mhc_pre_torch(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    pre_mix=None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     import torch.nn.functional as F
 
@@ -1805,7 +1806,12 @@ def _mhc_pre_torch(
         comb = comb / (comb.sum(-1, keepdim=True) + hc_sinkhorn_eps)
         comb = comb / (comb.sum(-2, keepdim=True) + hc_sinkhorn_eps)
 
-    layer_input = (pre.unsqueeze(-1) * x_flat.view(s, n, h)).sum(dim=1).to(dtype)
+    if pre_mix is None:
+        layer_input = (pre.unsqueeze(-1) * x_flat.view(s, n, h)).sum(dim=1).to(dtype)
+    else:
+        # The optional large-P path changes only this final four-stream mix.
+        # Projection, RMS scaling, coefficients and Sinkhorn stay native FP32.
+        layer_input = pre_mix(residual, pre)
     return post.unsqueeze(-1), comb, layer_input
 
 
@@ -1880,6 +1886,43 @@ def _mhc_post_dispatch(
     return mhc_post(x, residual, post_layer_mix, comb_res_mix)
 
 
+_large_prefill_hc_pre_logged = False
+
+
+def _use_large_prefill_hc_pre(x, hc_fn, hc_scale, hc_base, hc_mult, hc_norm_weight):
+    """Opt-in P mixing only; D and the existing small-batch kernel are untouched."""
+    if os.environ.get("SGLANG_GLM53_PREFILL_MHC_PRE", "0") != "1":
+        return False
+    if (
+        x.device.type != "npu"
+        or x.dtype != torch.bfloat16
+        or x.ndim != 2
+        or hc_mult != 4
+        or x.shape[1] != 16384
+        or not 4096 < x.shape[0] <= 16384
+        or hc_norm_weight is not None
+        or hc_fn.shape != (24, 16384)
+        or hc_scale.shape != (3,)
+        or hc_base.shape != (24,)
+    ):
+        return False
+    params = (hc_fn, hc_scale, hc_base)
+    if any(t.device != x.device or t.dtype != torch.float32 for t in params) or not all(
+        t.is_contiguous() for t in (x, *params)
+    ):
+        return False
+    from sglang.srt.runtime_context import get_server_args
+
+    if get_server_args().disaggregation_mode != "prefill":
+        return False
+    # Raw-pointer kernels require physical ND, not just logical contiguity.
+    try:
+        import torch_npu
+    except ImportError:
+        return False
+    return all(torch_npu.get_npu_format(t) == 2 for t in (x, *params))
+
+
 def hc_pre(
     x: torch.Tensor,
     hc_fn: torch.Tensor,
@@ -1919,6 +1962,35 @@ def hc_pre(
             out_norm_weight,
             out_norm_eps,
         )
+    if _use_large_prefill_hc_pre(x, hc_fn, hc_scale, hc_base, hc_mult, hc_norm_weight):
+        from sglang.kernels.ops.layernorm.mhc_pre_mix_npu import (
+            hc_pre_mix_large_prefill,
+        )
+
+        post_mix, comb_mix, layer_input = _mhc_pre_torch(
+            x.view(x.shape[0], 4, 4096),
+            hc_fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_eps,
+            hc_eps,
+            post_mult_value,
+            sinkhorn_iters,
+            pre_mix=hc_pre_mix_large_prefill,
+        )
+        global _large_prefill_hc_pre_logged
+        if not _large_prefill_hc_pre_logged:
+            logger.info(
+                "GLM53 prefill mHC pre selected: SGLANG_GLM53_PREFILL_MHC_PRE=1 "
+                "T=%d H=4096 hc_mult=4 physical_format=ND(2) "
+                "projection/coefficients=FP32 kernel=sequential_mix_only "
+                "out_norm_fused=False",
+                x.shape[0],
+            )
+            _large_prefill_hc_pre_logged = True
+        # Preserve the BF16 mixing boundary and the caller's native RMSNorm.
+        return layer_input, comb_mix.reshape(-1, 16), post_mix.reshape(-1, 4), False
     s, total = x.shape
     hidden_size = total // hc_mult
     if x.numel() == 0:
