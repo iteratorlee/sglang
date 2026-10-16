@@ -1,8 +1,13 @@
 """P draft scope consensus, fabricated idle mode and lifecycle on CPU only."""
 import ast
+from abc import ABC
 from contextlib import contextmanager
+from enum import IntEnum, auto
+import sys
+from types import ModuleType
 from types import SimpleNamespace as NS
 import unittest
+from unittest import mock
 
 import test_glm53_normal_idle_dp_cpu as idle
 from test_glm53_normal_hccl_cpu import SRT, load_source
@@ -13,16 +18,26 @@ class DraftPrefillScopeTests(unittest.TestCase):
         self.fixture = idle.IdleDpCpuTests()
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+        # Execute the actual production phase definitions, rather than a fake
+        # predicate: EAGLE_DRAFT_EXTEND.is_draft_input() is deliberately True.
+        parsed = ast.parse((SRT / 'speculative/spec_info.py').read_text())
+        nodes = [ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0)]
+        nodes += [n for n in parsed.body if isinstance(n, ast.ClassDef) and n.name in ('SpecInputType', 'SpecInput')]
+        namespace = dict(ABC=ABC, IntEnum=IntEnum, auto=auto)
+        exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), '<native spec phases>', 'exec'), namespace)
+        self.SpecInputType, self.SpecInput = namespace['SpecInputType'], namespace['SpecInput']
+        spec_module = ModuleType('sglang.srt.speculative.spec_info')
+        spec_module.SpecInputType = self.SpecInputType
+        mock.patch.dict(sys.modules, {spec_module.__name__: spec_module}).start()
         self.helper = load_source('draft_prefill_helper', SRT / 'hardware_backend/npu/moe/glm53_draft_prefill.py')
 
     def batch(self, counts, rank):
         self.fixture.parallel.attn_dp_rank = rank
         batch = idle.batch(counts)
         batch.is_extend_in_batch = True
-        batch.spec_info = NS(is_draft_input=lambda: False, num_tokens_per_req=1)
-        if counts[rank] == 0:
-            batch.forward_mode = idle.Mode.TARGET_VERIFY
-            batch._original_forward_mode = idle.Mode.IDLE
+        batch.spec_info = self.SpecInput(self.SpecInputType.EAGLE_DRAFT_EXTEND)
+        batch.spec_info.num_tokens_per_req = 1
+        self.assertTrue(batch.spec_info.is_draft_input())
         return batch
 
     def test_both_domains_publish_identical_original_counts(self):
@@ -47,7 +62,7 @@ class DraftPrefillScopeTests(unittest.TestCase):
     def test_rejects_real_verify_and_non_prefill_draft_geometry(self):
         batch = self.batch((32, 0), 0)
         batch.forward_mode = idle.Mode.TARGET_VERIFY
-        with self.assertRaisesRegex(ValueError, 'fabricated idle'):
+        with self.assertRaisesRegex(ValueError, 'native EXTEND'):
             with self.helper.draft_prefill_scope(batch):
                 self.fail('invalid mode admitted')
         batch = self.batch((32, 0), 0)
@@ -55,6 +70,12 @@ class DraftPrefillScopeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'one-token-per-row'):
             with self.helper.draft_prefill_scope(batch):
                 self.fail('decode draft geometry admitted')
+        for kind in (self.SpecInputType.EAGLE_DRAFT, self.SpecInputType.EAGLE_VERIFY):
+            batch = self.batch((32, 0), 0)
+            batch.spec_info.spec_input_type = kind
+            with self.assertRaisesRegex(ValueError, 'EAGLE_DRAFT_EXTEND'):
+                with self.helper.draft_prefill_scope(batch):
+                    self.fail('wrong phase admitted')
 
     def test_context_restores_on_success_and_error(self):
         events = []
