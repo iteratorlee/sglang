@@ -3,7 +3,8 @@
 Extends the 1012 postop tests: byte comparison (including NaN payloads and
 signed zero), native head sum, causal mask and ordered INT32 TopK. Direct
 helper tests force its opt-in at every requested shape; separate extracted
-production-caller tests obey the actual auto thresholds. Correctness finishes
+production-caller tests obey the actual auto thresholds. --force-min-keys adds
+separate production-caller tests that MUST actually fuse. Correctness finishes
 before independent event/host timing. No full-query intermediate tape or
 tensor files: at most one 32-row score tile per variant, compared row by row.
 
@@ -28,14 +29,16 @@ from pathlib import Path
 from types import SimpleNamespace
 
 FLAG = "SGLANG_GLM53_PREFILL_POOLED_POSTOP64"
+MIN_KEYS = "SGLANG_GLM53_PREFILL_POOLED_POSTOP64_MIN_KEYS"
 REL = "python/sglang/srt/hardware_backend/npu/attention/glm53"
 PATTERNS = ("random", "edge_bits", "rank_boundary")
 
 
 @contextmanager
-def environment(flag, tile):
+def environment(flag, tile, min_keys=None):
     settings = {
         FLAG: str(flag),
+        MIN_KEYS: None if min_keys is None else str(min_keys),
         "SGLANG_GLM53_PREFILL_POOLED_POSTOP": "auto",
         "SGLANG_GLM53_PREFILL_POOLED_SCORE": "0",
         "SGLANG_GLM53_PREFILL_SCORE_VALIDATE": "0",
@@ -43,7 +46,11 @@ def environment(flag, tile):
         "SGLANG_GLM53_PREFILL_TOPK_METADATA_REUSE": "1",
     }
     previous = {k: os.environ.get(k) for k in settings}
-    os.environ.update(settings)
+    for key, value in settings.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
     try:
         yield
     finally:
@@ -286,7 +293,30 @@ def query_fixture(rows, keys, seed):
     return q, weights, history, batch
 
 
-def caller_case(module_file, helper, rows, keys, seed):
+def validate_caller_activation(calls, rows, keys, force_min_keys=None):
+    candidate_min = (
+        force_min_keys if force_min_keys is not None else {32: 16384, 8: 49152}[rows]
+    )
+    expected_calls = [
+        int(keys >= {32: 32768, 8: 98304}[rows]),
+        int(keys >= candidate_min),
+    ]
+    if [len(x) for x in calls] != expected_calls:
+        raise AssertionError(
+            f"Wrong production helper calls: {calls}; expected {expected_calls}"
+        )
+    if any(c["active"] for c in calls[0]) or not all(c["active"] for c in calls[1]):
+        raise AssertionError(f"Wrong production activation: {calls}")
+    if force_min_keys is not None and (
+        len(calls[1]) != 1 or calls[1][0]["active"] is not True
+    ):
+        raise AssertionError(
+            "Forced production caller must launch the fused helper exactly once"
+        )
+    return expected_calls
+
+
+def caller_case(module_file, helper, rows, keys, seed, force_min_keys=None):
     q, weights, history, batch = query_fixture(rows, keys, seed)
     indexer = SimpleNamespace(index_topk=2048, index_kpool=4)
     calls, logits = [[], []], [[], []]
@@ -298,28 +328,25 @@ def caller_case(module_file, helper, rows, keys, seed):
             lambda x: logits[flag].append(x.detach().cpu()),
             calls[flag],
         )
-        with environment(flag, rows):
+        with environment(flag, rows, force_min_keys):
             outputs.append(fn(indexer, q, weights, [history], batch))
     # One tile terminating exactly at this causal block's end.
-    expected_calls = [
-        int(keys >= {32: 32768, 8: 98304}[rows]),
-        int(keys >= {32: 16384, 8: 49152}[rows]),
-    ]
-    if [len(x) for x in calls] != expected_calls:
-        raise AssertionError(
-            f"Wrong production helper calls: {calls}; expected {expected_calls}"
-        )
-    if any(c["active"] for c in calls[0]) or not all(c["active"] for c in calls[1]):
-        raise AssertionError(f"Wrong production activation: {calls}")
+    expected_calls = validate_caller_activation(calls, rows, keys, force_min_keys)
     if len(logits[0]) != 1 or len(logits[1]) != 1:
         raise AssertionError("Expected exactly one scored production tile")
     return dict(
-        scope="production_auto_caller",
+        scope=(
+            "production_auto_caller"
+            if force_min_keys is None
+            else "production_forced_caller"
+        ),
+        force_min_keys=force_min_keys,
         rows=rows,
         heads=64,
         keys=keys,
         physical_formats=formats(q, weights, history),
         calls=calls,
+        actual_active_counts=[sum(c["active"] for c in variant) for variant in calls],
         expected_calls=expected_calls,
         masked_logits=strict(logits[0][0], logits[1][0], "production masked logits"),
         topk_int32=strict(outputs[0], outputs[1], "production ordered INT32 TopK"),
@@ -384,7 +411,9 @@ def timed_pair(functions, repeat, warmup):
     return values
 
 
-def timing_case(module_file, helper, rows, keys, repeat, warmup, seed):
+def timing_case(
+    module_file, helper, rows, keys, repeat, warmup, seed, force_min_keys=None
+):
     q, weights, history, batch = query_fixture(rows, keys, seed)
     indexer = SimpleNamespace(index_topk=2048, index_kpool=4)
     scores = torch.einsum("qhd,kd->qhk", q, history)
@@ -409,9 +438,9 @@ def timing_case(module_file, helper, rows, keys, repeat, warmup, seed):
 
         return run
 
-    def production(flag):
+    def production(flag, min_keys=None):
         def run():
-            with environment(flag, rows):
+            with environment(flag, rows, min_keys):
                 return fn(indexer, q, weights, [history], batch)
 
         return run
@@ -429,6 +458,17 @@ def timing_case(module_file, helper, rows, keys, repeat, warmup, seed):
             [production(0), production(1)], repeat, warmup
         ),
         production_expected_active=[False, keys >= {32: 16384, 8: 49152}[rows]],
+        force_min_keys=force_min_keys,
+        production_forced_caller=(
+            timed_pair(
+                [production(0, force_min_keys), production(1, force_min_keys)],
+                repeat,
+                warmup,
+            )
+            if force_min_keys is not None
+            else None
+        ),
+        forced_expected_active=[False, True] if force_min_keys is not None else None,
         scope="Independent synchronized host/NPU events; not TTFT; timing not used for correctness",
     )
 
@@ -450,12 +490,17 @@ def main():
         "--tiles", type=int, nargs="+", choices=(8, 32), default=[8, 32]
     )
     parser.add_argument("--keys", type=int, nargs="+", default=[8192, 16384, 32768])
+    parser.add_argument(
+        "--force-min-keys",
+        type=int,
+        help="Add forced real-caller correctness/timing; 1..49152 and <= every selected key count",
+    )
     parser.add_argument("--repeat", type=int, default=10, help="0: correctness only")
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--seed", type=int, default=1018)
     args = parser.parse_args()
     report = dict(
-        schema="glm53-postop64-direct-and-production-ab-v1",
+        schema="glm53-postop64-direct-and-production-ab-v2",
         status="running",
         correctness=[],
         fallbacks=[],
@@ -464,6 +509,7 @@ def main():
         timing_used_for_correctness=False,
         parent_stopped_p_asserted=args.confirm_parent_stopped_p,
         device=args.device,
+        force_min_keys=args.force_min_keys,
         argv=sys.argv[1:],
         limits="Finite fixtures only; no model/D100/accuracy or performance promotion",
         failure_history="Old GSM1264/1319<1267; approximate Sinkhorn42/300 rejected",
@@ -492,6 +538,13 @@ def main():
                 raise ValueError(
                     "Bounded keys range is [1024,49152]; default 8192/16384/32768"
                 )
+            if args.force_min_keys is not None and not (
+                1 <= args.force_min_keys <= 49152
+                and args.force_min_keys <= min(args.keys)
+            ):
+                raise ValueError(
+                    "--force-min-keys must be in [1,49152] and <= every selected key count; forced cases must activate"
+                )
             global torch, torch_npu, DEVICE
             import torch
             import torch_npu
@@ -515,6 +568,10 @@ def main():
             if (
                 FLAG not in helper_file.read_text()
                 or FLAG not in args.module_file.read_text()
+                or (
+                    args.force_min_keys is not None
+                    and MIN_KEYS not in args.module_file.read_text()
+                )
             ):
                 raise ValueError(
                     "Both production files must contain the opt-in; refusing a no-op A/B"
@@ -542,6 +599,26 @@ def main():
                         )
                         gc.collect()
                         save()
+                        if args.force_min_keys is not None:
+                            report["active_case"] = dict(
+                                scope="production_forced",
+                                rows=rows,
+                                keys=keys,
+                                force_min_keys=args.force_min_keys,
+                            )
+                            save()
+                            report["correctness"].append(
+                                caller_case(
+                                    args.module_file,
+                                    helper,
+                                    rows,
+                                    keys,
+                                    args.seed,
+                                    args.force_min_keys,
+                                )
+                            )
+                            gc.collect()
+                            save()
                 report["active_case"] = dict(scope="legacy32_unchanged_and_fallbacks")
                 save()
                 report["legacy32"] = helper_case(
@@ -566,6 +643,7 @@ def main():
                                     args.repeat,
                                     args.warmup,
                                     args.seed,
+                                    args.force_min_keys,
                                 )
                             )
                             gc.collect()

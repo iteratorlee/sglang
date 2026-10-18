@@ -30,6 +30,7 @@ class Postop64CPU(unittest.TestCase):
             },
         )
         self.environment.start()
+        os.environ.pop(bench.MIN_KEYS, None)
         self.addCleanup(self.environment.stop)
         self.role = "prefill"
         self.scope = dict(
@@ -131,6 +132,82 @@ class Postop64CPU(unittest.TestCase):
             self.assertTrue(
                 torch.equal(actual.view(torch.int16), expected.view(torch.int16))
             )
+
+    def test_override_parse_bounds_and_default(self):
+        os.environ[bench.FLAG] = "1"
+        policy = self.scope["_prefill_pooled_postop_min_keys"]
+        for raw in ("1", "8192", "16384", "32768", "49152", " 8192 "):
+            os.environ[bench.MIN_KEYS] = raw
+            for tile in (8, 32):
+                self.assertEqual(policy(self.device, tile, 64), int(raw))
+            self.assertIsNone(policy(self.device, 16, 64))
+        for raw in (
+            "",
+            "0",
+            "-1",
+            "49153",
+            "999999999999999999999",
+            "1.5",
+            "nan",
+            "abc",
+        ):
+            os.environ[bench.MIN_KEYS] = raw
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                policy(self.device, 8, 64)
+        os.environ.pop(bench.MIN_KEYS)
+        self.assertEqual(policy(self.device, 8, 64), 49152)
+        self.assertEqual(policy(self.device, 32, 64), 16384)
+
+    def test_override_is_ignored_outside_opted_in_p64(self):
+        os.environ[bench.MIN_KEYS] = "invalid-but-out-of-scope"
+        policy = self.scope["_prefill_pooled_postop_min_keys"]
+        for flag in ("0", "1"):
+            os.environ[bench.FLAG] = flag
+            self.assertEqual(policy(self.device, 8, 32), 98304)
+            self.assertEqual(policy(self.device, 32, 32), 32768)
+        os.environ[bench.FLAG] = "0"
+        self.assertEqual(policy(self.device, 8, 64), 98304)
+        os.environ.pop(bench.FLAG)
+        self.assertEqual(policy(self.device, 32, 64), 32768)
+        os.environ[bench.FLAG] = "1"
+        self.assertIsNone(policy(SimpleNamespace(type="cpu"), 8, 64))
+        for role in ("decode", "null"):
+            self.role = role
+            self.assertIsNone(policy(self.device, 8, 64))
+        self.role = "prefill"
+        os.environ["SGLANG_GLM53_PREFILL_POOLED_POSTOP"] = "0"
+        self.assertIsNone(policy(self.device, 8, 64))
+
+    def test_harness_clears_and_restores_inherited_override(self):
+        os.environ[bench.MIN_KEYS] = "32768"
+        with bench.environment(1, 8):
+            self.assertNotIn(bench.MIN_KEYS, os.environ)
+        self.assertEqual(os.environ[bench.MIN_KEYS], "32768")
+        for flag in (0, 1):
+            with bench.environment(flag, 8, 8192):
+                self.assertEqual(os.environ[bench.MIN_KEYS], "8192")
+                expected = 8192 if flag else 98304
+                self.assertEqual(
+                    self.scope["_prefill_pooled_postop_min_keys"](self.device, 8, 64),
+                    expected,
+                )
+        self.assertEqual(os.environ[bench.MIN_KEYS], "32768")
+
+    def test_forced_caller_rejects_noop_or_helper_fallback(self):
+        self.assertEqual(
+            bench.validate_caller_activation([[], [{"active": True}]], 8, 8192, 8192),
+            [0, 1],
+        )
+        for calls in (
+            [[], []],
+            [[], [{"active": False}]],
+            [[], [{"active": True}, {"active": True}]],
+        ):
+            with self.assertRaises(AssertionError):
+                bench.validate_caller_activation(calls, 8, 8192, 8192)
+        with self.assertRaises(AssertionError):
+            bench.validate_caller_activation([[], []], 8, 8192, 16384)
+        self.assertEqual(bench.validate_caller_activation([[], []], 8, 8192), [0, 0])
 
     def test_grid_limit_has_no_large_allocation(self):
         self.scope["supported"] = lambda *_: True

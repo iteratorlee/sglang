@@ -72,6 +72,21 @@ def _prefill_pooled_postop_min_keys(
         heads == 64
         and os.environ.get("SGLANG_GLM53_PREFILL_POOLED_POSTOP64", "0") == "1"
     ):
+        override = os.environ.get("SGLANG_GLM53_PREFILL_POOLED_POSTOP64_MIN_KEYS")
+        if override is not None:
+            try:
+                min_keys = int(override)
+            except ValueError:
+                raise ValueError(
+                    "SGLANG_GLM53_PREFILL_POOLED_POSTOP64_MIN_KEYS must be an integer in [1, 49152]"
+                ) from None
+            if not 1 <= min_keys <= 49152:
+                raise ValueError(
+                    "SGLANG_GLM53_PREFILL_POOLED_POSTOP64_MIN_KEYS must be an integer in [1, 49152]"
+                )
+            # Experimental admission threshold only. Tensor/ND/grid safety
+            # checks remain in the helper, and unsupported tiles stay native.
+            return min_keys if legacy_tile_rows in (8, 32) else None
         # Experimental thresholds preserve the old rows*heads*keys workload
         # at twice the head count. They are not measured 64-head break-even
         # points: tile8 stays native throughout a 128K-token history.
