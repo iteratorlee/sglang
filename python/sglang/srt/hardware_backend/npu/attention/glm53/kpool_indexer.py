@@ -662,6 +662,11 @@ class AscendIndexerKPoolMixin:
         # The fused path writes [rows, pools], so it can use 32 rows even when
         # the legacy [rows, heads, pools] path needs the tile-8 HBM fallback.
         tile_rows = 32 if fused_scores else legacy_tile_rows
+        reuse_metadata = (
+            os.environ.get("SGLANG_GLM53_PREFILL_TOPK_METADATA_REUSE", "0") == "1"
+            and q.device.type == "npu"
+            and get_server_args().disaggregation_mode == "prefill"
+        )
         result = []
         offset = 0
         for i in range(
@@ -673,6 +678,22 @@ class AscendIndexerKPoolMixin:
             q_req = q[offset : offset + q_len]
             w_req = weights[offset : offset + q_len]
             k_req = compressed_by_request[i]
+            request_visible_pools = request_pool_ids = None
+            if reuse_metadata and q_len >= 512 and k_req.shape[0]:
+                # Integer-only, invocation-local metadata. Keep the score
+                # tiles/GEMM shapes and every floating-point operation below
+                # unchanged. In particular, do not cache a [Q,K] mask or
+                # retain anything on the batch/indexer across layers/chunks.
+                request_visible_pools = torch.div(
+                    torch.arange(
+                        first_pos + 1, seq_len + 1, device=q.device, dtype=torch.long
+                    ),
+                    self.index_kpool,
+                    rounding_mode="floor",
+                )
+                request_pool_ids = torch.arange(
+                    min(seq_len // self.index_kpool, k_req.shape[0]), device=q.device
+                )
             rows = []
             start = 0
             while start < q_len:
@@ -748,13 +769,17 @@ class AscendIndexerKPoolMixin:
                             logits.relu_()
                             logits.mul_(w_req[start:end].unsqueeze(-1))
                         logits = logits.sum(1)
-                    logical_pos = first_pos + torch.arange(
-                        start, end, device=q.device, dtype=torch.long
-                    )
-                    visible_pools = torch.div(
-                        logical_pos + 1, self.index_kpool, rounding_mode="floor"
-                    )
-                    pool_ids = torch.arange(candidate_count, device=q.device)
+                    if request_visible_pools is not None:
+                        visible_pools = request_visible_pools[start:end]
+                        pool_ids = request_pool_ids[:candidate_count]
+                    else:
+                        logical_pos = first_pos + torch.arange(
+                            start, end, device=q.device, dtype=torch.long
+                        )
+                        visible_pools = torch.div(
+                            logical_pos + 1, self.index_kpool, rounding_mode="floor"
+                        )
+                        pool_ids = torch.arange(candidate_count, device=q.device)
                     logits.masked_fill_(
                         pool_ids.view(1, -1) >= visible_pools.view(-1, 1),
                         float("-inf"),
