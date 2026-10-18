@@ -24,10 +24,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 FLAG = "SGLANG_GLM53_PREFILL_TOPK_METADATA_REUSE"
-SOURCE = (
-    Path(__file__).resolve().parents[3]
-    / "python/sglang/srt/hardware_backend/npu/attention/glm53/kpool_indexer.py"
-)
+if os.environ.get("GLM53_PREFILL_TOPK_SOURCE"):
+    SOURCE = Path(os.environ["GLM53_PREFILL_TOPK_SOURCE"]).resolve()
+else:
+    SOURCE = (
+        Path(__file__).resolve().parents[3]
+        / "python/sglang/srt/hardware_backend/npu/attention/glm53/kpool_indexer.py"
+    )
 CASE_NAMES = ("aligned_random", "fragment_random", "page_ties")
 
 
