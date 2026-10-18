@@ -100,9 +100,19 @@ def glm_rms_norm_gated_npu(
         mode = get_server_args().disaggregation_mode
         selected_loop_rows = None
         if mode == "decode" and loop_rows in ("4", "8") and 1024 <= num_rows <= 2048:
+            raw_min_rows = os.getenv("SGLANG_GLM53_D_GATED_RMS_LOOP_MIN_ROWS", "1024")
+            try:
+                min_rows = int(raw_min_rows)
+                if not 1024 <= min_rows <= 2048:
+                    raise ValueError
+            except ValueError as exc:
+                raise ValueError(
+                    "SGLANG_GLM53_D_GATED_RMS_LOOP_MIN_ROWS must be an integer "
+                    f"in [1024, 2048], got {raw_min_rows!r}"
+                ) from exc
             from .rms_norm_gated_rows_npu import supported
 
-            if supported(x, gate, weight):
+            if num_rows >= min_rows and supported(x, gate, weight):
                 selected_loop_rows = int(loop_rows)
         elif (
             mode == "prefill" and prefill_loop_rows in ("4", "8") and num_rows == 131072
