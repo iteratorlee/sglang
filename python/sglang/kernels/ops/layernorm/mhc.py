@@ -1779,6 +1779,7 @@ def _mhc_pre_torch(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     pre_mix=None,
+    square_via_mul: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     import torch.nn.functional as F
 
@@ -1786,7 +1787,10 @@ def _mhc_pre_torch(
     dtype = residual.dtype
 
     x_flat = residual.view(s, n * h).float()
-    rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + rms_eps)
+    # The large-P opt-in replaces only the elementwise FP32 square. Keep the
+    # native reduction, epsilon and rsqrt as separate, unchanged operations.
+    squared = x_flat * x_flat if square_via_mul else x_flat.square()
+    rsqrt = torch.rsqrt(squared.mean(-1, keepdim=True) + rms_eps)
     mixes = F.linear(x_flat, fn) * rsqrt
 
     pre_raw = mixes[:, :n]
@@ -1978,6 +1982,9 @@ def hc_pre(
             post_mult_value,
             sinkhorn_iters,
             pre_mix=hc_pre_mix_large_prefill,
+            square_via_mul=(
+                os.environ.get("SGLANG_GLM53_PREFILL_MHC_SQUARE_MUL", "0") == "1"
+            ),
         )
         global _large_prefill_hc_pre_logged
         if not _large_prefill_hc_pre_logged:
