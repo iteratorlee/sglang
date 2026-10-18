@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 
 import torch
 import triton
@@ -83,6 +84,22 @@ def glm_rms_norm_gated_npu(
     block_dim = triton.next_power_of_2(feature_dim)
     output = torch.empty_like(x)
     num_rows = x.numel() // feature_dim
+    grouped_rows = os.getenv("SGLANG_GLM53_D_GATED_RMS_ROWS", "0")
+    if (
+        grouped_rows in ("4", "8")
+        and x.device.type == "npu"
+        and feature_dim == 128
+        and 1024 <= num_rows <= 2048
+    ):
+        from sglang.srt.runtime_context import get_server_args
+
+        if get_server_args().disaggregation_mode == "decode":
+            from .rms_norm_gated_rows_npu import rms_norm_gated_rows, supported
+
+            if supported(x, gate, weight):
+                return rms_norm_gated_rows(
+                    x, gate, weight, output, eps, int(grouped_rows)
+                )
     if num_rows > 65535:
         # A 2048-token GLM prefill chunk has 65536 head rows. Ascend rejects
         # that one-dimensional launch. Keep the small/decode kernel unchanged.
