@@ -53,6 +53,7 @@ def rms_norm_gated_rows(x, gate, weight, output, eps, rows_per_program):
         or not supported(x, gate, weight)
         or output.shape != x.shape
         or output.dtype != x.dtype
+        or output.dtype != torch.bfloat16
         or output.device != x.device
         or not output.is_contiguous()
     ):

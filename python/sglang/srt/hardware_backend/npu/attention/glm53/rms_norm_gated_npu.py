@@ -90,6 +90,7 @@ def glm_rms_norm_gated_npu(
         and x.device.type == "npu"
         and feature_dim == 128
         and 1024 <= num_rows <= 2048
+        and output.dtype == torch.bfloat16
     ):
         from sglang.srt.runtime_context import get_server_args
 

@@ -110,7 +110,7 @@ class GatedRowsCPU(unittest.TestCase):
                 is_contiguous=lambda: contiguous,
             )
 
-        old.torch = NS(empty_like=lambda x: x)
+        old.torch = NS(empty_like=lambda x: x, bfloat16=torch.bfloat16)
         old._glm_rms_norm_gated_row_kernel = Launch("old")
         old._glm_rms_norm_gated_large_row_kernel = Launch("large")
         old.rms_norm_gated_rows = (
