@@ -1052,6 +1052,10 @@ class AscendIndexerKPoolMixin:
                 sparse_count=self.index_topk // self.index_kpool,
                 sparse_mode=3,
             )
+            # Zero-key LI rows can retain unwritten output on CANN. Give the
+            # candidate a deterministic sentinel before tail expansion; keep
+            # every positive-length row (including its index order) untouched.
+            topk.masked_fill_((pool_lens == 0).view(-1, 1, 1), -1)
             topk = topk.view(bs, steps, -1)
             # Keep the original bs-row expand shape and <=16 fused guard.
             # In particular bs=14 must not expand all 56 rows in torch.
