@@ -1,4 +1,9 @@
-"""Strict 64-head NPU postop A/B, with no SGLang package registration.
+"""Strict 32/64-head NPU postop A/B, with no SGLang package registration.
+
+--heads 32 --blocks 2048 4096 8192 sweeps the existing helper launch parameter
+against explicit native ReLU/mul. The extracted caller's admission is overridden
+ONLY in this harness; every candidate must actually launch, regardless of the
+unchanged production thresholds. num_warps stays at the production value 4.
 
 Extends the 1012 postop tests: byte comparison (including NaN payloads and
 signed zero), native head sum, causal mask and ordered INT32 TopK. Direct
@@ -282,10 +287,10 @@ def scorer(module_file, helper, observer=None, calls=None):
     return scope["_prefill_pooled_topk"]
 
 
-def query_fixture(rows, keys, seed):
+def query_fixture(rows, keys, seed, heads=64):
     generator = torch.Generator().manual_seed(seed)
-    q = nd(torch.randn((rows, 64, 128), generator=generator).bfloat16())
-    weights = nd(torch.randn((rows, 64), generator=generator))
+    q = nd(torch.randn((rows, heads, 128), generator=generator).bfloat16())
+    weights = nd(torch.randn((rows, heads), generator=generator))
     history = nd(torch.randn((keys, 128), generator=generator).bfloat16())
     batch = SimpleNamespace(
         batch_size=1, extend_seq_lens_cpu=[rows], seq_lens_cpu=[keys * 4]
@@ -473,6 +478,157 @@ def timing_case(
     )
 
 
+def validate_sweep_options(args):
+    if args.heads == 32 and args.force_min_keys is not None:
+        raise ValueError("--force-min-keys is P64-only; P32 sweep forces harness admission")
+    if args.heads == 64 and args.blocks != [8192]:
+        raise ValueError("--blocks sweep requires --heads 32")
+    if len(args.blocks) != len(set(args.blocks)):
+        raise ValueError("--blocks must not contain duplicates")
+    if args.heads == 32 and any(k % 32 for k in args.keys):
+        raise ValueError("P32 caller cases require keys divisible by 32 (one causal tile)")
+
+
+def launch32(helper, scores, weights, block):
+    if scores.shape[1] != 32:
+        raise AssertionError("P32 sweep received non-32-head scores")
+    active = helper.relu_gate_(scores, weights, block=block)
+    if active is not True:
+        raise AssertionError(f"P32 BLOCK{block} fell back; refusing inactive A/B")
+    return active
+
+
+def forced32_scorer(module_file, helper, block, enabled, observer=None, calls=None):
+    wrapped = SimpleNamespace(
+        relu_gate_=lambda scores, weights: launch32(helper, scores, weights, block)
+    )
+    fn = scorer(module_file, wrapped, observer, calls)
+    # Test-only admission override: keep the extracted scorer/GEMM/reduction
+    # body intact. No production env/threshold is introduced or modified.
+    fn.__globals__["_prefill_pooled_postop_min_keys"] = (
+        lambda *_: 1 if enabled else None
+    )
+    return fn
+
+
+def helper32_case(helper, rows, keys, pattern, seed, block):
+    scores, weights = fixture(rows, keys, pattern, seed, heads=32)
+    if formats(scores, weights) != [2, 2]:
+        raise AssertionError("P32 requires ND scores/weights")
+    baseline = scores.clone().relu_().mul_(weights.unsqueeze(-1))
+    active = launch32(helper, scores, weights, block)
+    weighted = strict(baseline, scores, "P32 weighted BF16")
+    old_logits, old_ids = finish(baseline, keys)
+    new_logits, new_ids = finish(scores, keys)
+    return dict(
+        scope="p32_direct_helper", rows=rows, heads=32, keys=keys, block=block,
+        num_warps=4, pattern=pattern, physical_formats=formats(scores, weights),
+        baseline="native_relu_mul", actual_active=[False, active], weighted=weighted,
+        masked_logits=strict(old_logits, new_logits, "P32 masked logits"),
+        topk_int32=strict(old_ids, new_ids, "P32 ordered INT32 TopK"),
+    )
+
+
+def caller32_case(module_file, helper, rows, keys, seed, block):
+    q, weights, history, batch = query_fixture(rows, keys, seed, heads=32)
+    indexer = SimpleNamespace(index_topk=2048, index_kpool=4)
+    calls, logits, outputs = [[], []], [[], []], []
+    for enabled in (0, 1):
+        fn = forced32_scorer(
+            module_file, helper, block, enabled,
+            lambda x: logits[enabled].append(x.detach().cpu()), calls[enabled],
+        )
+        outputs.append(fn(indexer, q, weights, [history], batch))
+    if calls[0] or len(calls[1]) != 1 or calls[1][0]["active"] is not True:
+        raise AssertionError(f"P32 must have zero/one actually fused calls: {calls}")
+    if calls[1][0]["shape"] != [rows, 32, keys] or calls[1][0]["formats"] != [2, 2]:
+        raise AssertionError(f"P32 real GEMM geometry/ND mismatch: {calls[1]}")
+    if [len(x) for x in logits] != [1, 1]:
+        raise AssertionError("P32 expected exactly one production tile per variant")
+    return dict(
+        scope="p32_harness_forced_caller", rows=rows, heads=32, keys=keys,
+        block=block, num_warps=4, calls=calls, actual_active_counts=[0, 1],
+        admission="harness namespace only: native=None, candidate=1; not production auto",
+        masked_logits=strict(logits[0][0], logits[1][0], "P32 caller logits"),
+        topk_int32=strict(outputs[0], outputs[1], "P32 caller INT32 TopK"),
+    )
+
+
+def timing32_case(module_file, helper, rows, keys, seed, block, repeat, warmup):
+    q, weights, history, batch = query_fixture(rows, keys, seed, heads=32)
+    indexer = SimpleNamespace(index_topk=2048, index_kpool=4)
+    scores = torch.einsum("qhd,kd->qhk", q, history)
+    if formats(scores, weights) != [2, 2]:
+        raise AssertionError("P32 timing requires real ND GEMM scores/weights")
+    target = scores.clone()
+
+    def native():
+        return target.copy_(scores).relu_().mul_(weights.unsqueeze(-1))
+
+    def fused():
+        target.copy_(scores)
+        launch32(helper, target, weights, block)
+        return target
+
+    old_fn = forced32_scorer(module_file, helper, block, False)
+    new_fn = forced32_scorer(module_file, helper, block, True)
+    return dict(
+        rows=rows, heads=32, keys=keys, block=block, num_warps=4,
+        direct_physical_formats=formats(scores, weights), actual_active=[False, True],
+        repeat_pairs=repeat, warmup_pairs=warmup,
+        direct_reset_plus_postop=timed_pair([native, fused], repeat, warmup),
+        harness_forced_caller=timed_pair(
+            [lambda: old_fn(indexer, q, weights, [history], batch),
+             lambda: new_fn(indexer, q, weights, [history], batch)], repeat, warmup
+        ),
+        scope="Independent host/NPU event A/B; forced harness admission; not auto/TTFT",
+    )
+
+
+def sweep32(args, helper, report, save):
+    report.update(
+        schema="glm53-postop32-block-sweep-v1", heads=32, blocks=args.blocks,
+        production_policy_unchanged={"tile8_min_keys": 98304, "tile32_min_keys": 32768},
+        admission_override="extracted harness namespace only; POSTOP64=0",
+    )
+    with torch.inference_mode():
+        for block in args.blocks:
+            for rows in args.tiles:
+                with environment(0, rows):
+                    for keys in args.keys:
+                        for pattern in (*PATTERNS, "caller"):
+                            report["active_case"] = dict(
+                                block=block, rows=rows, keys=keys, pattern=pattern
+                            )
+                            save()
+                            record = (
+                                caller32_case(args.module_file, helper, rows, keys, args.seed, block)
+                                if pattern == "caller" else
+                                helper32_case(helper, rows, keys, pattern, args.seed, block)
+                            )
+                            report["correctness"].append(record)
+                            gc.collect()
+                            save()
+        report["correctness_pass"] = True
+        save()
+        # No timed work until the complete selected correctness matrix passes.
+        if args.repeat:
+            for block in args.blocks:
+                for rows in args.tiles:
+                    with environment(0, rows):
+                        for keys in args.keys:
+                            report["active_case"] = dict(
+                                scope="independent_timing", block=block, rows=rows, keys=keys
+                            )
+                            save()
+                            report["timings"].append(timing32_case(
+                                args.module_file, helper, rows, keys, args.seed,
+                                block, args.repeat, args.warmup,
+                            ))
+                            gc.collect()
+                            save()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -490,6 +646,11 @@ def main():
         "--tiles", type=int, nargs="+", choices=(8, 32), default=[8, 32]
     )
     parser.add_argument("--keys", type=int, nargs="+", default=[8192, 16384, 32768])
+    parser.add_argument("--heads", type=int, choices=(32, 64), default=64)
+    parser.add_argument(
+        "--blocks", type=int, nargs="+", choices=(2048, 4096, 8192), default=[8192],
+        help="P32-only sweep of existing helper BLOCK; num_warps remains 4",
+    )
     parser.add_argument(
         "--force-min-keys",
         type=int,
@@ -526,6 +687,7 @@ def main():
 
         save()
         try:
+            validate_sweep_options(args)
             if not args.confirm_parent_stopped_p:
                 raise ValueError(
                     "Require --confirm-parent-stopped-p before importing device libraries"
@@ -577,6 +739,13 @@ def main():
                     "Both production files must contain the opt-in; refusing a no-op A/B"
                 )
             helper = load_helper(helper_file)
+            if args.heads == 32:
+                sweep32(args, helper, report, save)
+                report.update(status="pass", active_case=None)
+                save()
+                print(json.dumps(dict(status="pass", cases=len(report["correctness"]),
+                                      output=str(args.output))), flush=True)
+                return 0
             with torch.inference_mode():
                 for rows in args.tiles:
                     for keys in args.keys:
