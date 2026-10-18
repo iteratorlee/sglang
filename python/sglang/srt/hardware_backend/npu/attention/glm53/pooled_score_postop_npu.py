@@ -26,6 +26,28 @@ def _relu_gate_inplace(S, W, N, BLOCK: tl.constexpr):
     tl.store(S + qhead * N + key, result, mask=key < N)
 
 
+@triton.jit(do_not_specialize=["N", "TOTAL"])
+def _relu_gate_grouped(S, W, N, TOTAL, BLOCK: tl.constexpr):
+    key_blocks = tl.cdiv(N, BLOCK)
+    for block_id in range(tl.program_id(0), TOTAL, tl.num_programs(0)):
+        qhead = block_id // key_blocks
+        key = (block_id % key_blocks) * BLOCK + tl.arange(0, BLOCK)
+        value = tl.load(S + qhead * N + key, mask=key < N, other=0).to(tl.float32)
+        gate = tl.load(W + qhead).to(tl.float32)
+        value = tl.where(value <= 0.0, 0.0, value)
+        result = (value * gate).to(tl.bfloat16)
+        tl.store(S + qhead * N + key, result, mask=key < N)
+
+
+def _postop32_group(heads):
+    if heads != 32:
+        return 0
+    setting = os.environ.get("SGLANG_GLM53_PREFILL_POOLED_POSTOP32_GROUP", "0")
+    if setting not in ("0", "4", "8"):
+        raise ValueError("SGLANG_GLM53_PREFILL_POOLED_POSTOP32_GROUP must be 0, 4 or 8")
+    return int(setting)
+
+
 def supported(scores, weights):
     if not (
         scores.device.type == "npu"
@@ -68,6 +90,20 @@ def relu_gate_(scores, weights, block=8192):
     rows, heads, count = scores.shape
     if not rows or not count:
         return False
+    group = _postop32_group(heads)
+    if group:
+        # The P-only caller controls admission; this private helper also
+        # bounds the experimental launch to its intended geometry envelope.
+        if block != 8192 or count > 32768:
+            scores.relu_()
+            scores.mul_(weights.unsqueeze(-1))
+            return False
+        total = rows * heads * triton.cdiv(count, block)
+        programs = triton.cdiv(total, group)
+        _relu_gate_grouped[(programs,)](
+            scores, weights, count, total, block, num_warps=4, multibuffer=False
+        )
+        return True
     if rows * heads * triton.cdiv(count, block) > 65535:
         # The Ascend launch ABI limits the logical grid, even for vector ops.
         # This is a shape fallback, with the native operations executed once.

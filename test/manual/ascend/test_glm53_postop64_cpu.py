@@ -40,7 +40,7 @@ class Postop64CPU(unittest.TestCase):
             get_server_args=lambda: SimpleNamespace(disaggregation_mode=self.role),
         )
         bench.extract_defs(
-            DIR / "pooled_score_postop_npu.py", ["supported", "relu_gate_"], self.scope
+            DIR / "pooled_score_postop_npu.py", ["supported", "_postop32_group", "relu_gate_"], self.scope
         )
         bench.extract_defs(
             DIR / "kpool_indexer.py", ["_prefill_pooled_postop_min_keys"], self.scope

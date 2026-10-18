@@ -68,6 +68,19 @@ def _prefill_pooled_postop_min_keys(
         raise ValueError("SGLANG_GLM53_PREFILL_POOLED_POSTOP must be 0 or auto")
     if device.type != "npu" or get_server_args().disaggregation_mode != "prefill":
         return None
+    if heads == 32:
+        group = os.environ.get("SGLANG_GLM53_PREFILL_POOLED_POSTOP32_GROUP", "0")
+        if group not in ("0", "4", "8"):
+            raise ValueError("SGLANG_GLM53_PREFILL_POOLED_POSTOP32_GROUP must be 0, 4 or 8")
+        if group != "0":
+            raw = os.environ.get("SGLANG_GLM53_PREFILL_POOLED_POSTOP32_MIN_KEYS", "32768")
+            try:
+                min_keys = int(raw)
+            except ValueError:
+                raise ValueError("SGLANG_GLM53_PREFILL_POOLED_POSTOP32_MIN_KEYS must be in [1, 32768]") from None
+            if not 1 <= min_keys <= 32768:
+                raise ValueError("SGLANG_GLM53_PREFILL_POOLED_POSTOP32_MIN_KEYS must be in [1, 32768]")
+            return min_keys if legacy_tile_rows in (8, 32) else None
     if (
         heads == 64
         and os.environ.get("SGLANG_GLM53_PREFILL_POOLED_POSTOP64", "0") == "1"

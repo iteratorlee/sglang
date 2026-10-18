@@ -44,6 +44,8 @@ def environment(flag, tile, min_keys=None):
     settings = {
         FLAG: str(flag),
         MIN_KEYS: None if min_keys is None else str(min_keys),
+        "SGLANG_GLM53_PREFILL_POOLED_POSTOP32_GROUP": "0",
+        "SGLANG_GLM53_PREFILL_POOLED_POSTOP32_MIN_KEYS": None,
         "SGLANG_GLM53_PREFILL_POOLED_POSTOP": "auto",
         "SGLANG_GLM53_PREFILL_POOLED_SCORE": "0",
         "SGLANG_GLM53_PREFILL_SCORE_VALIDATE": "0",
