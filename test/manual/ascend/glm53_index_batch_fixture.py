@@ -26,6 +26,7 @@ else:
     SOURCE = ROOT / REL
 BASELINE = "83cfe9668fb98ca674c3a28816dd99016e38b8b6"
 FLAG = "SGLANG_GLM53_VERIFY_INDEX_BATCH"
+EXPAND_FLAG = "SGLANG_GLM53_VERIFY_EXPAND_BATCH"
 STATE = (
     "_kpool_tail_k",
     "_kpool_tail_score",
@@ -176,6 +177,7 @@ class Runner:
         op,
         *,
         enabled,
+        batch_expand=False,
         device="cpu",
         source=None,
         fused=False,
@@ -193,6 +195,20 @@ class Runner:
             [],
         )
         cpu = self.device.type == "cpu"
+        real_expand = kernel("kpool_expand_npu", cpu).expand_with_tail
+        in_per_step_expand = False
+
+        def record_expand(ids, positions):
+            self.expands.append((tuple(ids.shape), positions))
+            self.events.append("expand")
+
+        def fused_expand(ids, positions):
+            # Direct batched dispatch bypasses _expand_with_tail. Record it
+            # here, without double-counting that helper's existing fused path.
+            if not in_per_step_expand:
+                record_expand(ids, positions)
+            return real_expand(ids, positions)
+
         ns = dict(
             get_server_args=lambda: NS(
                 disaggregation_mode="decode", max_running_requests=16
@@ -210,7 +226,7 @@ class Runner:
             snapshot_kpool_tails_=kernel(
                 "kpool_snapshot_npu", cpu
             ).snapshot_kpool_tails_,
-            expand_with_tail=kernel("kpool_expand_npu", cpu).expand_with_tail,
+            expand_with_tail=fused_expand,
             torch_npu=NS(npu_lightning_indexer=self.lightning),
         )
         self.op = op
@@ -219,6 +235,8 @@ class Runner:
         obj = self.obj
         obj.index_kpool, obj.index_topk, obj.head_dim = 4, case.topk, 128
         obj._batch_kpool_verify_index = enabled
+        # Explicit opt-in, independent of the caller's ambient environment.
+        obj._batch_kpool_verify_expand = enabled and batch_expand
         obj._fuse_kpool_tail_scatter = fused
         obj._fuse_kpool_verify_snapshot = fused
         obj.index_kpool_compress_ape = self.data["ape"]
@@ -240,9 +258,13 @@ class Runner:
             return result
 
         def expand(ids, positions):
-            self.expands.append((tuple(ids.shape), positions))
-            self.events.append("expand")
-            return original_expand(ids, positions)
+            nonlocal in_per_step_expand
+            record_expand(ids, positions)
+            in_per_step_expand = True
+            try:
+                return original_expand(ids, positions)
+            finally:
+                in_per_step_expand = False
 
         obj._decode_topk, obj._expand_with_tail = decode, expand
         self.batch = NS(

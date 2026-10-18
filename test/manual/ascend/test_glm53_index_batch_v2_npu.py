@@ -11,13 +11,14 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import statistics
 import subprocess
 import traceback
 
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
 
-from glm53_index_batch_fixture import BASELINE, REL, ROOT, SOURCE, Runner
+from glm53_index_batch_fixture import BASELINE, REL, ROOT, SOURCE, Runner, fixture
 from glm53_index_batch_contract_v2 import compare_snapshots, snapshot
 from test_glm53_index_batch_npu import benchmark, capture, empty_forward, frames, ints
 
@@ -29,6 +30,7 @@ def group(torch, op, baseline, bs, prefix, args, report):
             initial,
             op,
             enabled=e,
+            batch_expand=e and args.batch_expand,
             device=f"npu:{args.device}",
             source=None if e else baseline,
             fused=args.fused_state,
@@ -68,16 +70,25 @@ def group(torch, op, baseline, bs, prefix, args, report):
             raise AssertionError(
                 "expected four baseline LI calls and one candidate call"
             )
-        if runners[1].events != ["update"] * 4 + ["indexer"] + ["expand"] * 4:
+        expand_count = 1 if args.batch_expand else 4
+        expected_events = ["update"] * 4 + ["indexer"] + ["expand"] * expand_count
+        if runners[1].events != expected_events:
             raise AssertionError("candidate update/indexer/expand order")
 
-        def check(label, left, right, ca=False, cb=True):
+        def check(label, left, right, ca=False, cb=True, ea=False, eb=False):
             diag = row["comparisons"][label] = {}
             compare_snapshots(
-                case, left, right, canonical_a=ca, canonical_b=cb, diagnostics=diag
+                case,
+                left,
+                right,
+                canonical_a=ca,
+                canonical_b=cb,
+                batch_expand_a=ea,
+                batch_expand_b=eb,
+                diagnostics=diag,
             )
 
-        check("eager_ab", *eager)
+        check("eager_ab", *eager, eb=args.batch_expand)
         # Repeat the legacy operation independently, retaining undefined-domain
         # counts even if both runs happen to return the same bytes.
         runners[0].reset(case)
@@ -98,10 +109,20 @@ def group(torch, op, baseline, bs, prefix, args, report):
         for graph, _ in graphs_outputs:
             graph.replay()
         torch.npu.synchronize()
+        if len(runners[1].calls) != 1 or runners[1].events != expected_events:
+            raise AssertionError("captured candidate LI/expand dispatch")
         replay = [snapshot(r, out) for r, (_, out) in zip(runners, graphs_outputs)]
-        check("graph_ab", *replay)
+        check("graph_ab", *replay, eb=args.batch_expand)
         for i, name in enumerate(("old_graph_eager", "new_graph_eager")):
-            check(name, replay[i], eager[i], bool(i), bool(i))
+            check(
+                name,
+                replay[i],
+                eager[i],
+                ca=bool(i),
+                cb=bool(i),
+                ea=bool(i) and args.batch_expand,
+                eb=bool(i) and args.batch_expand,
+            )
         if pointers != [[v.data_ptr() for v in r.data.values()] for r in runners]:
             raise AssertionError("input/state addresses changed during replay")
         row.update(
@@ -110,9 +131,64 @@ def group(torch, op, baseline, bs, prefix, args, report):
             all_state_bytes_exact=True,
             new_zero_key_canonical=True,
             li_calls=[4, 1],
-            expand_rows=[bs] * 4,
+            candidate_li_calls=1,
+            expand_rows=[shape[0] for shape in eager[1]["expands"]],
+            graph_expand_rows=[shape[0] for shape in replay[1]["expands"]],
         )
         print(json.dumps(row), flush=True)
+
+
+def benchmark_expand(torch, op, baseline, bs, args):
+    """Separate incremental expand savings from the four-to-one LI change."""
+    case = fixture(
+        [131068 + row % 4 for row in range(bs)], topk=args.topk, heads=args.heads
+    )
+    results = []
+    for name, enabled, batch_expand in (
+        ("legacy", False, False),
+        ("batch_li", True, False),
+        ("batch_li_expand", True, True),
+    ):
+        runner = Runner(
+            case,
+            op,
+            enabled=enabled,
+            batch_expand=batch_expand,
+            device=f"npu:{args.device}",
+            source=None if enabled else baseline,
+            fused=args.fused_state,
+            trace=False,
+        )
+        graph, _ = capture(torch, runner)
+        expand_rows = [shape[0] for shape, _ in runner.expands]
+        if len(runner.calls) != (1 if enabled else 4) or expand_rows != (
+            [bs * 4] if batch_expand else [bs] * 4
+        ):
+            raise AssertionError("timed graph LI/expand dispatch")
+        times = []
+        for _ in range(args.benchmark):
+            runner.reset()
+            start = torch.npu.Event(enable_timing=True)
+            end = torch.npu.Event(enable_timing=True)
+            start.record()
+            graph.replay()
+            end.record()
+            end.synchronize()
+            times.append(start.elapsed_time(end))
+        results.append(
+            dict(
+                mode=name,
+                bs=bs,
+                li_calls=len(runner.calls),
+                expand_rows=expand_rows,
+                samples_ms=times,
+                median_ms=statistics.median(times),
+            )
+        )
+        del graph, runner
+        gc.collect()
+        torch.npu.empty_cache()
+    return results
 
 
 def main():
@@ -144,6 +220,11 @@ def main():
         "--fused-state",
         action="store_true",
         help="also test existing fused scatter + snapshot",
+    )
+    p.add_argument(
+        "--batch-expand",
+        action="store_true",
+        help="opt in to one request-major expand after batched LI (default: four)",
     )
     p.add_argument(
         "--benchmark",
@@ -211,6 +292,7 @@ def main():
         topk=args.topk,
         heads=args.heads,
         fused_state=args.fused_state,
+        batch_expand=args.batch_expand,
         promotion_allowed=False,
         installed_contract_sha256=None,
     )
@@ -238,10 +320,9 @@ def main():
                     gc.collect()
                     torch.npu.empty_cache()
             if args.benchmark:
+                timing = benchmark_expand if args.batch_expand else benchmark
                 report["timings"] = [
-                    benchmark(
-                        torch, torch_npu.npu_lightning_indexer, baseline, bs, args
-                    )
+                    timing(torch, torch_npu.npu_lightning_indexer, baseline, bs, args)
                     for bs in args.batches
                 ]
         report["passed"] = True

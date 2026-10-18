@@ -121,7 +121,17 @@ def snapshot(runner, output):
     )
 
 
-def compare_snapshots(case, a, b, *, canonical_a=False, canonical_b=True, diagnostics):
+def compare_snapshots(
+    case,
+    a,
+    b,
+    *,
+    canonical_a=False,
+    canonical_b=True,
+    batch_expand_a=False,
+    batch_expand_b=False,
+    diagnostics,
+):
     compare_outputs(
         case,
         a["raw"],
@@ -147,5 +157,11 @@ def compare_snapshots(case, a, b, *, canonical_a=False, canonical_b=True, diagno
             exact(
                 left[key], right[key], f"{label} {key} (all bytes, including dead/sink)"
             )
-    if a["expands"] != b["expands"] or a["expands"] != [(case.bs, case.topk // 4)] * 4:
-        raise AssertionError("expand shape/order changed")
+    for side, batched in ((a, batch_expand_a), (b, batch_expand_b)):
+        expected = (
+            [(case.bs * 4, case.topk // 4)]
+            if batched
+            else [(case.bs, case.topk // 4)] * 4
+        )
+        if side["expands"] != expected:
+            raise AssertionError("expand shape/order changed")

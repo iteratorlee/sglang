@@ -345,6 +345,10 @@ class AscendIndexerKPoolMixin:
             get_server_args().disaggregation_mode == "decode"
             and os.getenv("SGLANG_GLM53_VERIFY_INDEX_BATCH", "0") == "1"
         )
+        self._batch_kpool_verify_expand = (
+            self._batch_kpool_verify_index
+            and os.getenv("SGLANG_GLM53_VERIFY_EXPAND_BATCH", "0") == "1"
+        )
         self._fuse_kpool_tail_scatter = (
             get_server_args().disaggregation_mode == "decode"
             and os.getenv("SGLANG_GLM53_FUSED_KPOOL_TAIL_SCATTER", "0") == "1"
@@ -984,6 +988,9 @@ class AscendIndexerKPoolMixin:
         batch_indexer = getattr(self, "_batch_kpool_verify_index", False) and (
             self._verify_index_batch_enabled(q, steps, bs)
         )
+        batch_expand = batch_indexer and getattr(
+            self, "_batch_kpool_verify_expand", False
+        )
         decode_kwargs = {"_defer_indexer": True} if batch_indexer else {}
         metadata = _get_full_attn_metadata(forward_batch)
         step_batch = copy(forward_batch)
@@ -1056,17 +1063,27 @@ class AscendIndexerKPoolMixin:
             # candidate a deterministic sentinel before tail expansion; keep
             # every positive-length row (including its index order) untouched.
             topk.masked_fill_((pool_lens == 0).view(-1, 1, 1), -1)
-            topk = topk.view(bs, steps, -1)
-            # Keep the original bs-row expand shape and <=16 fused guard.
-            # In particular bs=14 must not expand all 56 rows in torch.
-            outputs = [
-                self._expand_with_tail(
-                    topk[:, step].contiguous(),
-                    positions[step:real_shape_tokens:steps].contiguous(),
+            if batch_expand:
+                from .kpool_expand_npu import expand_with_tail
+
+                # LI already returns request-major rows. The integer kernel
+                # handles each row independently; keep the general <=16 guard.
+                result = expand_with_tail(
+                    topk.squeeze(1), positions[:real_shape_tokens]
                 )
-                for step in range(steps)
-            ]
-        result = torch.stack(outputs, 1).flatten(0, 1)
+            else:
+                topk = topk.view(bs, steps, -1)
+                # Keep the original bs-row expand shape and <=16 fused guard.
+                # In particular bs=14 must not expand all 56 rows in torch.
+                outputs = [
+                    self._expand_with_tail(
+                        topk[:, step].contiguous(),
+                        positions[step:real_shape_tokens:steps].contiguous(),
+                    )
+                    for step in range(steps)
+                ]
+        if not batch_expand:
+            result = torch.stack(outputs, 1).flatten(0, 1)
         if q.shape[0] > real_shape_tokens:
             result = torch.cat(
                 (
