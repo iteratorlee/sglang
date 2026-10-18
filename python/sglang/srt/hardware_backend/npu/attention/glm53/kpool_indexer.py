@@ -341,6 +341,10 @@ class AscendIndexerKPoolMixin:
 
     def _init_ascend_kpool(self):
         # Opt in only on D: P keeps its existing prepared/prefill behavior.
+        self._batch_kpool_verify_index = (
+            get_server_args().disaggregation_mode == "decode"
+            and os.getenv("SGLANG_GLM53_VERIFY_INDEX_BATCH", "0") == "1"
+        )
         self._fuse_kpool_tail_scatter = (
             get_server_args().disaggregation_mode == "decode"
             and os.getenv("SGLANG_GLM53_FUSED_KPOOL_TAIL_SCATTER", "0") == "1"
@@ -858,7 +862,9 @@ class AscendIndexerKPoolMixin:
         forward_batch: ForwardBatch,
         block_tables: torch.Tensor,
         layer_id: int,
-    ) -> torch.Tensor:
+        *,
+        _defer_indexer: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         bs = q.shape[0]
         metadata = _get_full_attn_metadata(forward_batch)
         if self.index_kpool == 4:
@@ -927,6 +933,10 @@ class AscendIndexerKPoolMixin:
             )
             actual_q = torch.arange(1, bs + 1, dtype=torch.int32, device=q.device)
             pooled_table = self._pooled_page_table(block_tables)
+        if _defer_indexer:
+            # Only the fixed four-step verify caller may defer this read.
+            # Tail and closing-pool writes above retain their original order.
+            return pool_lens, pooled_table
         topk, _ = torch_npu.npu_lightning_indexer(
             query=q,
             key=_get_index_k_buffer(forward_batch, layer_id),
@@ -940,6 +950,21 @@ class AscendIndexerKPoolMixin:
             sparse_mode=3,
         )
         return self._expand_with_tail(topk.squeeze(1), positions[:bs])
+
+    def _verify_index_batch_enabled(self, q, steps, bs):
+        if not (
+            getattr(self, "_batch_kpool_verify_index", False)
+            and q.device.type == "npu"
+            and self.index_kpool == steps == 4
+            and 0 < bs <= 16
+        ):
+            return False
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
+
+        # Includes graph warmup; replay executes the already captured branch.
+        return get_is_capture_mode()
 
     def _verify_topk(
         self,
@@ -956,6 +981,10 @@ class AscendIndexerKPoolMixin:
         steps = forward_batch.spec_info.draft_token_num
         bs = (getattr(forward_batch, "_original_batch_size", None) or forward_batch.batch_size)
         real_shape_tokens = bs * steps
+        batch_indexer = getattr(self, "_batch_kpool_verify_index", False) and (
+            self._verify_index_batch_enabled(q, steps, bs)
+        )
+        decode_kwargs = {"_defer_indexer": True} if batch_indexer else {}
         metadata = _get_full_attn_metadata(forward_batch)
         step_batch = copy(forward_batch)
         step_batch.batch_size = bs
@@ -978,6 +1007,7 @@ class AscendIndexerKPoolMixin:
                 step_batch,
                 block_tables,
                 layer_id,
+                **decode_kwargs,
             )
             outputs.append(result)
             if self._fuse_kpool_verify_snapshot:
@@ -996,6 +1026,42 @@ class AscendIndexerKPoolMixin:
                 self._kpool_mtp_tail_score[:bs, step].copy_(
                     self._kpool_tail_score.index_select(0, req)
                 )
+        if batch_indexer:
+            # Request-major rows: each query is an independent length-1 TND
+            # sequence, NOT one length-4 sequence. Right-down causal then sees
+            # exactly [0, pool_lens[row]); PA key lengths are not prefix sums.
+            # Four consecutive positions close exactly one pool per request.
+            # Its final value is invisible before closing via these lengths;
+            # historical pools are never overwritten by a later step.
+            pool_lens = torch.stack([item[0] for item in outputs], 1).flatten()
+            pooled_table = outputs[0][1].repeat_interleave(steps, dim=0)
+            queries = q[:real_shape_tokens].contiguous()
+            topk, _ = torch_npu.npu_lightning_indexer(
+                query=queries,
+                key=_get_index_k_buffer(forward_batch, layer_id),
+                weights=_ascend_lightning_weights(
+                    weights[:real_shape_tokens].contiguous(), queries
+                ),
+                actual_seq_lengths_query=torch.arange(
+                    1, real_shape_tokens + 1, dtype=torch.int32, device=q.device
+                ),
+                actual_seq_lengths_key=pool_lens,
+                block_table=pooled_table,
+                layout_query="TND",
+                layout_key="PA_BSND",
+                sparse_count=self.index_topk // self.index_kpool,
+                sparse_mode=3,
+            )
+            topk = topk.view(bs, steps, -1)
+            # Keep the original bs-row expand shape and <=16 fused guard.
+            # In particular bs=14 must not expand all 56 rows in torch.
+            outputs = [
+                self._expand_with_tail(
+                    topk[:, step].contiguous(),
+                    positions[step:real_shape_tokens:steps].contiguous(),
+                )
+                for step in range(steps)
+            ]
         result = torch.stack(outputs, 1).flatten(0, 1)
         if q.shape[0] > real_shape_tokens:
             result = torch.cat(
