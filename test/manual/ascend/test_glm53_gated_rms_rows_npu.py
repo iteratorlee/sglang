@@ -26,8 +26,11 @@ if __name__ == "__main__":
 import torch
 import triton
 
-ROOT = Path(__file__).resolve().parents[3]
-SOURCE = ROOT / "python/sglang/srt/hardware_backend/npu/attention/glm53"
+if os.environ.get("GLM53_GATED_RMS_SOURCE_DIR"):
+    SOURCE = Path(os.environ["GLM53_GATED_RMS_SOURCE_DIR"]).resolve()
+else:
+    ROOT = Path(__file__).resolve().parents[3]
+    SOURCE = ROOT / "python/sglang/srt/hardware_backend/npu/attention/glm53"
 FLAG = "SGLANG_GLM53_D_GATED_RMS_ROWS"
 
 
