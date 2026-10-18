@@ -4,6 +4,8 @@ Preserve native CANN matmul, BF16 storage, native head sum and query tiling.
 Only ND physical format 2 is admitted. No reduction, threshold or approximation.
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -32,7 +34,13 @@ def supported(scores, weights):
         and weights.dtype == torch.float32
         and scores.ndim == 3
         and 0 < scores.shape[0] <= 32
-        and scores.shape[1] == 32
+        and (
+            scores.shape[1] == 32
+            or (
+                scores.shape[1] == 64
+                and os.environ.get("SGLANG_GLM53_PREFILL_POOLED_POSTOP64", "0") == "1"
+            )
+        )
         and weights.ndim == 2
         and tuple(weights.shape) == tuple(scores.shape[:2])
         and scores.is_contiguous()

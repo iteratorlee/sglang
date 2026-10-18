@@ -57,7 +57,9 @@ def _prefill_pooled_score_backend():
     return fused_pooled_scores, supported
 
 
-def _prefill_pooled_postop_min_keys(device: torch.device, legacy_tile_rows: int):
+def _prefill_pooled_postop_min_keys(
+    device: torch.device, legacy_tile_rows: int, heads: int = 32
+):
     """Opt-in P pointwise fusion; thresholds affect performance, never scores."""
     setting = os.environ.get("SGLANG_GLM53_PREFILL_POOLED_POSTOP", "0").strip().lower()
     if setting in ("0", "off", "false", ""):
@@ -66,6 +68,14 @@ def _prefill_pooled_postop_min_keys(device: torch.device, legacy_tile_rows: int)
         raise ValueError("SGLANG_GLM53_PREFILL_POOLED_POSTOP must be 0 or auto")
     if device.type != "npu" or get_server_args().disaggregation_mode != "prefill":
         return None
+    if (
+        heads == 64
+        and os.environ.get("SGLANG_GLM53_PREFILL_POOLED_POSTOP64", "0") == "1"
+    ):
+        # Experimental thresholds preserve the old rows*heads*keys workload
+        # at twice the head count. They are not measured 64-head break-even
+        # points: tile8 stays native throughout a 128K-token history.
+        return {32: 16384, 8: 49152}.get(legacy_tile_rows)
     return {32: 32768, 8: 98304}.get(legacy_tile_rows)
 
 
@@ -649,7 +659,9 @@ class AscendIndexerKPoolMixin:
         if fused_scores:
             fused_pooled_scores, supported = _prefill_pooled_score_backend()
             fused_scores = supported(q, weights, compressed_by_request)
-        postop_min_keys = _prefill_pooled_postop_min_keys(q.device, legacy_tile_rows)
+        postop_min_keys = _prefill_pooled_postop_min_keys(
+            q.device, legacy_tile_rows, weights.shape[1]
+        )
         if postop_min_keys is not None:
             if fused_scores:
                 raise ValueError("Pooled postop requires SGLANG_GLM53_PREFILL_POOLED_SCORE=0")
