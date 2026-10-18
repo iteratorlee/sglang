@@ -17,9 +17,13 @@ from unittest.mock import patch
 import torch
 import torch.nn.functional as F
 
-ROOT = Path(__file__).resolve().parents[3]
 REL = "python/sglang/srt/hardware_backend/npu/attention/glm53/kpool_indexer.py"
-SOURCE = ROOT / REL
+if os.environ.get("GLM53_INDEX_BATCH_SOURCE"):
+    SOURCE = Path(os.environ["GLM53_INDEX_BATCH_SOURCE"]).resolve()
+    ROOT = SOURCE.parent
+else:
+    ROOT = Path(__file__).resolve().parents[3]
+    SOURCE = ROOT / REL
 BASELINE = "83cfe9668fb98ca674c3a28816dd99016e38b8b6"
 FLAG = "SGLANG_GLM53_VERIFY_INDEX_BATCH"
 STATE = (
