@@ -199,24 +199,29 @@ def group(bs, args, torch_npu, baseline, report):
         del repeated
         set_trace(old, saved[0])
         row["phase"] = "graph"
-        for mode, runner, (graph, out) in zip(MODES, runners, graphs_outputs):
+        for i, (mode, runner, (graph, out)) in enumerate(
+            zip(MODES, runners, graphs_outputs)
+        ):
             runner.reset(case)
             graph.replay()
             torch.npu.synchronize()
             replay.append(snapshot(runner, out))
             inspect_calls(runner, case, mode, torch_npu)
-        compare_three(case, replay, row["comparisons"].setdefault("graph", {}))
-        for mode, a, b in zip(MODES, eager, replay):
             compare_snapshots(
                 case,
-                a,
-                b,
+                eager[i],
+                replay[i],
                 canonical_a=mode[1],
                 canonical_b=mode[1],
                 batch_expand_a=mode[2],
                 batch_expand_b=mode[2],
                 diagnostics=row["comparisons"].setdefault(mode[0] + "_graph_eager", {}),
             )
+            # Four full-cache host snapshots at peak, not six: the isolated
+            # runner caps host RAM at 24 GiB. Keep all graph snapshots for the
+            # direct three-way comparison; release only already-checked eager.
+            eager[i] = None
+        compare_three(case, replay, row["comparisons"].setdefault("graph", {}))
         if pointers != [[v.data_ptr() for v in r.data.values()] for r in runners]:
             raise AssertionError("input/state pointer changed across replay")
         row.update(
