@@ -47,7 +47,7 @@ def supported(x, gate, weight):
 
 
 def supported_prefill_loop(x, gate, weight, output):
-    """Only P16384 x 8 heads, contiguous BF16/ND, for the old 1D loop."""
+    """Only P16384 x 8 heads, contiguous BF16 base format, for the old loop."""
     shapes = ((16384, 8, 128), (1, 16384, 8, 128))
     if not (
         supported(x, gate, weight)
@@ -64,7 +64,13 @@ def supported_prefill_loop(x, gate, weight, output):
     import torch_npu
 
     try:
-        return all(torch_npu.get_npu_format(t) == 2 for t in (x, gate, weight, output))
+        # torch_npu may allocate a contiguous 4D empty_like in base NCHW (0).
+        # Its physical order is unchanged; do not accept padded/internal formats.
+        return all(
+            fmt == 2 or (fmt == 0 and t.ndim == 4)
+            for t in (x, gate, weight, output)
+            for fmt in (torch_npu.get_npu_format(t),)
+        )
     except (AttributeError, RuntimeError):
         return False
 

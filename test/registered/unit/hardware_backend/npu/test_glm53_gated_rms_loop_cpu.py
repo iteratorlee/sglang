@@ -1,6 +1,7 @@
 """Small CPU numerical checks and D/P large-loop candidate dispatch."""
 
 import ast
+import contextlib
 import importlib.util
 import os
 from pathlib import Path
@@ -202,6 +203,100 @@ class LoopCPU(unittest.TestCase):
             self.assertEqual(calls[0][0], want)
             if want == "large" and rows <= 2048:
                 self.assertEqual(calls[0][1], ((rows + int(flag) - 1) // int(flag),))
+
+    def test_prefill_capture_base_format_and_failed_diagnostics(self):
+        reference = loop.adapt_reference(
+            module("test_glm53_gated_rms_rows_npu"), role="prefill"
+        )
+        old, new = reference.load_kernels(cpu=True)
+
+        class Meta:
+            def __init__(self, shape, dtype=torch.bfloat16, fmt=2, tensor=None):
+                self.tensor = (
+                    tensor
+                    if tensor is not None
+                    else torch.empty(shape, dtype=dtype, device="meta")
+                )
+                self.shape, self.ndim, self.dtype = (
+                    self.tensor.shape,
+                    self.tensor.ndim,
+                    self.tensor.dtype,
+                )
+                self.device, self.fmt = NS(type="npu", index=0), fmt
+
+            def numel(self):
+                return self.tensor.numel()
+
+            def is_contiguous(self):
+                return self.tensor.is_contiguous()
+
+            def stride(self):
+                return self.tensor.stride()
+
+            def storage_offset(self):
+                return self.tensor.storage_offset()
+
+            def view(self, *shape):
+                return Meta(shape, self.dtype, self.fmt)
+
+        old._glm_rms_norm_gated_large_row_kernel = Launch([], "large")
+        output_format = 0
+        old.torch = NS(
+            bfloat16=torch.bfloat16,
+            empty_like=lambda x: Meta(x.shape, x.dtype, output_format),
+        )
+        npu_graph_stub = NS(
+            synchronize=lambda: None,
+            NPUGraph=object,
+            graph=lambda graph: contextlib.nullcontext(),
+        )
+        with (
+            patch.dict(sys.modules, {"torch_npu": NS(get_npu_format=lambda t: t.fmt)}),
+            patch.object(reference.torch, "npu", npu_graph_stub, create=True),
+        ):
+            # Reproduce the old ND-only false rejection of empty_like's format 0
+            # without allocating or interpreting any large tensor/program grid.
+            data = [Meta((1, 4096, 32, 128)), Meta((1, 4096, 32, 128)), Meta((128,))]
+            reference.capture_wrapper(old, 8, data)
+            record = reference.wrapper_diagnostics[-1]
+            self.assertEqual(record["observed_grids"], [(16384,)] * 4)
+            self.assertTrue(record["supported_prefill_loop"])
+            self.assertEqual(record["tensors"]["x"]["shape"], [1, 16384, 8, 128])
+            self.assertEqual(record["tensors"]["output"]["npu_format"], 0)
+            self.assertEqual(
+                record["tensors"]["output"]["strides"], [16777216, 1024, 128, 1]
+            )
+            self.assertEqual(record["runtime_role"], "prefill")
+            # Reject internal formats and retain the evidence before raising.
+            output_format = 29
+            with self.assertRaisesRegex(AssertionError, "prefill_metadata"):
+                reference.capture_wrapper(old, 8, data)
+            record = reference.wrapper_diagnostics[-1]
+            self.assertFalse(record["supported_prefill_loop"])
+            self.assertEqual(record["tensors"]["output"]["npu_format"], 29)
+            self.assertEqual(record["observed_grids"], [(32768,)] * 4)
+            x, g, w = Meta((1, 16384, 8, 128)), Meta((16384, 8, 128)), Meta((128,))
+            out = Meta(x.shape, fmt=0)
+            for target in (x, out):
+                for fmt in (0, 2):
+                    target.fmt = fmt
+                    self.assertTrue(new.supported_prefill_loop(x, g, w, out))
+                for fmt in (1, 3, 4, 29, -1):
+                    target.fmt = fmt
+                    self.assertFalse(new.supported_prefill_loop(x, g, w, out))
+                target.fmt = 2
+            for target in (g, w):
+                target.fmt = 0  # Format 0 is newly admitted only for rank 4.
+                self.assertFalse(new.supported_prefill_loop(x, g, w, out))
+                target.fmt = 2
+            noncontiguous = Meta(
+                x.shape,
+                fmt=0,
+                tensor=torch.empty((1, 16384, 128, 8), device="meta").transpose(-1, -2),
+            )
+            self.assertFalse(new.supported_prefill_loop(noncontiguous, g, w, out))
+        with patch.dict(sys.modules, {"torch_npu": NS()}):
+            self.assertFalse(new.supported_prefill_loop(x, g, w, out))
 
     def test_both_original_kernel_bodies_and_arithmetic_unchanged(self):
         rel = "python/sglang/srt/hardware_backend/npu/attention/glm53/rms_norm_gated_npu.py"

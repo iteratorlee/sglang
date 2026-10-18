@@ -69,9 +69,28 @@ def baseline_grid(rows):
     return min(rows, 32768) if rows > 65535 else rows
 
 
+def tensor_metadata(tensor):
+    result = dict(
+        shape=list(tensor.shape),
+        strides=list(tensor.stride()),
+        storage_offset=tensor.storage_offset(),
+        dtype=str(tensor.dtype),
+        device=str(tensor.device),
+        contiguous=tensor.is_contiguous(),
+    )
+    try:
+        import torch_npu
+
+        result["npu_format"] = int(torch_npu.get_npu_format(tensor))
+    except (ImportError, AttributeError, RuntimeError) as error:
+        result["format_error"] = str(error)
+    return result
+
+
 def adapt_reference(h, role="decode"):
     original_load = h.load_kernels
     original_launch = h.launch
+    h.wrapper_diagnostics = []
 
     def load(*args, **kwargs):
         old, new = original_load(*args, **kwargs)
@@ -103,6 +122,7 @@ def adapt_reference(h, role="decode"):
 
     def capture_wrapper(old, variant, data):
         rows = data[0].numel() // 128
+        caller_shapes = [list(t.shape) for t in data]
         if role == "prefill":
             data = [
                 data[0].view(1, 16384, 8, 128),
@@ -144,9 +164,35 @@ def adapt_reference(h, role="decode"):
             h.torch.npu.synchronize()
         grid = baseline_grid(rows) if variant == 1 else (rows + variant - 1) // variant
         expected = [(grid,)] * 4 if variant != 1 or rows > 65535 else []
+        if role == "prefill":
+            diagnostic = dict(
+                role=role,
+                variant=variant,
+                caller_shapes=caller_shapes,
+                tensors={
+                    name: tensor_metadata(tensor)
+                    for name, tensor in zip(
+                        ("x", "gate", "weight", "output"), (*data, output)
+                    )
+                },
+                runtime_role=old.get_server_args().disaggregation_mode,
+                requested_flags=env,
+                observed_grids=observed,
+                expected_grids=expected,
+            )
+            try:
+                diagnostic["supported_prefill_loop"] = bool(
+                    old.supported_prefill_loop(*data, output)
+                )
+            except Exception as error:
+                diagnostic["supported_error"] = repr(error)
+            # Append before asserting: main's finally preserves failed capture
+            # evidence even when no numerical fixture has completed.
+            h.wrapper_diagnostics.append(diagnostic)
         if observed != expected:
             raise AssertionError(
-                f"wrapper loop dispatch mismatch: {observed} != {expected}"
+                f"wrapper loop dispatch mismatch: {observed} != {expected}; "
+                f"prefill_metadata={h.wrapper_diagnostics[-1:] if role == 'prefill' else []}"
             )
         return graph, output
 
@@ -239,6 +285,7 @@ def main():
         role=args.role,
         cases=[],
         timings=[],
+        wrapper_diagnostics=h.wrapper_diagnostics,
         torch=h.torch.__version__,
         torch_npu=torch_npu.__version__,
         triton=h.triton.__version__,
