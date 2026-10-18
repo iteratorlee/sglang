@@ -378,6 +378,17 @@ class AscendIndexerKPoolMixin:
     """NPU execution for the native KPool model parameters."""
 
     def _init_ascend_kpool(self):
+        raw_min_bs = os.getenv("SGLANG_GLM53_VERIFY_INDEX_MIN_BS", "1")
+        try:
+            min_bs = int(raw_min_bs)
+            if not 1 <= min_bs <= 16:
+                raise ValueError
+        except ValueError as exc:
+            raise ValueError(
+                "SGLANG_GLM53_VERIFY_INDEX_MIN_BS must be an integer in [1, 16], "
+                f"got {raw_min_bs!r}"
+            ) from exc
+        self._batch_kpool_verify_min_bs = min_bs
         # Opt in only on D: P keeps its existing prepared/prefill behavior.
         self._batch_kpool_verify_index = (
             get_server_args().disaggregation_mode == "decode"
@@ -1000,7 +1011,7 @@ class AscendIndexerKPoolMixin:
             getattr(self, "_batch_kpool_verify_index", False)
             and q.device.type == "npu"
             and self.index_kpool == steps == 4
-            and 0 < bs <= 16
+            and getattr(self, "_batch_kpool_verify_min_bs", 1) <= bs <= 16
         ):
             return False
         from sglang.srt.model_executor.runner_utils.capture_mode import (
