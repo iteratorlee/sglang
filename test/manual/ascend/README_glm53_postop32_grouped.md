@@ -80,6 +80,13 @@ Each case frees its tensors; no full-query QHK tape or tensor files are written.
 Largest individual score tensor is 64 MiB. Resident clones/graph buffers and
 native CANN workspace are additional; unit does not establish service HBM peak.
 
+The optional key counts 16416 and 32736 exercise partially filled BLOCK8192
+tiles while retaining the model's 128-token causal boundaries. Selecting all
+five key counts runs 180 correctness records. The first 1018 unit attempt
+was rejected by argparse before device import because its driver admitted
+only the three default counts; its exit2/log remain preserved. Adding these
+two explicit choices changes no fixture, comparison, kernel or default matrix.
+
 ## CPU verification
 
 ```sh

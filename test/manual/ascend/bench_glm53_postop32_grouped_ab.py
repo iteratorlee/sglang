@@ -238,7 +238,7 @@ def main():
     parser.add_argument("--confirm-parent-stopped-p", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--tiles", type=int, nargs="+", choices=(8, 32), default=[8, 32])
-    parser.add_argument("--keys", type=int, nargs="+", choices=(8192, 16384, 32768),
+    parser.add_argument("--keys", type=int, nargs="+", choices=(8192, 16384, 16416, 32736, 32768),
                         default=[8192, 16384, 32768])
     parser.add_argument("--min-keys", type=int, choices=(8192, 16384, 32768),
                         help="Optional real P32 grouped admission override; default unset")
