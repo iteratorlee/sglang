@@ -146,6 +146,74 @@ def _glm_kda_varlen_recurrent_kernel(
             )
 
 
+def _decode_verify_bhv_supported(
+    q,
+    k,
+    v,
+    a,
+    b,
+    A_log,
+    dt_bias,
+    state,
+    indices,
+    starts,
+    intermediate,
+    prefill,
+    track_indices,
+    track_lens,
+):
+    """Host metadata only; dense four-step starts/valid slots belong to the caller."""
+    if (
+        prefill
+        or intermediate is None
+        or track_indices is not None
+        or track_lens is not None
+    ):
+        return False
+    batch = indices.numel()
+    shape = (1, batch * 4, 32, 128)
+    if not (
+        12 <= batch <= 14
+        and q.device.type == "npu"
+        and all(
+            t.shape == shape and t.dtype == torch.bfloat16 and t.is_contiguous()
+            for t in (q, k, v, a)
+        )
+        and b.shape == shape[:-1]
+        and b.dtype == torch.bfloat16
+        and b.is_contiguous()
+        and state.ndim == 4
+        and state.shape[0] > 0
+        and state.shape[1:] == (32, 128, 128)
+        and state.dtype == torch.float32
+        and state.stride(-2) == 1
+        and state.transpose(-1, -2).is_contiguous()
+        and intermediate.ndim == 5
+        and intermediate.shape[0] >= batch
+        and intermediate.shape[1:] == (4, 32, 128, 128)
+        and intermediate.dtype == torch.float32
+        and intermediate.stride(-2) == 1
+        and intermediate.transpose(-1, -2).is_contiguous()
+        and A_log.numel() == 32
+        and dt_bias.numel() == 32 * 128
+        and all(
+            t.dtype == torch.float32 and t.is_contiguous() for t in (A_log, dt_bias)
+        )
+        and indices.ndim == starts.ndim == 1
+        and starts.numel() == batch + 1
+        and all(
+            t.dtype in (torch.int32, torch.int64) and t.is_contiguous()
+            for t in (indices, starts)
+        )
+        and all(
+            t.device == q.device
+            for t in (k, v, a, b, A_log, dt_bias, state, indices, starts, intermediate)
+        )
+    ):
+        return False
+    return True
+
+
 def glm_kda_varlen_recurrent_npu(
     *,
     A_log: torch.Tensor,
@@ -246,6 +314,29 @@ def glm_kda_varlen_recurrent_npu(
     block_value_count = triton.cdiv(value_dim, block_v)
     # CANN9 reduces along the contiguous key axis of a [BV,BK] tile.
     heads_per_program = 1
+    verify_bhv = os.getenv("SGLANG_GLM53_D_KDA_BHV", "1")
+    if verify_bhv in ("2", "4") and _decode_verify_bhv_supported(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        initial_state_source,
+        initial_state_indices,
+        cu_seqlens,
+        intermediate_state,
+        prefill,
+        track_state_indices,
+        track_state_lens,
+    ):
+        from sglang.srt.runtime_context import get_server_args
+
+        # _forward_target_verify omits prefill (False) and supplies scratch;
+        # ordinary extend sets prefill=True, while draft has no scratch.
+        if get_server_args().disaggregation_mode == "decode":
+            heads_per_program = int(verify_bhv)
     if (
         prefill
         and intermediate_state is None
