@@ -84,6 +84,49 @@ def glm_rms_norm_gated_npu(
     block_dim = triton.next_power_of_2(feature_dim)
     output = torch.empty_like(x)
     num_rows = x.numel() // feature_dim
+    loop_rows = os.getenv("SGLANG_GLM53_D_GATED_RMS_LOOP_ROWS", "0")
+    prefill_loop_rows = os.getenv("SGLANG_GLM53_P_GATED_RMS_LOOP_ROWS", "0")
+    if (
+        (
+            (loop_rows in ("4", "8") and 1024 <= num_rows <= 2048)
+            or (prefill_loop_rows in ("4", "8") and num_rows == 131072)
+        )
+        and x.device.type == "npu"
+        and feature_dim == 128
+        and output.dtype == torch.bfloat16
+    ):
+        from sglang.srt.runtime_context import get_server_args
+
+        mode = get_server_args().disaggregation_mode
+        selected_loop_rows = None
+        if mode == "decode" and loop_rows in ("4", "8") and 1024 <= num_rows <= 2048:
+            from .rms_norm_gated_rows_npu import supported
+
+            if supported(x, gate, weight):
+                selected_loop_rows = int(loop_rows)
+        elif (
+            mode == "prefill" and prefill_loop_rows in ("4", "8") and num_rows == 131072
+        ):
+            from .rms_norm_gated_rows_npu import supported_prefill_loop
+
+            if supported_prefill_loop(x, gate, weight, output):
+                selected_loop_rows = int(prefill_loop_rows)
+        if selected_loop_rows is not None:
+            grid_rows = triton.cdiv(num_rows, selected_loop_rows)
+            _glm_rms_norm_gated_large_row_kernel[(grid_rows,)](
+                x,
+                gate,
+                weight,
+                output,
+                eps,
+                feature_dim=128,
+                block_dim=128,
+                num_rows=num_rows,
+                grid_rows=grid_rows,
+                num_warps=1,
+                num_stages=1,
+            )
+            return output
     grouped_rows = os.getenv("SGLANG_GLM53_D_GATED_RMS_ROWS", "0")
     if (
         grouped_rows in ("4", "8")

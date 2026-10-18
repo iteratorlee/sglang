@@ -46,6 +46,29 @@ def supported(x, gate, weight):
     )
 
 
+def supported_prefill_loop(x, gate, weight, output):
+    """Only P16384 x 8 heads, contiguous BF16/ND, for the old 1D loop."""
+    shapes = ((16384, 8, 128), (1, 16384, 8, 128))
+    if not (
+        supported(x, gate, weight)
+        and x.device.type == "npu"
+        and tuple(x.shape) in shapes
+        and tuple(gate.shape) in shapes
+        and weight.shape == (128,)
+        and output.shape == x.shape
+        and output.dtype == torch.bfloat16
+        and output.device == x.device
+        and output.is_contiguous()
+    ):
+        return False
+    import torch_npu
+
+    try:
+        return all(torch_npu.get_npu_format(t) == 2 for t in (x, gate, weight, output))
+    except (AttributeError, RuntimeError):
+        return False
+
+
 def rms_norm_gated_rows(x, gate, weight, output, eps, rows_per_program):
     """Write contiguous BF16 rows; allow short shapes for isolated validation."""
     if (
