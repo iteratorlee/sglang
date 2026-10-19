@@ -1028,7 +1028,7 @@ class TestGlm53PDState(unittest.TestCase):
         self.assertEqual(UTILS["get_dsa_tail_state_indices"](pool, 1, 65539), [])
 
     def test_prefill_mamba_layout_matches_decode_without_verify_scratch(self):
-        for draft_tokens in (1, 4):
+        for draft_tokens in (1, 4, 5):
             p, d = MambaPool(5, 3, False), MambaPool(9, 3 + draft_tokens - 1, True)
             requests = types.SimpleNamespace(mamba_pool=p)
             token_pool = types.SimpleNamespace(mamba_pool=p)
@@ -1090,8 +1090,15 @@ class TestGlm53PDState(unittest.TestCase):
             self.assertFalse(d.mamba_cache.temporal.array[:, 8:].any())
 
     def test_910b_tp4_to_tp2_and_tp8_to_tp1_mamba_state_bytes(self):
+        self._check_910b_mamba_state_bytes(draft_tokens=4)
+
+    def test_draft5_910b_mamba_state_bytes(self):
+        self._check_910b_mamba_state_bytes(draft_tokens=5)
+
+    def _check_910b_mamba_state_bytes(self, draft_tokens):
         # Conv has a row before its channel axis; temporal does not. A TP1 D
         # must combine all eight P shards without overwriting neighboring rows.
+        conv_window = 3 + draft_tokens - 1
         for p_tp, d_tp, d_tp_rank, p_dp in (
             (4, 2, 0, 0), (4, 2, 1, 0), (8, 1, 0, 0),
             # Both P hosts and all eight D DP domains, including global ranks
@@ -1101,7 +1108,8 @@ class TestGlm53PDState(unittest.TestCase):
             with self.subTest(p_tp=p_tp, d_tp=d_tp, d_tp_rank=d_tp_rank):
                 writers = p_tp // d_tp
                 dest = MambaPool(
-                    9, 6, True, conv_channels=6 * writers, temporal_heads=2 * writers
+                    9, conv_window, True,
+                    conv_channels=6 * writers, temporal_heads=2 * writers
                 )
                 src_states = []
 
@@ -1116,11 +1124,11 @@ class TestGlm53PDState(unittest.TestCase):
                     pd_state.prepare_glm53_pd_mamba_state(
                         types.SimpleNamespace(mamba_pool=source),
                         types.SimpleNamespace(mamba_pool=source),
-                        mode="prefill", draft_tokens=4,
+                        mode="prefill", draft_tokens=draft_tokens,
                     )
                     source.mamba_cache.conv[0].array[:, 2] = (
                         p_tp_rank * 1000
-                        + np.arange(2 * 6 * 6).reshape(2, 6, 6)
+                        + np.arange(2 * conv_window * 6).reshape(2, conv_window, 6)
                     )
                     source.mamba_cache.temporal.array[:, 2] = (
                         p_tp_rank * 1000
@@ -1268,12 +1276,18 @@ class TestTorchPDState(unittest.TestCase):
         self.assertEqual(pointers, pool.full_kv_pool.get_compress_tail_buf_infos()[0])
 
     def test_real_npu_conv_allocator_and_mamba_bytes_on_cpu(self):
+        self._check_real_npu_conv_allocator_and_mamba_bytes(draft_tokens=4)
+
+    def test_draft5_real_npu_conv_allocator_and_mamba_bytes_on_cpu(self):
+        self._check_real_npu_conv_allocator_and_mamba_bytes(draft_tokens=5)
+
+    def _check_real_npu_conv_allocator_and_mamba_bytes(self, draft_tokens):
         conv_init = source_functions(
             SRT / "hardware_backend/npu/memory_pool_npu.py",
             ["_init_npu_conv_state"],
             {"torch": torch},
         )["_init_npu_conv_state"]
-        p, d = MambaPool(5, 3, False), MambaPool(9, 6, True)
+        p, d = MambaPool(5, 3, False), MambaPool(9, 3 + draft_tokens - 1, True)
 
         def state(rows, draft_tokens):
             conv = conv_init(
@@ -1288,7 +1302,7 @@ class TestTorchPDState(unittest.TestCase):
                 temporal.transpose(-1, -2) if draft_tokens is not None else temporal,
             )
 
-        p.mamba_cache, d.mamba_cache = state(5, None), state(9, 4)
+        p.mamba_cache, d.mamba_cache = state(5, None), state(9, draft_tokens)
         self.assertNotEqual(
             p.get_contiguous_buf_infos()[2], d.get_contiguous_buf_infos()[2]
         )
@@ -1296,7 +1310,7 @@ class TestTorchPDState(unittest.TestCase):
             types.SimpleNamespace(mamba_pool=p),
             types.SimpleNamespace(mamba_pool=p),
             mode="prefill",
-            draft_tokens=4,
+            draft_tokens=draft_tokens,
         )
         self.assertEqual(
             p.get_contiguous_buf_infos()[2], d.get_contiguous_buf_infos()[2]

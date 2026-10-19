@@ -95,9 +95,13 @@ def glm53_pd_decode_prefix_profile(
             and getattr(cfg, "disaggregation_decode_retraction_backup", None)
             in (None, "cpu_tensor")
             and str(getattr(cfg, "speculative_algorithm", "")).upper() == "EAGLE"
-            and getattr(cfg, "speculative_num_steps", None) == 3
             and getattr(cfg, "speculative_eagle_topk", None) == 1
-            and getattr(cfg, "speculative_num_draft_tokens", None) == 4
+            # Verify scratch/conv windows follow draft_tokens; the persistent
+            # four-token KPool ring and 256-token sharing boundary do not.
+            and (
+                getattr(cfg, "speculative_num_steps", None),
+                getattr(cfg, "speculative_num_draft_tokens", None),
+            ) in ((3, 4), (4, 5))
         )
         else None
     )

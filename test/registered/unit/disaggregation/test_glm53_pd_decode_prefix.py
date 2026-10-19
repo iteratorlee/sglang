@@ -134,6 +134,50 @@ def target_cfg(**overrides):
 
 
 class ProfileTests(unittest.TestCase):
+    def test_draft5_preserves_only_the_supported_prefix_profiles(self):
+        topologies = (
+            {},
+            dict(tp_size=8, dp_size=4, ep_size=8),
+            dict(nnodes=2, moe_dp_size=1, dwdp_size=1, enable_prefill_cp=False),
+        )
+        with mock.patch.dict(os.environ, {"SGLANG_GLM53_2NODE_PD": "1"}):
+            for topology in topologies:
+                for steps, draft_tokens in ((3, 4), (4, 5)):
+                    cfg = target_cfg(
+                        **topology,
+                        speculative_num_steps=steps,
+                        speculative_num_draft_tokens=draft_tokens,
+                    )
+                    with self.subTest(topology=topology, steps=steps):
+                        profile = glm53_pd_decode_prefix_profile(cfg, target_model())
+                        self.assertIsNotNone(profile)
+                        self.assertEqual(profile.physical_page_size, 64)
+                        self.assertEqual(profile.prefix_share_page_size, 256)
+                        for change in (
+                            dict(speculative_eagle_topk=2),
+                            dict(page_size=128),
+                            dict(disaggregation_mode="prefill"),
+                            dict(attn_cp_size=8),
+                            dict(enable_hierarchical_cache=True),
+                        ):
+                            rejected = NS(**(vars(cfg) | change))
+                            self.assertIsNone(
+                                glm53_pd_decode_prefix_profile(rejected, target_model())
+                            )
+
+    def test_mtp_steps_and_capacity_are_an_explicit_pair(self):
+        for steps, draft_tokens in ((3, 5), (4, 4), (4, 6), (2, 3), (5, 6)):
+            with self.subTest(steps=steps, draft_tokens=draft_tokens):
+                self.assertIsNone(
+                    glm53_pd_decode_prefix_profile(
+                        target_cfg(
+                            speculative_num_steps=steps,
+                            speculative_num_draft_tokens=draft_tokens,
+                        ),
+                        target_model(),
+                    )
+                )
+
     def test_exact_supported_profile(self):
         for topology in ({}, {"tp_size": 8, "dp_size": 4, "ep_size": 8}):
             with self.subTest(topology=topology):
