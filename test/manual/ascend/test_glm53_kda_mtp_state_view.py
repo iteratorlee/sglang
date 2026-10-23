@@ -5,6 +5,7 @@ The target model is not needed. This exercises the same recurrent kernel and
 speculative state mover as serving.
 """
 
+import argparse
 import json
 from types import SimpleNamespace
 
@@ -26,9 +27,13 @@ def max_error(left, right):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--heads", type=int, default=4, choices=(4, 8, 16, 32, 64))
+    parser.add_argument("--steps", type=int, default=4, choices=(1, 4, 5))
+    args = parser.parse_args()
     torch.npu.set_device(0)
     torch.manual_seed(17)
-    dev, heads, dim = "npu:0", 4, 128
+    dev, heads, dim = "npu:0", args.heads, 128
     layer = SimpleNamespace(
         num_v_heads=heads,
         head_k_dim=dim,
@@ -69,22 +74,24 @@ def main():
     # A verify writes its accepted states to scratch. Commit must use the
     # physical destination view, otherwise the next recurrent call reads a
     # transposed matrix although the immediate verify output may look right.
-    verify_input = inputs(4)
+    verify_input = inputs(args.steps)
     baseline.zero_()
     speculative.zero_()
     ref = run(baseline, verify_input)
-    scratch = torch.zeros((1, 1, 4, heads, dim, dim), dtype=torch.float32, device=dev)
+    scratch = torch.zeros((1, 1, args.steps, heads, dim, dim), dtype=torch.float32, device=dev)
     got = run(speculative, verify_input, intermediate=scratch[0])
     move_intermediate_cache_kda(
         speculative.unsqueeze(0).transpose(-1, -2), scratch,
         torch.tensor([1], dtype=torch.int32, device=dev),
         torch.tensor([0], dtype=torch.int32, device=dev),
-        torch.tensor([3], dtype=torch.int32, device=dev),
+        torch.tensor([args.steps - 1], dtype=torch.int32, device=dev),
         h_block_size=1,
     )
     verify_error = max_error(ref, got)
     commit_error = max_error(baseline.transpose(-1, -2), speculative)
     result = {
+        "heads": heads,
+        "steps": args.steps,
         "prefill_output_max_abs": prefill_errors,
         "prefill_state_max_abs": state_error,
         "verify_output_max_abs": verify_error,

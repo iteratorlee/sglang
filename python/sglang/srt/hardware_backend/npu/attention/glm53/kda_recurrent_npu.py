@@ -310,6 +310,31 @@ def glm_kda_varlen_recurrent_npu(
         ):
             raise ValueError("Invalid GLM KDA per-token intermediate state layout")
     q, k, v, a, b = (t.contiguous() for t in (q, k, v, a, b))
+    # All original validation above runs before either implementation. Select
+    # here so prepared P prefill cannot silently bypass the opt-in varlen op.
+    if os.getenv("SGLANG_GLM53_KDA_VARLEN_ASCENDC", "0") == "1":
+        from .kda_varlen_ascendc import try_run
+
+        result = try_run(
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=initial_state_source,
+            initial_state_indices=initial_state_indices,
+            cu_seqlens=cu_seqlens,
+            lower_bound=lower_bound,
+            scale=scale,
+            intermediate_state=intermediate_state,
+            prefill=prefill,
+            track_state_indices=track_state_indices,
+            track_state_lens=track_state_lens,
+        )
+        if result is not None:
+            return result
     output = torch.zeros_like(v)
     block_value_count = triton.cdiv(value_dim, block_v)
     # CANN9 reduces along the contiguous key axis of a [BV,BK] tile.
