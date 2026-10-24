@@ -4,6 +4,7 @@ import logging
 from array import array
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.mamba_branch_prefill import branch_checkpoint_chunk_limit
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -578,6 +579,7 @@ class PrefillAdder:
         self.can_run_list = []
         self.preempt_list = []
         self.new_chunked_req = None
+        self._mamba_branch_chunk_pending = False
         self.log_hit_tokens = 0
         self.reprocessed_log_hit_tokens = 0
         self.log_device_hit_tokens = 0
@@ -1091,10 +1093,18 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
+        branch_limit = None
+        if self.dllm_config is None:
+            branch_limit = branch_checkpoint_chunk_limit(
+                self.tree_cache, req, _rem_tokens, physical_page_size=self.page_size
+            )
+            if branch_limit is not None:
+                _rem_tokens = branch_limit
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
         self.can_run_list.append(req)
+        self._mamba_branch_chunk_pending = branch_limit is not None
         self._update_prefill_budget(
             0,
             req.extend_range.length,
@@ -1266,6 +1276,11 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
+        # A forced short chunk leaves budget available, but the scheduler has
+        # only one chunked_req owner. End admission for this pass so a second
+        # request cannot replace that owner; charge only tokens actually run.
+        if self._mamba_branch_chunk_pending:
+            return AddReqResult.OTHER
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
             return AddReqResult.OTHER
 
@@ -1399,6 +1414,20 @@ class PrefillAdder:
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
             )
 
+            branch_limit = None
+            if self.dllm_config is None and not has_chunked_req:
+                # Host restoration must happen first: the loaded state may
+                # already cover the branch, in which case no split is needed.
+                branch_limit = branch_checkpoint_chunk_limit(
+                    self.tree_cache,
+                    req,
+                    chunk_tokens_limit,
+                    physical_page_size=self.page_size,
+                    truncation_align_size=truncation_align_size,
+                )
+                if branch_limit is not None:
+                    chunk_tokens_limit = branch_limit
+
             if (
                 self.rem_chunk_tokens is None
                 and len(self.can_run_list) != 0
@@ -1485,6 +1514,7 @@ class PrefillAdder:
 
                 self.can_run_list.append(req)
                 self.new_chunked_req = req
+                self._mamba_branch_chunk_pending = branch_limit is not None
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(
@@ -1496,6 +1526,8 @@ class PrefillAdder:
                 )
                 self._account_prefill_cache_admission(req, prefix_len)
 
+        if self._mamba_branch_chunk_pending:
+            return AddReqResult.OTHER
         return self.budget_state()
 
     def preempt_to_schedule(self, req: Req) -> bool:
