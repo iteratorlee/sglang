@@ -133,11 +133,22 @@ class ChatAffinityTokenizer:
             return {"supported": False, "reason": "invalid_request"}
         serving._normalize_reasoning_effort(request)
         is_multimodal = manager.model_config.is_multimodal
+        from sglang.srt.entrypoints.openai.glm53_chat_tokenization import (
+            Glm53ChatTokenizationGuard,
+        )
+
+        guard = Glm53ChatTokenizationGuard(serving, request, is_multimodal)
         processed = serving._process_messages(request, is_multimodal)
         if processed.image_data or processed.video_data or processed.audio_data:
             return {"supported": False, "reason": "media"}
+        reusable = guard.try_reuse(processed)
+        tokenization_path = "reference"
         if request.input_ids is not None:
             tokens = processed.prompt_ids
+            tokenization_path = "request_input_ids"
+        elif reusable is not None:
+            tokens = reusable
+            tokenization_path = "verified_render_ids"
         else:
             kind, prompt = serving._engine_prompt(processed, is_multimodal)
             if kind == "input_ids":
@@ -177,4 +188,5 @@ class ChatAffinityTokenizer:
             "model": manager.served_model_name,
             "model_path": manager.model_path,
             "weight_version": manager.config_value("weight_version"),
+            "tokenization_path": tokenization_path,
         }
