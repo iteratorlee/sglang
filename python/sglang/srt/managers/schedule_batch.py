@@ -2988,6 +2988,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         req.kv.mamba_next_track_idx
                     )
                 )
+            tail_track_seqlen = mamba_track_seqlen_aligned
             if req.mamba_branching_seqlen is not None:
                 # track branching point in this forward if the branching point
                 # is within the current extend batch.
@@ -3005,6 +3006,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
                     mamba_track_seqlen_aligned = req.mamba_branching_seqlen
             req.kv.mamba_last_track_seqlen = mamba_track_seqlen_aligned
+
+        if os.environ.get("SGLANG_MAMBA_RESTORE_TRACE") == "1":
+            from sglang.srt.mem_cache.mamba_restore_trace import trace_event
+
+            trace_event(
+                req,
+                "track",
+                prefix_depth=len(req.prefix_indices),
+                extend_start=req.extend_range.start,
+                extend_end=req.extend_range.end,
+                tail_candidate=tail_track_seqlen if mask else None,
+                branching=req.mamba_branching_seqlen,
+                last_track=req.kv.mamba_last_track_seqlen,
+                track_seqlen=mamba_track_seqlen,
+                track_mask=mask,
+                checkpoint_grid=checkpoint_grid,
+            )
 
         return _MambaRadixCacheV2TrackEntry(
             track_mask=mask,

@@ -46,6 +46,11 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.mamba_restore_trace import (
+    trace_enabled,
+    trace_event,
+    trace_insert,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -996,6 +1001,15 @@ class UnifiedRadixCache(BasePrefixCache):
             insert_params.value = values
             result = self.insert(insert_params)
 
+            trace_insert(
+                req,
+                result,
+                requested_depth=kv_len_to_handle,
+                actual_depth=page_aligned_len,
+                finished=True,
+                chunked=False,
+            )
+
             # Keep the prompt as an independent radix node. Finished requests
             # append a short, request-specific output to a much longer prompt;
             # without this split the prompt and output form one leaf and are
@@ -1140,6 +1154,15 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params.key = radix_key
         insert_params.value = values
         result = self.insert(insert_params)
+
+        trace_insert(
+            req,
+            result,
+            requested_depth=len(token_ids),
+            actual_depth=page_aligned_len,
+            finished=False,
+            chunked=chunked,
+        )
 
         if result.rotation_tail_declined:
             # Rotation-base discontinuity with the matched chain (pipelined
@@ -3089,7 +3112,18 @@ class UnifiedRadixCache(BasePrefixCache):
                 and (req.swa_host_hit_length > 0 or req.mamba_host_hit_length > 0)
             )
         ):
-            if self.load_back(best_match_node_id, mem_quota, req=req):
+            loaded = self.load_back(best_match_node_id, mem_quota, req=req)
+            if trace_enabled(req):
+                trace_event(
+                    req,
+                    "load_back",
+                    node=best_match_node_id,
+                    device_depth=len(req.prefix_indices),
+                    host_depth=params.host_hit_length,
+                    mamba_host_hit=req.mamba_host_hit_length,
+                    scheduled=bool(loaded),
+                )
+            if loaded:
                 new_indices = self.tree_core.collect_full_device_indices(
                     best_match_node_id, last_best_match_device_node_id
                 )

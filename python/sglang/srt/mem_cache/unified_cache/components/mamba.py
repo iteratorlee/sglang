@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.mamba_restore_trace import trace_enabled, trace_event
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     FreeComponentHostSlot,
@@ -182,6 +183,25 @@ class MambaComponent(TreeComponent):
                 mamba_host_hit_length=max(result.mamba_host_hit_length, 1)
             )
 
+        if trace_enabled(params.req):
+            cd = last_node.component_data[self.component_type]
+            trace_event(
+                params.req,
+                "match",
+                query_depth=len(params.key),
+                full_kv_depth=result.full_kv_hit_length,
+                best_mamba_depth=mamba_boundary_len,
+                device_depth=len(result.device_indices),
+                host_depth=result.host_hit_length,
+                mamba_host_hit=result.mamba_host_hit_length,
+                mamba_device=cd.value is not None and mamba_boundary_len > 0,
+                mamba_host=cd.host_value is not None and mamba_boundary_len > 0,
+                branching=branching_seqlen,
+                last_track=params.req.kv.mamba_last_track_seqlen,
+                node=last_node.id,
+                checkpoint_grid=self.mamba_checkpoint_grid,
+                cow=params.cow_mamba,
+            )
         return result._replace(mamba_branching_seqlen=branching_seqlen)
 
     def finalize_match_result_in_cache(
