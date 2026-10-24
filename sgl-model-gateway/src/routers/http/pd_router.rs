@@ -68,6 +68,8 @@ pub struct PDRouter {
     pd_token_affinity: bool,
     chat_affinity: Option<ChatAffinity>,
     pd_prefill_stage_reservation: bool,
+    pd_chat_early_stream: bool,
+    pd_chat_early_stream_timeout: std::time::Duration,
     pd_decode_inflight_cap: usize,
     load_snapshots: watch::Receiver<HashMap<String, DPLoadSnapshot>>,
     reservations: Arc<PDReservationTable>,
@@ -192,6 +194,96 @@ impl PDReservationTable {
 
 const PD_DECODE_INFLIGHT_CAP_ENV: &str = "SGLANG_GATEWAY_PD_DECODE_INFLIGHT_CAP";
 const PD_PREFILL_STAGE_RESERVATION_ENV: &str = "SGLANG_GATEWAY_PD_PREFILL_STAGE_RESERVATION";
+const PD_CHAT_EARLY_STREAM_ENV: &str = "SGLANG_GATEWAY_PD_CHAT_EARLY_STREAM";
+const EARLY_STREAM_MAX_EVENT_BYTES: usize = 1024 * 1024;
+
+// A response body owns the driver, including both upstreams. Dropping the
+// response must also cancel a driver currently waiting for P or backpressure.
+struct AbortStreamOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortStreamOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+enum EarlyPrefillFailure {
+    Response(Response),
+    // Report the failed status immediately so D can be cancelled before the
+    // error body is read. Keep P's stage alive through that read as usual.
+    Http(reqwest::Response, PrefillStage),
+}
+
+impl EarlyPrefillFailure {
+    async fn into_response(self) -> Response {
+        match self {
+            Self::Response(response) => response,
+            Self::Http(response, _stage) => {
+                let url = response.url().to_string();
+                PDRouter::process_prefill_response(Ok(response), &url, false)
+                    .await
+                    .expect_err("non-success prefill status")
+            }
+        }
+    }
+}
+
+// Retain only one event (plus the current transport chunk). In particular a
+// coalesced data + [DONE] chunk must not hide data behind the pending P ack.
+fn early_sse_events(
+    stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+) -> impl futures_util::Stream<Item = Result<bytes::Bytes, String>> + Send {
+    futures_util::stream::try_unfold(
+        (Box::pin(stream), bytes::Bytes::new(), Vec::new()),
+        |(mut stream, mut chunk, mut event)| async move {
+            loop {
+                if chunk.is_empty() {
+                    match stream.next().await {
+                        Some(Ok(next)) => chunk = next,
+                        Some(Err(e)) => return Err(e.to_string()),
+                        None if event.is_empty() => return Ok(None),
+                        None => return Err("Incomplete upstream SSE event".to_string()),
+                    }
+                }
+                while !chunk.is_empty() {
+                    let take = chunk
+                        .iter()
+                        .position(|&b| b == b'\n')
+                        .map_or(chunk.len(), |i| i + 1);
+                    if event.len().saturating_add(take) > EARLY_STREAM_MAX_EVENT_BYTES {
+                        return Err("Upstream SSE event exceeds 1 MiB".to_string());
+                    }
+                    event.extend_from_slice(&chunk.split_to(take));
+                    if event.ends_with(b"\n\n") || event.ends_with(b"\n\r\n") {
+                        let bytes = bytes::Bytes::from(std::mem::take(&mut event));
+                        return Ok(Some((bytes, (stream, chunk, event))));
+                    }
+                }
+            }
+        },
+    )
+}
+
+fn early_sse_error(event: &[u8]) -> Result<bool, String> {
+    let text = std::str::from_utf8(event).map_err(|e| e.to_string())?;
+    let mut data = Vec::new();
+    for line in text.lines() {
+        let (field, value) = line.split_once(':').unwrap_or((line, ""));
+        let value = value.strip_prefix(' ').unwrap_or(value);
+        if field == "event" && value == "error" {
+            return Ok(true);
+        }
+        if field == "data" {
+            data.push(value);
+        }
+    }
+    if data.is_empty() || data == ["[DONE]"] {
+        return Ok(false);
+    }
+    let value: Value = serde_json::from_str(&data.join("\n")).map_err(|e| e.to_string())?;
+    Ok(value.get("error").is_some_and(|e| !e.is_null())
+        || value.get("object").and_then(Value::as_str) == Some("error"))
+}
 
 fn prefill_stage_reservation_from_env() -> bool {
     prefill_stage_reservation_enabled(
@@ -383,6 +475,10 @@ impl PDRouter {
             pd_token_affinity: pd_token_affinity_enabled(),
             chat_affinity: pd_chat_token_affinity_enabled().then(ChatAffinity::default),
             pd_prefill_stage_reservation: prefill_stage_reservation_from_env(),
+            pd_chat_early_stream: std::env::var(PD_CHAT_EARLY_STREAM_ENV).as_deref() == Ok("1"),
+            pd_chat_early_stream_timeout: std::time::Duration::from_secs(
+                ctx.router_config.request_timeout_secs,
+            ),
             pd_decode_inflight_cap: decode_inflight_cap_from_env()?,
             load_snapshots,
             reservations: Arc::new(PDReservationTable::default()),
@@ -840,6 +936,7 @@ impl PDRouter {
                                 Arc::clone(&prefill),
                                 Arc::clone(&decode),
                                 prefill_stage,
+                                &mut reservations._decode,
                                 start_time,
                             )
                             .await;
@@ -1094,6 +1191,7 @@ impl PDRouter {
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
         prefill_stage: PrefillStage,
+        decode_reservation: &mut Option<PDReservationLease>,
         _start_time: Instant,
     ) -> Response {
         // P's guard and lease were acquired immediately after selection. They
@@ -1144,6 +1242,20 @@ impl PDRouter {
             decode_url: decode.url(),
         }
         .emit();
+
+        if self.use_chat_early_stream(&context, &json_request) {
+            return self
+                .dispatch_chat_early_stream(
+                    prefill_request,
+                    decode_request,
+                    &context,
+                    prefill,
+                    decode,
+                    prefill_stage,
+                    decode_reservation,
+                )
+                .await;
+        }
 
         let mut prefill_fut = Box::pin(prefill_request.send());
         let mut decode_fut = Box::pin(decode_request.send());
@@ -1203,16 +1315,14 @@ impl PDRouter {
             prefill.record_outcome(prefill_ok);
 
             // Status-faithful error shaping (including P's 500; transport -> 502).
-            let mut response = match self
-                .process_prefill_response(prefill_result, prefill.url(), false)
-                .await
-            {
-                Err(error_response) => error_response,
-                Ok(_) => error::bad_gateway(
-                    "prefill_server_error",
-                    "Prefill reported failure but returned a success response".to_string(),
-                ),
-            };
+            let mut response =
+                match Self::process_prefill_response(prefill_result, prefill.url(), false).await {
+                    Err(error_response) => error_response,
+                    Ok(_) => error::bad_gateway(
+                        "prefill_server_error",
+                        "Prefill reported failure but returned a success response".to_string(),
+                    ),
+                };
             response.extensions_mut().insert(BreakerOutcomesRecorded);
             return response;
         }
@@ -1228,7 +1338,7 @@ impl PDRouter {
             drop(prefill_result);
             None
         } else {
-            let prefill_body_fut = self.process_prefill_response(
+            let prefill_body_fut = Self::process_prefill_response(
                 prefill_result,
                 prefill.url(),
                 context.return_logprob,
@@ -1392,6 +1502,296 @@ impl PDRouter {
                 response
             }
         }
+    }
+
+    fn use_chat_early_stream(&self, context: &PDRequestContext<'_>, raw: &Value) -> bool {
+        self.pd_chat_early_stream
+            && context.route == "/v1/chat/completions"
+            && context.is_stream
+            && !context.return_logprob
+            // Raw extensions are preserved by the Chat route. Conservatively
+            // leave any prompt/output logprob request on the existing path.
+            && ["logprobs", "return_logprob", "prompt_logprobs", "top_logprobs"]
+                .iter()
+                .all(|key| raw.get(*key).is_none_or(|v| v.is_null() || v == &json!(false)))
+    }
+
+    async fn consume_early_prefill(response: reqwest::Response) -> Result<(), String> {
+        let is_sse = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("text/event-stream"));
+        if is_sse {
+            let events = early_sse_events(response.bytes_stream());
+            tokio::pin!(events);
+            let mut done = false;
+            while let Some(event) = events.next().await {
+                let event = event?;
+                if early_sse_error(&event)? {
+                    return Err(String::from_utf8_lossy(&event).into_owned());
+                }
+                done |= SseDoneDetector::default().feed(&event);
+            }
+            if !done {
+                return Err("Prefill SSE ended without [DONE]".to_string());
+            }
+        } else {
+            let mut stream = response.bytes_stream();
+            let mut body = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| e.to_string())?;
+                if body.len().saturating_add(chunk.len()) > EARLY_STREAM_MAX_EVENT_BYTES {
+                    return Err("Prefill acknowledgement exceeds 1 MiB".to_string());
+                }
+                body.extend_from_slice(&chunk);
+            }
+            if serde_json::from_slice::<Value>(&body)
+                .ok()
+                .is_some_and(|v| {
+                    v.get("error").is_some_and(|e| !e.is_null()) || v["object"] == "error"
+                })
+            {
+                return Err(String::from_utf8_lossy(&body).into_owned());
+            }
+        }
+        Ok(())
+    }
+
+    async fn drive_early_prefill(
+        request: reqwest::RequestBuilder,
+        worker: Arc<dyn Worker>,
+        stage: PrefillStage,
+    ) -> Result<(), EarlyPrefillFailure> {
+        let result = request.send().await;
+        match result {
+            Ok(response) if response.status().is_success() => {
+                let result = Self::consume_early_prefill(response).await;
+                worker.record_outcome(result.is_ok());
+                result.map_err(|message| {
+                    EarlyPrefillFailure::Response(error::bad_gateway(
+                        "prefill_stream_error",
+                        message,
+                    ))
+                })
+            }
+            Ok(response) => {
+                worker.record_outcome(response.status().is_client_error());
+                Err(EarlyPrefillFailure::Http(response, stage))
+            }
+            Err(e) => {
+                worker.record_outcome(false);
+                Self::process_prefill_response(Err(e), worker.url(), false)
+                    .await
+                    .map(|_| ())
+                    .map_err(EarlyPrefillFailure::Response)
+            }
+        }
+    }
+
+    // Once D headers have escaped, HTTP status/retry cannot express a late P
+    // failure. Preserve the gateway error object and add its status in-band.
+    async fn early_stream_error(response: Response) -> bytes::Bytes {
+        let status = response.status().as_u16();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        let mut payload: Value = serde_json::from_slice(&body)
+            .unwrap_or_else(|_| json!({"error":{"message":"PD stream failed"}}));
+        payload["error"]["status"] = json!(status);
+        bytes::Bytes::from(format!("data: {payload}\n\n"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_chat_early_stream(
+        &self,
+        prefill_request: reqwest::RequestBuilder,
+        decode_request: reqwest::RequestBuilder,
+        context: &PDRequestContext<'_>,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
+        prefill_stage: PrefillStage,
+        decode_reservation: &mut Option<PDReservationLease>,
+    ) -> Response {
+        // Reuse the configured request budget, starting before either send.
+        // Reqwest's body timeout alone cannot run while D is backpressured.
+        let deadline = tokio::time::Instant::now() + self.pd_chat_early_stream_timeout;
+        let mut prefill = Some(Box::pin(Self::drive_early_prefill(
+            prefill_request,
+            prefill,
+            prefill_stage,
+        )));
+        let mut decode_fut = Box::pin(decode_request.send());
+        let response = loop {
+            tokio::select! {
+                biased;
+                result = async { prefill.as_mut().unwrap().await }, if prefill.is_some() => {
+                    prefill = None;
+                    if let Err(failure) = result {
+                        drop(decode_fut);
+                        let mut response = failure.into_response().await;
+                        response.extensions_mut().insert(BreakerOutcomesRecorded);
+                        return response;
+                    }
+                }
+                result = &mut decode_fut => {
+                    match result {
+                        Ok(response) if response.status().is_success() => break response,
+                        result => {
+                            drop(prefill);
+                            return self.handle_decode_before_prefill(result, context, decode).await;
+                        }
+                    }
+                }
+            }
+        };
+        events::RequestReceivedEvent {}.emit();
+        let status = response.status();
+        let mut headers = header_utils::preserve_response_headers(response.headers());
+        // A late error can replace the tail, so an upstream fixed length is
+        // no longer a valid downstream promise.
+        headers.remove(axum::http::header::CONTENT_LENGTH);
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        let guard = WorkerLoadGuard::new(Arc::clone(&decode), Some(&headers));
+        let tracked = BreakerTrackedStream::new(
+            early_sse_events(response.bytes_stream()),
+            Arc::clone(&decode),
+            decode.url().to_string(),
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel::<(bytes::Bytes, bool)>(1);
+        // A timeout must bypass a full output queue, including a queued DONE.
+        let (timeout_tx, timeout_rx) = tokio::sync::oneshot::channel();
+        // On this path the driver must release D even if the body is never
+        // polled/dropped. Legacy paths keep their response-owned reservation.
+        let resources = (guard, decode_reservation.take());
+        let driver = tokio::spawn(async move {
+            let resources = resources;
+            let drive = async {
+                let mut prefill = prefill;
+                let mut decode = Some(tracked);
+                let mut pending = None;
+                let mut done = None;
+                let mut terminal = false;
+                loop {
+                    if prefill.is_none() && done.is_some() {
+                        pending = done.take();
+                        terminal = true;
+                    }
+                    tokio::select! {
+                        biased;
+                        result = async { prefill.as_mut().unwrap().await }, if prefill.is_some() => {
+                            prefill = None;
+                            if let Err(failure) = result {
+                                // Cancel D before waiting for downstream capacity.
+                                drop(decode.take());
+                                pending = Some(Self::early_stream_error(failure.into_response().await).await);
+                                done = None;
+                                terminal = true;
+                            }
+                        }
+                        permit = tx.reserve(), if pending.is_some() => {
+                            let Ok(permit) = permit else { break };
+                            permit.send((pending.take().unwrap(), terminal));
+                            if terminal {
+                                // Keep D's load/lease until the terminal event is
+                                // consumed, cancellation, or the independent deadline.
+                                let _ = tx.reserve().await;
+                                break;
+                            }
+                        }
+                        event = async { decode.as_mut().unwrap().next().await },
+                            if decode.is_some() && pending.is_none() => {
+                            let event = match event {
+                                Some(Ok(event)) => match early_sse_error(&event) {
+                                    Ok(is_error) => {
+                                        if is_error {
+                                            decode.as_mut().unwrap().mark_errored();
+                                            drop(decode.take());
+                                            drop(prefill.take());
+                                            terminal = true;
+                                        } else if SseDoneDetector::default().feed(&event) {
+                                            decode.as_mut().unwrap().mark_completed();
+                                            drop(decode.take());
+                                            done = Some(event);
+                                            continue;
+                                        }
+                                        Ok(event)
+                                    }
+                                    Err(e) => Err(e),
+                                },
+                                Some(Err(e)) => Err(e),
+                                None => Err("Decode SSE ended without [DONE]".to_string()),
+                            };
+                            pending = Some(match event {
+                                Ok(event) => event,
+                                Err(message) => {
+                                    decode.as_mut().unwrap().mark_errored();
+                                    drop(decode.take());
+                                    drop(prefill.take());
+                                    terminal = true;
+                                    Self::early_stream_error(error::bad_gateway("decode_stream_error", message)).await
+                                }
+                            });
+                        }
+                    }
+                }
+            };
+            let timed_out = {
+                tokio::pin!(drive);
+                tokio::select! {
+                    biased;
+                    _ = tx.closed() => false,
+                    _ = tokio::time::sleep_until(deadline) => true,
+                    _ = &mut drive => false,
+                }
+                // Dropping drive cancels both upstreams, including a stalled
+                // P error-body read inside a select branch, before notification.
+            };
+            drop(resources);
+            if timed_out {
+                let payload = json!({"error": {
+                    "type": "Gateway Timeout",
+                    "code": "pd_stream_timeout",
+                    "message": "PD stream exceeded the configured request timeout",
+                    "status": StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                }});
+                let event = bytes::Bytes::from(format!("data: {payload}\n\n"));
+                // Single-slot notification never waits for downstream capacity.
+                let _ = timeout_tx.send(event);
+            }
+        });
+        let stream = futures_util::stream::unfold(
+            (rx, Some(timeout_rx), false),
+            |(mut rx, mut timeout, terminal)| async move {
+                if terminal {
+                    return None;
+                }
+                loop {
+                    tokio::select! {
+                        biased;
+                        result = async { timeout.as_mut().unwrap().await }, if timeout.is_some() => {
+                            timeout = None;
+                            if let Ok(event) = result {
+                                // Discard buffered data/DONE after timeout. Once
+                                // a terminal event was consumed, never append an error.
+                                rx.close();
+                                return Some((Ok::<_, String>(event), (rx, timeout, true)));
+                            }
+                        }
+                        event = rx.recv() => {
+                            return event.map(|(event, terminal)| (Ok(event), (rx, timeout, terminal)));
+                        }
+                    }
+                }
+            },
+        );
+        let mut response = Response::new(Body::from_stream(stream));
+        *response.status_mut() = status;
+        *response.headers_mut() = headers;
+        // Outcomes are owned by P's future and D's tracked stream, including
+        // cancellation (neither is optimistically successful on headers).
+        response.extensions_mut().insert(BreakerOutcomesRecorded);
+        crate::core::AttachedBody::wrap_response(response, AbortStreamOnDrop(driver.abort_handle()))
     }
 
     fn policies_need_request_text(&self) -> bool {
@@ -1811,7 +2211,6 @@ impl PDRouter {
 
     // Helper to process prefill response and extract body if needed for logprobs
     async fn process_prefill_response(
-        &self,
         prefill_result: Result<reqwest::Response, reqwest::Error>,
         prefill_url: &str,
         return_logprob: bool,
@@ -2566,6 +2965,728 @@ mod tests {
         );
     }
 
+    // Raw HTTP mocks expose connection closure even before response headers;
+    // an axum handler blocked on a latch need not be dropped on disconnect.
+    struct EarlyChatMock {
+        url: String,
+        entered: tokio::sync::oneshot::Receiver<()>,
+        headers: Option<tokio::sync::oneshot::Sender<()>>,
+        body: tokio::sync::mpsc::UnboundedSender<Result<Option<bytes::Bytes>, ()>>,
+        closed: tokio::sync::oneshot::Receiver<()>,
+        _abort: AbortStreamOnDrop,
+    }
+
+    impl EarlyChatMock {
+        fn headers(&mut self) {
+            self.headers.take().unwrap().send(()).unwrap();
+        }
+
+        fn data(&self, data: impl Into<bytes::Bytes>) {
+            self.body.send(Ok(Some(data.into()))).unwrap();
+        }
+
+        fn end(&self) {
+            self.body.send(Ok(None)).unwrap();
+        }
+    }
+
+    async fn early_chat_mock(status: StatusCode, sse: bool) -> EarlyChatMock {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (entered_tx, entered) = tokio::sync::oneshot::channel();
+        let (headers, headers_rx) = tokio::sync::oneshot::channel();
+        let (body, mut body_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<Option<bytes::Bytes>, ()>>();
+        let (closed_tx, closed) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let run = async {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0; 4096];
+                loop {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&request[..end]);
+                        assert!(head.starts_with("POST /v1/chat/completions "));
+                        let len: usize = head
+                            .lines()
+                            .find_map(|line| {
+                                let (key, value) = line.split_once(':')?;
+                                key.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse().unwrap())
+                            })
+                            .unwrap();
+                        if request.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let _ = entered_tx.send(());
+                let (mut read, mut write) = socket.into_split();
+                tokio::select! {
+                    _ = headers_rx => {},
+                    _ = read.read(&mut buf) => return,
+                }
+                let content_type = if sse {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                };
+                let head = format!("HTTP/1.1 {} {}\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n", status.as_u16(), status.canonical_reason().unwrap());
+                if write.write_all(head.as_bytes()).await.is_err() {
+                    return;
+                }
+                loop {
+                    tokio::select! {
+                        _ = read.read(&mut buf) => return,
+                        chunk = body_rx.recv() => match chunk {
+                            Some(Ok(Some(chunk))) => {
+                                let head = format!("{:x}\r\n", chunk.len());
+                                if write.write_all(head.as_bytes()).await.is_err()
+                                    || write.write_all(&chunk).await.is_err()
+                                    || write.write_all(b"\r\n").await.is_err() { return; }
+                            }
+                            Some(Ok(None)) => {
+                                let _ = write.write_all(b"0\r\n\r\n").await;
+                                return;
+                            }
+                            _ => return, // Deliberately truncate the chunked body.
+                        },
+                    }
+                }
+            };
+            run.await;
+            let _ = closed_tx.send(());
+        });
+        EarlyChatMock {
+            url,
+            entered,
+            headers: Some(headers),
+            body,
+            closed,
+            _abort: AbortStreamOnDrop(task.abort_handle()),
+        }
+    }
+
+    async fn early_wait<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(std::time::Duration::from_secs(3), future)
+            .await
+            .expect("early stream operation stalled")
+    }
+
+    async fn early_load_zero(worker: &Arc<dyn Worker>) {
+        early_wait(async {
+            while worker.load() != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+    }
+
+    fn start_early_chat(
+        p: &EarlyChatMock,
+        d: &EarlyChatMock,
+        enabled: bool,
+    ) -> (
+        Arc<PDRouter>,
+        Arc<dyn Worker>,
+        Arc<dyn Worker>,
+        tokio::task::JoinHandle<Response>,
+    ) {
+        start_early_chat_with_timeout(p, d, enabled, std::time::Duration::from_secs(7200))
+    }
+
+    fn start_early_chat_with_timeout(
+        p: &EarlyChatMock,
+        d: &EarlyChatMock,
+        enabled: bool,
+        timeout: std::time::Duration,
+    ) -> (
+        Arc<PDRouter>,
+        Arc<dyn Worker>,
+        Arc<dyn Worker>,
+        tokio::task::JoinHandle<Response>,
+    ) {
+        let mut router = create_test_pd_router();
+        router.pd_chat_early_stream = enabled;
+        router.pd_chat_early_stream_timeout = timeout;
+        router.pd_token_affinity = true;
+        router.pd_prefill_stage_reservation = true;
+        router.retry_config.max_retries = 1;
+        let (prefill, decode) = register_pd_workers(&router, p.url.clone(), d.url.clone());
+        let router = Arc::new(router);
+        let task_router = Arc::clone(&router);
+        let request = tokio::spawn(async move {
+            let raw = json!({"model":"test-model", "messages":[{"role":"user","content":"hi"}], "stream":true});
+            let body = serde_json::from_value(raw.clone()).unwrap();
+            task_router.route_chat_raw(None, &body, &raw, None).await
+        });
+        (router, prefill, decode, request)
+    }
+
+    #[test]
+    fn test_chat_early_stream_scope_and_default() {
+        let mut router = create_test_pd_router();
+        let mut context = PDRequestContext {
+            route: "/v1/chat/completions",
+            batch_size: None,
+            is_stream: true,
+            return_logprob: false,
+            request_text: None,
+            tokens: None,
+            estimated_tokens: 0,
+            prefill_tokens: 1,
+            model_id: None,
+            headers: None,
+        };
+        assert!(!router.use_chat_early_stream(&context, &json!({})));
+        router.pd_chat_early_stream = true;
+        assert!(router.use_chat_early_stream(&context, &json!({"logprobs":false})));
+        for route in ["/generate", "/v1/completions"] {
+            context.route = route;
+            assert!(!router.use_chat_early_stream(&context, &json!({})));
+        }
+        context.route = "/v1/chat/completions";
+        context.is_stream = false;
+        assert!(!router.use_chat_early_stream(&context, &json!({})));
+        context.is_stream = true;
+        context.return_logprob = true;
+        assert!(!router.use_chat_early_stream(&context, &json!({})));
+        context.return_logprob = false;
+        for raw in [
+            json!({"logprobs":true}),
+            json!({"return_logprob":true}),
+            json!({"prompt_logprobs":0}),
+            json!({"top_logprobs":1}),
+        ] {
+            assert!(!router.use_chat_early_stream(&context, &raw));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chat_early_stream_data_precedes_prefill_headers_and_body() {
+        use http_body_util::BodyExt;
+
+        for p_headers_first in [false, true] {
+            let mut p = early_chat_mock(StatusCode::OK, false).await;
+            let mut d = early_chat_mock(StatusCode::OK, true).await;
+            let (router, prefill, decode, request) = start_early_chat(&p, &d, true);
+            early_wait(&mut p.entered).await.unwrap();
+            early_wait(&mut d.entered).await.unwrap();
+            if p_headers_first {
+                p.headers();
+                p.data("{");
+            }
+            d.headers();
+            // The first data event and DONE share one HTTP transport chunk.
+            d.data("data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\ndata: [DONE]\n\n");
+            let response = early_wait(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut stream = response.into_body().into_data_stream();
+            let first = early_wait(stream.next()).await.unwrap().unwrap();
+            assert!(String::from_utf8_lossy(&first).contains("first"));
+            assert!(!String::from_utf8_lossy(&first).contains("[DONE]"));
+            assert_eq!(prefill.load(), 1);
+            assert_eq!(prefill.circuit_breaker().total_successes(), 0);
+            assert_eq!(router.reservations.views(&HashMap::new()).0.len(), 2);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(30), stream.next())
+                    .await
+                    .is_err()
+            );
+            if !p_headers_first {
+                p.headers();
+                p.data("{");
+            }
+            p.data("}");
+            p.end();
+            early_load_zero(&prefill).await; // P stays driven without a downstream poll.
+            assert_eq!(prefill.circuit_breaker().total_successes(), 1);
+            assert_eq!(router.reservations.views(&HashMap::new()).0.len(), 1);
+            assert_eq!(
+                early_wait(stream.next()).await.unwrap().unwrap(),
+                "data: [DONE]\n\n"
+            );
+            assert!(early_wait(stream.next()).await.is_none());
+            drop(stream);
+            early_wait(&mut d.closed).await.unwrap();
+            assert_eq!(decode.circuit_breaker().total_successes(), 1);
+            early_load_zero(&decode).await;
+            assert_eq!(decode.load(), 0);
+            assert!(router.reservations.views(&HashMap::new()).0.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chat_early_stream_disabled_still_waits_for_prefill() {
+        let mut p = early_chat_mock(StatusCode::OK, false).await;
+        let mut d = early_chat_mock(StatusCode::OK, true).await;
+        let (router, prefill, _, mut request) = start_early_chat(&p, &d, false);
+        early_wait(&mut p.entered).await.unwrap();
+        early_wait(&mut d.entered).await.unwrap();
+        d.headers();
+        d.data("data: {\"choices\":[]}\n\ndata: [DONE]\n\n");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut request)
+                .await
+                .is_err()
+        );
+        assert_eq!(prefill.load(), 1);
+        p.headers();
+        p.data("{}");
+        p.end();
+        let response = early_wait(request).await.unwrap();
+        early_wait(axum::body::to_bytes(response.into_body(), 4096))
+            .await
+            .unwrap();
+        assert!(router.reservations.views(&HashMap::new()).0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_chat_early_stream_preheader_errors_preserve_status_and_attribution() {
+        for p_fails in [true, false] {
+            for status in [StatusCode::BAD_REQUEST, StatusCode::INTERNAL_SERVER_ERROR] {
+                let mut p =
+                    early_chat_mock(if p_fails { status } else { StatusCode::OK }, false).await;
+                let mut d =
+                    early_chat_mock(if p_fails { StatusCode::OK } else { status }, true).await;
+                let (router, prefill, decode, request) = start_early_chat(&p, &d, true);
+                early_wait(&mut p.entered).await.unwrap();
+                early_wait(&mut d.entered).await.unwrap();
+                let failed = if p_fails { &mut p } else { &mut d };
+                failed.headers();
+                failed.data("backend failed");
+                failed.end();
+                let response = early_wait(request).await.unwrap();
+                assert_eq!(response.status(), status);
+                early_wait(axum::body::to_bytes(response.into_body(), 4096))
+                    .await
+                    .unwrap();
+                let cancelled = if p_fails { &mut d } else { &mut p };
+                early_wait(&mut cancelled.closed).await.unwrap();
+                early_load_zero(&prefill).await;
+                let (failed, cancelled) = if p_fails {
+                    (&prefill, &decode)
+                } else {
+                    (&decode, &prefill)
+                };
+                assert_eq!(
+                    failed.circuit_breaker().total_successes(),
+                    u64::from(status.is_client_error())
+                );
+                assert_eq!(
+                    failed.circuit_breaker().total_failures(),
+                    u64::from(status.is_server_error())
+                );
+                assert_eq!(cancelled.circuit_breaker().total_successes(), 0);
+                assert_eq!(cancelled.circuit_breaker().total_failures(), 0);
+                assert!(router.reservations.views(&HashMap::new()).0.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chat_early_stream_late_prefill_failures_no_done_or_retry() {
+        use http_body_util::BodyExt;
+
+        // HTTP 500/400, truncated body, and HTTP-200 SSE error (split frames).
+        for failure in 0..4 {
+            let status = match failure {
+                0 => StatusCode::INTERNAL_SERVER_ERROR,
+                1 => StatusCode::BAD_REQUEST,
+                _ => StatusCode::OK,
+            };
+            let mut p = early_chat_mock(status, failure == 3).await;
+            let mut d = early_chat_mock(StatusCode::OK, true).await;
+            let (router, prefill, decode, request) = start_early_chat(&p, &d, true);
+            early_wait(&mut p.entered).await.unwrap();
+            early_wait(&mut d.entered).await.unwrap();
+            d.headers();
+            d.data("data: {\"choices\":[]}\n\n");
+            if failure == 3 {
+                d.data("data: [DONE]\n\n");
+            }
+            let response = early_wait(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut stream = response.into_body().into_data_stream();
+            early_wait(stream.next()).await.unwrap().unwrap();
+            p.headers();
+            match failure {
+                0 | 1 => {
+                    p.data("prefill failed");
+                    // Status alone must cancel D; P's error body is still open.
+                    early_wait(&mut d.closed).await.unwrap();
+                    assert_eq!(prefill.load(), 1);
+                    p.end();
+                }
+                2 => {
+                    p.data("{");
+                    p.body.send(Err(())).unwrap();
+                }
+                _ => {
+                    p.data("data: {\"err");
+                    p.data("or\":{\"message\":\"late P\"}}\n\n");
+                }
+            }
+            let event = early_wait(stream.next()).await.unwrap().unwrap();
+            let text = std::str::from_utf8(&event).unwrap();
+            let payload: Value =
+                serde_json::from_str(text.trim().strip_prefix("data: ").unwrap()).unwrap();
+            assert_eq!(
+                payload["error"]["status"],
+                if failure < 2 { status.as_u16() } else { 502 }
+            );
+            assert!(!text.contains("[DONE]"));
+            assert!(early_wait(stream.next()).await.is_none());
+            drop(stream);
+            if failure >= 2 {
+                early_wait(&mut d.closed).await.unwrap();
+            }
+            early_load_zero(&prefill).await;
+            early_load_zero(&decode).await;
+            assert_eq!(
+                prefill.circuit_breaker().total_failures(),
+                u64::from(failure != 1)
+            );
+            assert_eq!(
+                prefill.circuit_breaker().total_successes(),
+                u64::from(failure == 1)
+            );
+            assert_eq!(decode.circuit_breaker().total_failures(), 0);
+            assert!(router.reservations.views(&HashMap::new()).0.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chat_early_stream_client_cancel_aborts_both_connections() {
+        use http_body_util::BodyExt;
+
+        for cancel_at in 0..4 {
+            let mut p = early_chat_mock(
+                if cancel_at == 3 {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                } else {
+                    StatusCode::OK
+                },
+                false,
+            )
+            .await;
+            let mut d = early_chat_mock(StatusCode::OK, true).await;
+            let (router, prefill, decode, request) = start_early_chat(&p, &d, true);
+            early_wait(&mut p.entered).await.unwrap();
+            early_wait(&mut d.entered).await.unwrap();
+            if cancel_at == 0 {
+                request.abort();
+                assert!(early_wait(request).await.unwrap_err().is_cancelled());
+            } else {
+                if cancel_at == 2 {
+                    p.headers();
+                    p.data("{");
+                }
+                d.headers();
+                d.data("data: {\"choices\":[]}\n\n");
+                let response = early_wait(request).await.unwrap();
+                if cancel_at == 1 {
+                    drop(response);
+                } else {
+                    let mut stream = response.into_body().into_data_stream();
+                    early_wait(stream.next()).await.unwrap().unwrap();
+                    if cancel_at == 3 {
+                        p.headers(); // Leave the HTTP error body pending indefinitely.
+                        early_wait(&mut d.closed).await.unwrap();
+                        assert_eq!(prefill.load(), 1);
+                    }
+                    drop(stream);
+                }
+            }
+            early_wait(&mut p.closed).await.unwrap();
+            if cancel_at != 3 {
+                early_wait(&mut d.closed).await.unwrap();
+            }
+            early_load_zero(&prefill).await;
+            early_load_zero(&decode).await;
+            assert_eq!(decode.load(), 0);
+            assert!(router.reservations.views(&HashMap::new()).0.is_empty());
+            for worker in [&prefill, &decode] {
+                assert_eq!(worker.circuit_breaker().total_successes(), 0);
+                assert_eq!(
+                    worker.circuit_breaker().total_failures(),
+                    u64::from(cancel_at == 3 && worker.url() == prefill.url())
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chat_early_stream_decode_failures_cancel_pending_prefill() {
+        use http_body_util::BodyExt;
+
+        for failure in 0..3 {
+            let mut p = early_chat_mock(StatusCode::OK, false).await;
+            let mut d = early_chat_mock(StatusCode::OK, true).await;
+            let (router, prefill, decode, request) = start_early_chat(&p, &d, true);
+            early_wait(&mut p.entered).await.unwrap();
+            early_wait(&mut d.entered).await.unwrap();
+            d.headers();
+            d.data("data: {\"choices\":[]}\n\n");
+            let mut stream = early_wait(request)
+                .await
+                .unwrap()
+                .into_body()
+                .into_data_stream();
+            early_wait(stream.next()).await.unwrap().unwrap();
+            match failure {
+                0 => {
+                    d.data("data: {\"err");
+                    d.data("or\":{\"message\":\"D failed\"}}\n\n");
+                }
+                1 => {
+                    d.body.send(Err(())).unwrap();
+                }
+                _ => d.end(),
+            }
+            let event = early_wait(stream.next()).await.unwrap().unwrap();
+            assert!(early_sse_error(&event).unwrap());
+            assert!(early_wait(stream.next()).await.is_none());
+            drop(stream);
+            early_wait(&mut p.closed).await.unwrap();
+            early_load_zero(&prefill).await;
+            early_load_zero(&decode).await;
+            assert_eq!(decode.circuit_breaker().total_failures(), 1);
+            assert_eq!(decode.circuit_breaker().total_successes(), 0);
+            assert_eq!(prefill.circuit_breaker().total_failures(), 0);
+            assert_eq!(prefill.circuit_breaker().total_successes(), 0);
+            assert!(router.reservations.views(&HashMap::new()).0.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chat_early_stream_prefill_driven_under_backpressure() {
+        let mut p = early_chat_mock(StatusCode::OK, true).await;
+        let mut d = early_chat_mock(StatusCode::OK, true).await;
+        let (router, prefill, decode, request) = start_early_chat(&p, &d, true);
+        early_wait(&mut p.entered).await.unwrap();
+        early_wait(&mut d.entered).await.unwrap();
+        d.headers();
+        d.data("data: {\"choices\":[]}\n\n".repeat(32));
+        let response = early_wait(request).await.unwrap();
+        // Do not poll the returned body: the bounded D queue fills up.
+        p.headers();
+        p.data("data: {\"choices\":[]}\n\ndata: [DONE]\n\n");
+        p.end();
+        early_load_zero(&prefill).await;
+        assert_eq!(prefill.circuit_breaker().total_successes(), 1);
+        assert_eq!(router.reservations.views(&HashMap::new()).0.len(), 1);
+        drop(response);
+        early_wait(&mut d.closed).await.unwrap();
+        early_load_zero(&decode).await;
+        assert_eq!(decode.load(), 0);
+        assert!(router.reservations.views(&HashMap::new()).0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_chat_early_stream_deadline_releases_unconsumed_response() {
+        use http_body_util::BodyExt;
+        use std::time::Duration;
+
+        for prefill_done in [false, true] {
+            let mut p = early_chat_mock(StatusCode::OK, false).await;
+            let mut d = early_chat_mock(StatusCode::OK, true).await;
+            // The mock client's reqwest timeout is unset: only the driver can
+            // enforce this deadline while its bounded D queue is full.
+            let (router, prefill, decode, request) =
+                start_early_chat_with_timeout(&p, &d, true, Duration::from_millis(500));
+            early_wait(&mut p.entered).await.unwrap();
+            early_wait(&mut d.entered).await.unwrap();
+            p.headers();
+            p.data("{");
+            d.headers();
+            d.data("data: {\"choices\":[]}\n\n".repeat(32));
+            let response = early_wait(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            if prefill_done {
+                p.data("}");
+                p.end();
+                early_load_zero(&prefill).await;
+            }
+            assert_eq!(prefill.load(), usize::from(!prefill_done));
+            assert_eq!(decode.load(), 1);
+            assert_eq!(
+                router.reservations.views(&HashMap::new()).0.len(),
+                if prefill_done { 1 } else { 2 }
+            );
+
+            // Retain the response without polling OR dropping it. Both peer
+            // sockets and all leases must close before any downstream action.
+            early_wait(&mut d.closed).await.unwrap();
+            early_wait(&mut p.closed).await.unwrap();
+            early_load_zero(&prefill).await;
+            early_load_zero(&decode).await;
+            assert!(router.reservations.views(&HashMap::new()).0.is_empty());
+            assert_eq!(
+                prefill.circuit_breaker().total_successes(),
+                u64::from(prefill_done)
+            );
+            assert_eq!(prefill.circuit_breaker().total_failures(), 0);
+            assert_eq!(decode.circuit_breaker().total_successes(), 0);
+            assert_eq!(decode.circuit_breaker().total_failures(), 0);
+
+            let mut stream = response.into_body().into_data_stream();
+            let event = early_wait(stream.next()).await.unwrap().unwrap();
+            let text = std::str::from_utf8(&event).unwrap();
+            let payload: Value =
+                serde_json::from_str(text.trim().strip_prefix("data: ").unwrap()).unwrap();
+            assert_eq!(payload["error"]["code"], "pd_stream_timeout");
+            assert_eq!(payload["error"]["status"], 504);
+            assert!(!text.contains("[DONE]"));
+            assert!(early_wait(stream.next()).await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chat_early_stream_deadline_interrupts_prefill_error_body() {
+        use std::time::Duration;
+
+        let mut p = early_chat_mock(StatusCode::INTERNAL_SERVER_ERROR, false).await;
+        let mut d = early_chat_mock(StatusCode::OK, true).await;
+        let (router, prefill, decode, request) =
+            start_early_chat_with_timeout(&p, &d, true, Duration::from_millis(500));
+        early_wait(&mut p.entered).await.unwrap();
+        early_wait(&mut d.entered).await.unwrap();
+        d.headers();
+        d.data("data: {\"choices\":[]}\n\n".repeat(32));
+        let response = early_wait(request).await.unwrap();
+        p.headers(); // The non-2xx body never completes.
+        early_wait(&mut d.closed).await.unwrap();
+        assert_eq!(prefill.load(), 1);
+        early_wait(&mut p.closed).await.unwrap();
+        early_load_zero(&prefill).await;
+        early_load_zero(&decode).await;
+        assert!(router.reservations.views(&HashMap::new()).0.is_empty());
+        assert_eq!(prefill.circuit_breaker().total_failures(), 1);
+        assert_eq!(decode.circuit_breaker().total_failures(), 0);
+        let body = early_wait(axum::body::to_bytes(response.into_body(), 4096))
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("pd_stream_timeout"));
+        assert!(!text.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn test_chat_early_stream_deadline_discards_queued_done() {
+        use http_body_util::BodyExt;
+        use std::time::Duration;
+
+        let mut p = early_chat_mock(StatusCode::OK, false).await;
+        let mut d = early_chat_mock(StatusCode::OK, true).await;
+        let (router, prefill, decode, request) =
+            start_early_chat_with_timeout(&p, &d, true, Duration::from_millis(500));
+        early_wait(&mut p.entered).await.unwrap();
+        early_wait(&mut d.entered).await.unwrap();
+        p.headers();
+        p.data("{}");
+        p.end();
+        d.headers();
+        d.data("data: {\"choices\":[]}\n\ndata: [DONE]\n\n");
+        let mut stream = early_wait(request)
+            .await
+            .unwrap()
+            .into_body()
+            .into_data_stream();
+        let first = early_wait(stream.next()).await.unwrap().unwrap();
+        assert!(!SseDoneDetector::default().feed(&first));
+        early_load_zero(&prefill).await;
+        early_wait(&mut d.closed).await.unwrap();
+        assert_eq!(decode.circuit_breaker().total_successes(), 1);
+        assert_eq!(decode.load(), 1);
+        // DONE is queued, but the client stays connected without consuming it.
+        early_load_zero(&decode).await;
+        assert!(router.reservations.views(&HashMap::new()).0.is_empty());
+        let error = early_wait(stream.next()).await.unwrap().unwrap();
+        assert!(std::str::from_utf8(&error)
+            .unwrap()
+            .contains("pd_stream_timeout"));
+        assert!(!SseDoneDetector::default().feed(&error));
+        assert!(early_wait(stream.next()).await.is_none());
+        assert_eq!(decode.circuit_breaker().total_failures(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_chat_early_stream_consumed_done_has_no_late_timeout() {
+        use http_body_util::BodyExt;
+        use std::time::Duration;
+
+        let mut p = early_chat_mock(StatusCode::OK, false).await;
+        let mut d = early_chat_mock(StatusCode::OK, true).await;
+        let budget = Duration::from_millis(500);
+        let (router, prefill, decode, request) =
+            start_early_chat_with_timeout(&p, &d, true, budget);
+        early_wait(&mut p.entered).await.unwrap();
+        early_wait(&mut d.entered).await.unwrap();
+        p.headers();
+        p.data("{}");
+        p.end();
+        d.headers();
+        d.data("data: {\"choices\":[]}\n\ndata: [DONE]\n\n");
+        let mut stream = early_wait(request)
+            .await
+            .unwrap()
+            .into_body()
+            .into_data_stream();
+        assert_eq!(
+            early_wait(stream.next()).await.unwrap().unwrap(),
+            "data: {\"choices\":[]}\n\n"
+        );
+        assert_eq!(
+            early_wait(stream.next()).await.unwrap().unwrap(),
+            "data: [DONE]\n\n"
+        );
+        early_load_zero(&prefill).await;
+        early_load_zero(&decode).await;
+        assert!(router.reservations.views(&HashMap::new()).0.is_empty());
+        tokio::time::sleep(budget).await;
+        assert!(early_wait(stream.next()).await.is_none());
+        for worker in [&prefill, &decode] {
+            assert_eq!(worker.circuit_breaker().total_successes(), 1);
+            assert_eq!(worker.circuit_breaker().total_failures(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chat_early_stream_sse_framing_and_bounds() {
+        let input = b"data: {\"text\":\"data: [DONE]\"}\r\n\r\ndata:[DONE]\r\n\r\n";
+        for split in 0..=input.len() {
+            let chunks = [
+                bytes::Bytes::copy_from_slice(&input[..split]),
+                bytes::Bytes::copy_from_slice(&input[split..]),
+            ];
+            let events = early_sse_events(futures_util::stream::iter(chunks.map(Ok)));
+            tokio::pin!(events);
+            let data = events.next().await.unwrap().unwrap();
+            assert!(!SseDoneDetector::default().feed(&data));
+            assert!(!early_sse_error(&data).unwrap());
+            assert!(SseDoneDetector::default().feed(&events.next().await.unwrap().unwrap()));
+            assert!(events.next().await.is_none());
+        }
+        for input in [
+            bytes::Bytes::from_static(b"data: [DONE]\n"),
+            bytes::Bytes::from(vec![b'x'; EARLY_STREAM_MAX_EVENT_BYTES + 1]),
+        ] {
+            let events = early_sse_events(futures_util::stream::iter([Ok(input)]));
+            tokio::pin!(events);
+            assert!(events.next().await.unwrap().is_err());
+        }
+        assert!(early_sse_error(b"event: error\ndata: {}\n\n").unwrap());
+        assert!(early_sse_error(b"data: {\"error\":\n data:broken\n\n").is_err());
+    }
+
     async fn mock_worker(status: StatusCode, body: Body) -> String {
         use axum::routing::post;
 
@@ -2768,6 +3889,8 @@ mod tests {
             pd_token_affinity: false,
             chat_affinity: None,
             pd_prefill_stage_reservation: false,
+            pd_chat_early_stream: false,
+            pd_chat_early_stream_timeout: std::time::Duration::from_secs(7200),
             pd_decode_inflight_cap: 2,
             load_snapshots,
             reservations: Arc::new(PDReservationTable::default()),
