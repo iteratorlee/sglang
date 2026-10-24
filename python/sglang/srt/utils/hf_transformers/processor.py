@@ -208,6 +208,52 @@ def _build_processor_manually(
     return proc_cls(**init_kwargs)
 
 
+def _build_glm5_next_processor(
+    model_path,
+    tokenizer_name,
+    args,
+    config,
+    trust_remote_code,
+    revision,
+    backend,
+    kwargs,
+):
+    from sglang.srt.multimodal.glm5_next.processing_glm5_next import Glm5NextProcessor
+
+    logger.warning(
+        "AutoProcessor did not load GLM5Next multimodal processing for %s; "
+        "using SGLang's Hugging Face compatibility processor",
+        model_path,
+    )
+    processor = Glm5NextProcessor.from_pretrained(
+        model_path,
+        *args,
+        tokenizer_name=tokenizer_name,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+        image_processor_backend=backend,
+        **kwargs,
+    )
+    vision_config = config.vision_config
+    for name in ("image_processor", "video_processor"):
+        component = getattr(processor, name)
+        for processor_key, config_key in (
+            ("patch_size", "patch_size"),
+            ("temporal_patch_size", "temporal_patch_size"),
+            ("merge_size", "spatial_merge_size"),
+        ):
+            expected = (
+                vision_config.get(config_key)
+                if isinstance(vision_config, dict)
+                else getattr(vision_config, config_key, None)
+            )
+            if expected is not None and getattr(component, processor_key) != expected:
+                raise ValueError(
+                    f"GLM5Next {name}.{processor_key} disagrees with vision_config"
+                )
+    return processor
+
+
 def get_processor(
     tokenizer_name: str,
     *args,
@@ -275,6 +321,23 @@ def get_processor(
         if "size" not in kwargs:
             kwargs["size"] = {"shortest_edge": 3136, "longest_edge": 1003520}
 
+    is_glm5_next = (
+        config.model_type == "glm5_next"
+        and getattr(config, "vision_config", None) is not None
+    )
+
+    def glm5_next_fallback():
+        return _build_glm5_next_processor(
+            model_name or tokenizer_name,
+            tokenizer_name,
+            args,
+            config,
+            trust_remote_code,
+            revision,
+            image_processor_backend,
+            kwargs,
+        )
+
     try:
         if "InternVL3_5" in tokenizer_name:
             processor = AutoTokenizer.from_pretrained(
@@ -302,9 +365,13 @@ def get_processor(
                     **kwargs,
                 )
 
-    except ValueError as e:
+    except (ValueError, ImportError) as e:
         error_message = str(e)
-        if "Unrecognized feature extractor" in error_message:
+        if is_glm5_next:
+            processor = glm5_next_fallback()
+        elif isinstance(e, ImportError):
+            raise
+        elif "Unrecognized feature extractor" in error_message:
             logger.info(
                 "AutoProcessor failed on feature extractor for %s, "
                 "constructing processor manually",
@@ -334,6 +401,14 @@ def get_processor(
             )
         else:
             raise
+
+    # Older Transformers can return a tokenizer successfully for an unknown
+    # processor_class. For GLM5Next this silently discards all image inputs.
+    if is_glm5_next and (
+        getattr(processor, "image_processor", None) is None
+        or getattr(processor, "tokenizer", None) is None
+    ):
+        processor = glm5_next_fallback()
 
     processor = _apply_image_processor_backend(
         processor,
