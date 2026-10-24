@@ -1126,6 +1126,18 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_constraint=processed_messages.tool_call_constraint,
             renderer_handles_response_format=self.chat_encoding_spec == "kimi_k3",
         )
+        # Keep the actual tool constraint on this request: a native builder
+        # can fail even when the detector's capability probe succeeds.
+        # This private attribute is not a Pydantic/wire field.
+        object.__setattr__(
+            request,
+            "_tool_call_constraint_kind",
+            (
+                processed_messages.tool_call_constraint[0]
+                if processed_messages.tool_call_constraint is not None
+                else None
+            ),
+        )
         set_request_reasoning_end_token_ids(
             sampling_params, processed_messages.reasoning_end_token_ids
         )
@@ -2216,6 +2228,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     finish_reason,
                     request.tool_choice,
                     history_tool_calls_cnt,
+                    tool_call_constraint_kind=getattr(
+                        request, "_tool_call_constraint_kind", None
+                    ),
                 )
 
             # Extract prompt_token_ids if requested
@@ -2371,6 +2386,7 @@ class OpenAIServingChat(OpenAIServingBase):
         finish_reason: Dict[str, Any],
         tool_choice: Optional[Union[str, ToolChoice]] = None,
         history_tool_calls_cnt: int = 0,
+        tool_call_constraint_kind: Optional[str] = None,
     ) -> ToolCallProcessingResult:
         """Process tool calls in the response"""
 
@@ -2383,7 +2399,7 @@ class OpenAIServingChat(OpenAIServingBase):
             parser = FunctionCallParser(
                 tools, self.tool_call_parser, tokenizer=self.tokenizer_manager.tokenizer
             )
-            detector_owns_format = (
+            detector_owns_format = tool_call_constraint_kind != "json_schema" and (
                 parser.detector.supports_structural_tag()
                 or parser.detector.parses_required_natively()
             )
@@ -2821,7 +2837,11 @@ class OpenAIServingChat(OpenAIServingBase):
             # native format output.
             if is_required:
                 use_native_parser = False
-                if self.tool_call_parser:
+                if (
+                    self.tool_call_parser
+                    and getattr(request, "_tool_call_constraint_kind", None)
+                    != "json_schema"
+                ):
                     probe = FunctionCallParser(
                         tools=effective_tools,
                         tool_call_parser=self.tool_call_parser,
