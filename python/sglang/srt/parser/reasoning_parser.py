@@ -865,6 +865,51 @@ class Glm45Detector(BaseReasoningFormatDetector):
             previous_content=previous_content,
         )
 
+    def _glm_boundaries(self, text: str):
+        start = text.find(self.think_start_token)
+        end = text.find(self.think_end_token)
+        tool = text.find(self.tool_start_token)
+        boundary = min(i for i in (end, tool, len(text)) if i >= 0)
+        opens_reasoning = not self.stripped_think_start and 0 <= start < boundary
+        return start, end, tool, self._in_reasoning or opens_reasoning
+
+    def _detect_and_parse_impl(self, text: str) -> StreamingParseResult:
+        _, end, tool, in_reasoning = self._glm_boundaries(text)
+        if not in_reasoning:
+            return StreamingParseResult(normal_text=text)
+        if tool >= 0 and (end < 0 or tool < end):
+            # A literal </think> inside tool arguments is code, not a late
+            # reasoning terminator. The first boundary owns the transition.
+            reasoning = text[:tool]
+            while reasoning.startswith(self.think_start_token):
+                reasoning = reasoning[len(self.think_start_token) :]
+            return StreamingParseResult(
+                reasoning_text=reasoning, normal_text=text[tool:]
+            )
+        return super()._detect_and_parse_impl(text)
+
+    def _parse_streaming_increment_impl(self, new_text: str) -> StreamingParseResult:
+        text = self._buffer + new_text
+        start, end, tool, in_reasoning = self._glm_boundaries(text)
+        if in_reasoning and tool >= 0 and (end < 0 or tool < end):
+            reasoning = text[:tool]
+            if not self.stripped_think_start:
+                reasoning = reasoning.replace(self.think_start_token, "", 1)
+            self._buffer = ""
+            self._in_reasoning = False
+            self.stripped_think_start = True
+            return StreamingParseResult(
+                reasoning_text=reasoning, normal_text=text[tool:]
+            )
+        if in_reasoning and end >= 0 and (start < 0 or end < start):
+            # The opener was prefilled by the template. Mark it handled
+            # before the base parser can mistake a later code literal for it.
+            self.stripped_think_start = True
+        if not in_reasoning and tool >= 0 and (start < 0 or tool < start):
+            self._buffer = ""
+            return StreamingParseResult(normal_text=text)
+        return super()._parse_streaming_increment_impl(new_text)
+
 
 class Ling3Detector(Glm45Detector):
     """

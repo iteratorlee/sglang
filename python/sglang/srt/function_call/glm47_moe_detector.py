@@ -373,7 +373,7 @@ class Glm47MoeDetector(BaseFormatDetector):
             normal_text_parts.append(text[last_end:])
 
         # Combine all normal text parts
-        normal_text = "".join(normal_text_parts).strip()
+        normal_text = "".join(normal_text_parts)
 
         # Parse tool calls
         match_result_list = re.findall(self.func_call_regex, text, re.DOTALL)
@@ -384,7 +384,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                 func_detail = self.func_detail_regex.search(match_result)
                 if func_detail is None:
                     continue
-                func_name = func_detail.group(1) if func_detail.group(1) else ""
+                func_name = (func_detail.group(1) or "").strip()
                 func_args = func_detail.group(2) if func_detail.group(2) else ""
                 arguments = {}
                 if func_args:
@@ -394,7 +394,11 @@ class Glm47MoeDetector(BaseFormatDetector):
 
                 # construct match_result for parse_base_json
                 match_result = {"name": func_name, "parameters": arguments}
-                calls.extend(self.parse_base_json(match_result, tools))
+                for call in self.parse_base_json(match_result, tools):
+                    # OpenAI indices enumerate calls, including repeated calls
+                    # to the same function, rather than entries in tools.
+                    call.tool_index = len(calls)
+                    calls.append(call)
             return StreamingParseResult(normal_text=normal_text, calls=calls)
         except Exception as e:
             logger.error(f"Error in detect_and_parse: {e}", exc_info=True)
@@ -403,14 +407,6 @@ class Glm47MoeDetector(BaseFormatDetector):
 
     def _get_value_type(self, func_name: str, key: str, tools: List[Tool]) -> str:
         return get_argument_type(func_name, key, tools) or "auto"
-
-    def _format_value_complete(self, value: str, value_type: str) -> str:
-        """Format a value that completed in one chunk; number/integer/auto never
-        reach here (they are parsed at value close instead)."""
-        if value_type == "string":
-            return json.dumps(value, ensure_ascii=False)
-        # object/array/boolean values arrive as JSON already
-        return value
 
     def _process_xml_to_json_streaming(
         self, raw_increment: str, func_name: str, tools: List[Tool]
@@ -467,25 +463,24 @@ class Glm47MoeDetector(BaseFormatDetector):
                     self._current_value += final_value
 
                     value_type = self._cached_value_type or "string"
-                    if value_type in ("auto", "number", "integer"):
+                    if value_type != "string":
+                        # Non-string recovery (e.g. escaped JSON or Python
+                        # booleans) must match the non-streaming parser. Wait
+                        # for the value boundary before emitting valid JSON.
                         parsed = self._parse_argument_pairs(
                             [(self._current_key, self._current_value)], func_name, tools
                         )[self._current_key]
                         json_output += json.dumps(parsed, ensure_ascii=False)
                     elif self._value_started:
                         if final_value:
-                            if value_type == "string":
-                                json_output += json.dumps(
-                                    final_value, ensure_ascii=False
-                                )[1:-1]
-                            else:
-                                json_output += final_value
-                        if value_type == "string":
-                            json_output += '"'
+                            json_output += json.dumps(final_value, ensure_ascii=False)[
+                                1:-1
+                            ]
+                        json_output += '"'
                     else:
                         # Value never started: empty, or completed in one chunk.
-                        json_output += self._format_value_complete(
-                            self._current_value, value_type
+                        json_output += json.dumps(
+                            self._current_value, ensure_ascii=False
                         )
 
                     self._xml_tag_buffer = ""
@@ -500,13 +495,24 @@ class Glm47MoeDetector(BaseFormatDetector):
                     ) and closing_tag.startswith(self._xml_tag_buffer)
 
                     if not is_potential_closing:
-                        content = self._xml_tag_buffer
+                        # A failed prefix can end in a new prefix: e.g. a
+                        # literal '<' immediately followed by </arg_value>.
+                        holdback = self._ends_with_partial_token(
+                            self._xml_tag_buffer, closing_tag
+                        )
+                        content = (
+                            self._xml_tag_buffer[:-holdback]
+                            if holdback
+                            else self._xml_tag_buffer
+                        )
+                        self._xml_tag_buffer = (
+                            self._xml_tag_buffer[-holdback:] if holdback else ""
+                        )
                         value_type = self._cached_value_type or "string"
 
-                        if value_type in ("auto", "number", "integer"):
+                        if value_type != "string":
                             self._current_value += content
-                            self._xml_tag_buffer = ""
-                        elif value_type == "string":
+                        else:
                             if not self._value_started:
                                 json_output += '"'
                                 self._value_started = True
@@ -515,15 +521,6 @@ class Glm47MoeDetector(BaseFormatDetector):
                                     1:-1
                                 ]
                                 self._current_value += content
-                                self._xml_tag_buffer = ""
-                        else:
-                            # object/array/boolean values stream through verbatim
-                            if content:
-                                if not self._value_started:
-                                    self._value_started = True
-                                json_output += content
-                                self._current_value += content
-                                self._xml_tag_buffer = ""
 
         return json_output
 
@@ -700,9 +697,9 @@ class Glm47MoeDetector(BaseFormatDetector):
                 pairs = self.func_arg_regex.findall(func_args_raw)
                 if pairs:
                     arguments = self._parse_argument_pairs(pairs, func_name, tools)
-                    self.prev_tool_call_arr[self.current_tool_id]["arguments"] = (
-                        arguments
-                    )
+                    self.prev_tool_call_arr[self.current_tool_id][
+                        "arguments"
+                    ] = arguments
             except Exception as e:
                 logger.debug(f"Failed to parse arguments: {e}", exc_info=True)
 
@@ -727,6 +724,28 @@ class Glm47MoeDetector(BaseFormatDetector):
         Outputs JSON increments immediately as XML data arrives.
         """
         self._buffer += new_text
+        normal_text_parts = []
+        calls = []
+        # A scheduler delta can contain several complete calls (especially
+        # with speculative decoding). Drain every complete call now, without
+        # relying on a later delta or recursive parsing at end of stream.
+        while self._buffer:
+            previous_buffer = self._buffer
+            result = self._parse_streaming_buffer(tools)
+            normal_text_parts.append(result.normal_text)
+            calls.extend(result.calls)
+            if self._buffer == previous_buffer:
+                break
+        return StreamingParseResult(normal_text="".join(normal_text_parts), calls=calls)
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        # Release an ordinary text suffix held for a possible opening marker.
+        # Never fabricate JSON closure for an interrupted tool call.
+        text = self._buffer if self.bot_token not in self._buffer else ""
+        self._buffer = ""
+        return StreamingParseResult(normal_text=text)
+
+    def _parse_streaming_buffer(self, tools: List[Tool]) -> StreamingParseResult:
         current_text = self._buffer
 
         # Check if we have a tool call
@@ -747,8 +766,6 @@ class Glm47MoeDetector(BaseFormatDetector):
                 # that turned out not to be part of a tool call
                 output_text = current_text
                 self._buffer = ""
-                if self.eot_token in output_text:
-                    output_text = output_text.replace(self.eot_token, "")
                 return StreamingParseResult(normal_text=output_text)
             else:
                 # Could be start of tool call, keep buffering
@@ -809,7 +826,7 @@ class Glm47MoeDetector(BaseFormatDetector):
 
             # Determine if function name is complete by checking for <arg_key> in the full text
             # This is important for streaming scenarios where args come in later chunks
-            has_arg_key = "<arg_key" in current_text
+            has_arg_key = bool(partial_match.group(2))
 
             # Send tool name if needed
             tool_name_item = self._send_tool_name_if_needed(
@@ -879,16 +896,18 @@ class Glm47MoeDetector(BaseFormatDetector):
         for arg_key, arg_value in pairs:
             arg_key = arg_key.strip()
             arg_type = get_argument_type(func_name, arg_key, tools, known_arguments)
+            if arg_type == "string":
+                # GLM's template renders string arguments verbatim. Quotes
+                # and backslashes belong to the source code/search text;
+                # decoding them as JSON corrupts edit and shell arguments.
+                arguments[arg_key] = arg_value
+                known_arguments[arg_key] = arg_value
+                continue
             parsed_value, is_good_json = parse_arguments(
                 arg_value, arg_type or "string"
             )
 
-            if arg_type == "string":
-                if isinstance(parsed_value, str):
-                    arguments[arg_key] = parsed_value
-                else:
-                    arguments[arg_key] = arg_value
-            elif arg_type is None:
+            if arg_type is None:
                 # A value whose parsed JSON type is inadmissible stays the raw
                 # string when the schema allows a string (e.g. enum ["7", 8]).
                 allowed = _get_argument_types(
@@ -923,11 +942,38 @@ class Glm47MoeDetector(BaseFormatDetector):
     ) -> Optional[StructuralTag]:
         if not self.supports_structural_tag():
             return None
-        return super().get_structural_tag(
+        tag = super().get_structural_tag(
             tools=tools,
             tool_choice=tool_choice,
             thinking_mode=thinking_mode,
             parallel_tool_calls=parallel_tool_calls,
+        )
+        if tag is not None and not parallel_tool_calls:
+            # XGrammar's builtin factory has no parallel_tool_calls argument.
+            # Its GLM suffix supports a single-call limit explicitly; named
+            # tool choice already returns a single TagFormat.
+            suffix = tag.format
+            if suffix.type == "sequence":
+                suffix = suffix.elements[-1]
+            if suffix.type in ("triggered_tags", "tags_with_separator"):
+                suffix.stop_after_first = True
+        return tag
+
+    def get_auto_tool_call_structural_tag(
+        self,
+        tools: Union[List[Tool], None] = None,
+        thinking_mode: bool = False,
+        parallel_tool_calls: bool = True,
+    ) -> Optional[StructuralTag]:
+        if parallel_tool_calls:
+            return None
+        # Even non-strict auto requests need a grammar to enforce at most one
+        # call. Free text remains allowed by the native triggered-tags format.
+        return self.get_structural_tag(
+            tools=tools,
+            tool_choice="auto",
+            thinking_mode=thinking_mode,
+            parallel_tool_calls=False,
         )
 
     def structure_info(self) -> _GetInfoFunc:
