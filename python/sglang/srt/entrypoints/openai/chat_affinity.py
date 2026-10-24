@@ -9,6 +9,7 @@ model version) is consulted on every call.
 import asyncio
 import copy
 import json
+import os
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
@@ -55,10 +56,18 @@ def supports_text_request(data):
 class ChatAffinityTokenizer:
     def __init__(self, chat_serving):
         self.chat_serving = chat_serving
+        # Each render owns its cache and request copy. Keep CPU work bounded,
+        # but allow deployments with long simultaneous histories to avoid
+        # falling back simply because another advisory render is in flight.
+        try:
+            workers = int(os.environ.get("SGLANG_CHAT_AFFINITY_CPU_WORKERS", "1"))
+        except ValueError:
+            workers = 1
+        workers = max(1, min(workers, 8))
         self._executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="chat-affinity"
+            max_workers=workers, thread_name_prefix="chat-affinity"
         )
-        self._slot = asyncio.Semaphore(1)
+        self._slot = asyncio.Semaphore(workers)
 
     async def tokenize(self, data):
         # Never queue an unbounded amount of CPU work behind inference's HTTP
