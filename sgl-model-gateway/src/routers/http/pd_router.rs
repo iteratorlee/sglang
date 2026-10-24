@@ -554,6 +554,18 @@ impl PDRouter {
                 .len()
                 .saturating_add(usize::try_from(output).unwrap_or(usize::MAX))
         });
+        // The CPU endpoint has already produced the final engine token IDs.
+        // Preserve messages, tools and all other raw fields so the Chat handler
+        // still derives constraints, reasoning and output parsing normally.
+        // Failed/unsupported advisory work keeps the original serving path.
+        let forwarded = self.chat_affinity.as_ref().and_then(|affinity| {
+            tokens
+                .as_deref()
+                .and_then(|ids| affinity.body_with_prompt_ids(raw_body, ids))
+        });
+        if forwarded.is_some() {
+            metrics::counter!("smg_pd_chat_prompt_ids_reused_total").increment(1);
+        }
         let context = PDRequestContext {
             route: "/v1/chat/completions",
             batch_size: Self::get_chat_batch_size(body),
@@ -566,7 +578,8 @@ impl PDRouter {
             model_id,
             headers: headers.cloned(),
         };
-        self.execute_dual_dispatch(headers, raw_body, context).await
+        self.execute_dual_dispatch(headers, forwarded.as_ref().unwrap_or(raw_body), context)
+            .await
     }
 
     fn get_chat_batch_size(req: &ChatCompletionRequest) -> Option<usize> {
@@ -2315,6 +2328,57 @@ mod tests {
             }));
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (url, token_bodies, generated)
+    }
+
+    #[tokio::test]
+    async fn test_chat_prompt_reuse_forwards_exact_ids_or_preserves_fallback() {
+        for supported in [true, false] {
+            let token_result = if supported {
+                json!({"supported":true,"version":1,"tokens":[10,20,30],"count":3})
+            } else {
+                json!({"supported":false,"reason":"busy"})
+            };
+            let (purl, token_bodies, p_generated) = mock_chat_backend(token_result).await;
+            let (durl, _, d_generated) = mock_chat_backend(json!({"supported":false})).await;
+            let mut router = create_test_pd_router();
+            let mut affinity = ChatAffinity::default();
+            affinity.reuse_token_ids = true;
+            router.chat_affinity = Some(affinity);
+            router.worker_registry.register(Arc::new(
+                BasicWorkerBuilder::new(purl)
+                    .worker_type(WorkerType::Prefill {
+                        bootstrap_port: None,
+                    })
+                    .build(),
+            ));
+            router.worker_registry.register(Arc::new(
+                BasicWorkerBuilder::new(durl)
+                    .worker_type(WorkerType::Decode)
+                    .build(),
+            ));
+            let raw = json!({"model":"test-model","messages":[{"role":"user","content":"hello"}],"max_tokens":7,"return_spec_tokens_details":true,"unknown_extension":{"keep":true}});
+            let body = serde_json::from_value(raw.clone()).unwrap();
+            assert_eq!(
+                router
+                    .route_chat_raw(None, &body, &raw, None)
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+            assert_eq!(*token_bodies.lock().unwrap(), vec![raw.clone()]);
+            for generated in [&p_generated, &d_generated] {
+                let saved = generated.lock().unwrap();
+                assert_eq!(saved.len(), 1);
+                assert_eq!(saved[0]["messages"], raw["messages"]);
+                assert_eq!(saved[0]["unknown_extension"], raw["unknown_extension"]);
+                if supported {
+                    assert_eq!(saved[0]["input_ids"], json!([10, 20, 30]));
+                } else {
+                    assert!(saved[0].get("input_ids").is_none());
+                }
+            }
+            assert!(raw.get("input_ids").is_none());
+        }
     }
 
     #[tokio::test]

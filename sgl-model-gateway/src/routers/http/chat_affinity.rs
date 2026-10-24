@@ -17,12 +17,17 @@ const MAX_TOKENS: usize = 1024 * 1024;
 #[derive(Debug)]
 pub(super) struct ChatAffinity {
     slots: Semaphore,
+    /// Reuse this request's authoritative final IDs in the native Chat input
+    /// extension. Opt-in: deployments must use matching P/D templates/tokenizers.
+    pub(super) reuse_token_ids: bool,
 }
 
 impl Default for ChatAffinity {
     fn default() -> Self {
         Self {
             slots: Semaphore::new(8),
+            reuse_token_ids: std::env::var("SGLANG_GATEWAY_PD_CHAT_REUSE_TOKEN_IDS")
+                .is_ok_and(|value| value == "1"),
         }
     }
 }
@@ -77,6 +82,18 @@ pub(super) fn supports_text_request(body: &Value) -> bool {
 }
 
 impl ChatAffinity {
+    pub(super) fn body_with_prompt_ids(&self, body: &Value, tokens: &[u32]) -> Option<Value> {
+        if !self.reuse_token_ids || tokens.is_empty() || !supports_text_request(body) {
+            return None;
+        }
+        let mut forwarded = body.clone();
+        forwarded.as_object_mut()?.insert(
+            "input_ids".to_owned(),
+            Value::Array(tokens.iter().copied().map(Value::from).collect()),
+        );
+        Some(forwarded)
+    }
+
     pub(super) async fn tokenize(
         &self,
         client: &Client,
@@ -151,6 +168,31 @@ impl ChatAffinity {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn exact_prompt_reuse_keeps_tools_extensions_and_raw_input_immutable() {
+        let raw = json!({
+            "model":"glm", "messages":[{"role":"user","content":"code"}],
+            "tools":[{"type":"function","function":{"name":"read","parameters":{}}}],
+            "tool_choice":"required", "parallel_tool_calls":true, "stream":true,
+            "chat_template_kwargs":{"clear_thinking":true},
+            "cache_salt":"tenant-a", "unknown_extension":{"preserve":true}
+        });
+        let mut affinity = ChatAffinity::default();
+        affinity.reuse_token_ids = false;
+        assert!(affinity.body_with_prompt_ids(&raw, &[1, 2]).is_none());
+        affinity.reuse_token_ids = true;
+        let mut forwarded = affinity.body_with_prompt_ids(&raw, &[1, 2]).unwrap();
+        assert_eq!(
+            forwarded.as_object_mut().unwrap().remove("input_ids"),
+            Some(json!([1, 2]))
+        );
+        assert_eq!(forwarded, raw);
+        assert!(raw.get("input_ids").is_none());
+        assert!(affinity.body_with_prompt_ids(&raw, &[]).is_none());
+        let media = json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"example"}}]}]});
+        assert!(affinity.body_with_prompt_ids(&media, &[1, 2]).is_none());
+    }
 
     #[tokio::test]
     async fn transport_keeps_stream_true_and_rejects_malformed_token_responses() {
