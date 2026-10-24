@@ -191,14 +191,69 @@ async fn generate(
         .await
 }
 
+// Keep the original JSON alongside the normal validated/normalized view. The
+// extractor's validation and error behavior remain the same as typed Chat.
+struct RawChatRequest {
+    typed: ChatCompletionRequest,
+    raw: Value,
+}
+
+impl<'de> Deserialize<'de> for RawChatRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = Value::deserialize(deserializer)?;
+        let typed = serde_json::from_value(raw.clone()).map_err(serde::de::Error::custom)?;
+        Ok(Self { typed, raw })
+    }
+}
+
+impl crate::protocols::validated::Normalizable for RawChatRequest {
+    fn normalize(&mut self) {
+        self.typed.normalize();
+        let missing = |value: Option<&Value>| value.is_none_or(Value::is_null);
+        if missing(self.raw.get("max_completion_tokens")) && !missing(self.raw.get("max_tokens")) {
+            self.raw["max_completion_tokens"] = self.raw["max_tokens"].clone();
+            self.raw.as_object_mut().unwrap().remove("max_tokens");
+        }
+        if missing(self.raw.get("tools")) {
+            if let Some(functions) = self.raw.get("functions").and_then(Value::as_array) {
+                self.raw["tools"] = Value::Array(
+                    functions
+                        .iter()
+                        .map(|f| json!({"type": "function", "function": f}))
+                        .collect(),
+                );
+                self.raw.as_object_mut().unwrap().remove("functions");
+            }
+        }
+        if missing(self.raw.get("tool_choice")) {
+            if let Some(choice) = &self.typed.tool_choice {
+                self.raw["tool_choice"] =
+                    serde_json::to_value(choice).expect("serializable tool choice");
+                self.raw.as_object_mut().unwrap().remove("function_call");
+            }
+        }
+    }
+}
+
+impl validator::Validate for RawChatRequest {
+    fn validate(&self) -> Result<(), validator::ValidationErrors> {
+        self.typed.validate()
+    }
+}
+
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+    ValidatedJson(body): ValidatedJson<RawChatRequest>,
 ) -> Response {
     state
         .router
-        .route_chat(Some(&headers), &body, Some(&body.model))
+        .route_chat_raw(
+            Some(&headers),
+            &body.typed,
+            &body.raw,
+            Some(&body.typed.model),
+        )
         .await
 }
 
@@ -1157,4 +1212,25 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
     };
 
     cors.max_age(Duration::from_secs(3600))
+}
+
+#[cfg(test)]
+mod raw_chat_tests {
+    use super::*;
+    use crate::protocols::validated::Normalizable;
+    use validator::Validate;
+
+    #[test]
+    fn raw_chat_keeps_nested_extensions_and_old_normalizations() {
+        let raw = json!({"model":"m", "messages":[{"role":"user","content":"hi","vendor_field":"keep"}], "functions":[{"name":"f","parameters":{"type":"object"},"new_schema_field":true}], "function_call":{"name":"f"}, "max_tokens":7, "return_spec_tokens_details":true});
+        let mut parsed: RawChatRequest = serde_json::from_value(raw.clone()).unwrap();
+        parsed.normalize();
+        parsed.validate().unwrap();
+        assert_eq!(parsed.raw["messages"], raw["messages"]);
+        assert_eq!(parsed.raw["tools"][0]["function"], raw["functions"][0]);
+        assert_eq!(parsed.raw["return_spec_tokens_details"], true);
+        assert_eq!(parsed.raw["max_completion_tokens"], 7);
+        assert_eq!(parsed.raw["tool_choice"]["function"]["name"], "f");
+        assert!(parsed.raw.get("functions").is_none());
+    }
 }

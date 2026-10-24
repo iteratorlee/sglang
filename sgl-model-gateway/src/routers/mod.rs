@@ -113,6 +113,17 @@ pub trait RouterTrait: Send + Sync + Debug {
         model_id: Option<&str>,
     ) -> Response;
 
+    /// Preserve backend Chat extensions without changing typed-only routers.
+    async fn route_chat_raw(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        _raw_body: &Value,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_chat(headers, body, model_id).await
+    }
+
     /// Route a completion request
     async fn route_completion(
         &self,

@@ -168,6 +168,18 @@ struct PhysicalWorkerGroup {
 
 pub const PD_TOKEN_AFFINITY_ENV: &str = "SGLANG_GATEWAY_PD_TOKEN_AFFINITY";
 
+/// Independent from native /generate's strict input_ids contract.
+pub fn pd_chat_token_affinity_enabled() -> bool {
+    std::env::var("SGLANG_GATEWAY_PD_CHAT_TOKEN_AFFINITY")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 pub fn pd_token_affinity_enabled() -> bool {
     std::env::var(PD_TOKEN_AFFINITY_ENV)
         .map(|value| {
@@ -579,7 +591,8 @@ impl LoadMonitor {
         snapshot_tx: watch::Sender<HashMap<String, DPLoadSnapshot>>,
     ) {
         let mut interval_timer = tokio::time::interval(interval);
-        let detailed_feedback_enabled = pd_token_affinity_enabled();
+        let detailed_feedback_enabled =
+            pd_token_affinity_enabled() || pd_chat_token_affinity_enabled();
 
         loop {
             interval_timer.tick().await;

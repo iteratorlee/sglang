@@ -235,6 +235,26 @@ class TestChatTemplateCache(CustomTestCase):
         self.tokenizer_manager.tokenizer.encode.assert_called_once()
         self.tokenizer_manager.tokenizer.decode.assert_called_once()
 
+    def test_affinity_cache_key_preserves_argument_order_and_model_version(self):
+        def message(arguments):
+            return [
+                {
+                    "role": "assistant",
+                    "tool_calls": [{"function": {"name": "f", "arguments": arguments}}],
+                }
+            ]
+
+        self._render(messages=message({"z": 1, "a": 2}))
+        self._render(messages=message({"a": 2, "z": 1}))
+        self.assertEqual(
+            self.tokenizer_manager.tokenizer.apply_chat_template.call_count, 2
+        )
+        self.tokenizer_manager._config_overrides["weight_version"] = "next"
+        self._render(messages=message({"a": 2, "z": 1}))
+        self.assertEqual(
+            self.tokenizer_manager.tokenizer.apply_chat_template.call_count, 3
+        )
+
     def test_cache_key_includes_template_and_encode_options(self):
         self._render()
         self._render(template_kwargs={"enable_thinking": True})
@@ -312,6 +332,183 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
+
+    def _affinity_fixture(self, multimodal=False):
+        from sglang.srt.entrypoints.openai.chat_affinity import ChatAffinityTokenizer
+        from jinja2 import Environment
+
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.chat_encoding_spec = None
+        self.chat.is_gpt_oss = False
+        self.tm.model_config.is_multimodal = multimodal
+        self.tm.tokenizer.is_fast = False
+        self.tm._config_overrides["weight_version"] = "v1"
+        self.tm.generate_request.side_effect = AssertionError(
+            "CPU tokenizer dispatched generation"
+        )
+        template = Environment().from_string(
+            "{{ tools | tojson }}|{{ reasoning_effort }}|"
+            "{% set ns = namespace(last_user=-1) %}"
+            "{% for m in messages %}{% if m.role == 'user' %}{% set ns.last_user=loop.index0 %}{% endif %}{% endfor %}"
+            "{% for m in messages %}{{ m.role }}:{{ m.content }}"
+            "{% if not clear_thinking or loop.index0 > ns.last_user %}{{ m.reasoning_content | default('') }}{% endif %}"
+            "{{ m.tool_calls | default([]) | tojson }};{% endfor %}"
+        )
+        self.tm.tokenizer.apply_chat_template.side_effect = (
+            lambda messages, **kw: template.render(messages=messages, **kw)
+        )
+        # Distinguish template encode(False) from the VLM's final default encode.
+        self.tm.tokenizer.encode.side_effect = lambda text, **kw: (
+            ([] if kw.get("add_special_tokens") is False else [1])
+            + [ord(c) + 10 for c in text]
+        )
+        self.tm.tokenizer.decode.side_effect = lambda ids: "".join(
+            chr(i - 10) for i in ids if i != 1
+        )
+        self.chat._tokenizer_auto_adds_specials = True
+        service = ChatAffinityTokenizer(self.chat)
+        self.addCleanup(service._executor.shutdown)
+        return service
+
+    def test_affinity_matches_actual_chat_preparation_and_vlm_reencode(self):
+        import copy
+
+        for multimodal in (False, True):
+            with self.subTest(multimodal=multimodal):
+                service = self._affinity_fixture(multimodal)
+                data = {
+                    "model": "test-model",
+                    "reasoning_effort": "high",
+                    "stream": True,
+                    "chat_template_kwargs": {
+                        "reasoning_effort": "low",
+                        "clear_thinking": True,
+                    },
+                    "messages": [
+                        {"role": "user", "content": "call a tool"},
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "reasoning_content": "private thought",
+                            "tool_calls": [
+                                {
+                                    "id": "x",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "f",
+                                        "arguments": '{"z":1,"a":{"b":2}}',
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": "x",
+                            "content": [{"type": "text", "text": "result"}],
+                        },
+                    ],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "f",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"z": {"type": "integer"}},
+                                },
+                            },
+                        }
+                    ],
+                }
+                original = copy.deepcopy(data)
+                actual, _ = self.chat._convert_to_internal_request(
+                    ChatCompletionRequest.model_validate(copy.deepcopy(data))
+                )
+                expected = (
+                    actual.input_ids
+                    if actual.input_ids is not None
+                    else self.tm.tokenizer.encode(actual.text)
+                )
+                result = service._tokenize(data)
+                self.assertTrue(result["supported"], result)
+                self.assertEqual(result["tokens"], expected)
+                self.assertEqual(data, original)
+                kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+                self.assertEqual(kwargs["reasoning_effort"], "low")
+                messages = self.tm.tokenizer.apply_chat_template.call_args.args[0]
+                self.assertEqual(
+                    messages[1]["tool_calls"][0]["function"]["arguments"],
+                    {"z": 1, "a": {"b": 2}},
+                )
+                self.tm.generate_request.assert_not_called()
+                if multimodal:
+                    self.assertEqual(result["tokens"][0], 1)
+
+    def test_affinity_rerenders_clear_thinking_tools_and_model_version(self):
+        import copy
+
+        service = self._affinity_fixture()
+        data = {
+            "model": "test-model",
+            "chat_template_kwargs": {"clear_thinking": True},
+            "messages": [
+                {"role": "user", "content": "first"},
+                {
+                    "role": "assistant",
+                    "content": "answer",
+                    "reasoning_content": "OLD_THINKING",
+                    "tool_calls": [
+                        {
+                            "id": "x",
+                            "type": "function",
+                            "function": {"name": "f", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "x", "content": "result"},
+            ],
+        }
+        first = service._tokenize(data)
+        data["messages"].append({"role": "user", "content": "second"})
+        second = service._tokenize(data)
+        self.assertIn("OLD_THINKING", self.tm.tokenizer.decode(first["tokens"]))
+        self.assertNotIn("OLD_THINKING", self.tm.tokenizer.decode(second["tokens"]))
+        data["chat_template_kwargs"]["clear_thinking"] = False
+        self.assertIn(
+            "OLD_THINKING", self.tm.tokenizer.decode(service._tokenize(data)["tokens"])
+        )
+        original = copy.deepcopy(data)
+        self.tm._config_overrides["weight_version"] = "v2"
+        self.assertEqual(service._tokenize(data)["weight_version"], "v2")
+        self.assertEqual(data, original)
+        count = self.tm.tokenizer.apply_chat_template.call_count
+        service._tokenize(data)
+        self.assertEqual(self.tm.tokenizer.apply_chat_template.call_count, count + 1)
+
+    def test_affinity_media_and_unknown_renderer_do_not_render(self):
+        service = self._affinity_fixture()
+        for kind in ("image_url", "video_url", "input_audio"):
+            result = service._tokenize(
+                {
+                    "model": "test-model",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [{"type": kind, kind: "never fetch"}],
+                        }
+                    ],
+                }
+            )
+            self.assertFalse(result["supported"])
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.assertFalse(
+            service._tokenize(
+                {"model": "test-model", "messages": [{"role": "user", "content": "x"}]}
+            )["supported"]
+        )
+        self.tm.tokenizer.apply_chat_template.assert_not_called()
+        self.tm.generate_request.assert_not_called()
 
     @staticmethod
     def _render_tool_results_in_call_order(messages, **kwargs):

@@ -323,6 +323,11 @@ async def lifespan(fast_api_app: FastAPI):
     fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
         _global_state.tokenizer_manager, _global_state.template_manager
     )
+    from sglang.srt.entrypoints.openai.chat_affinity import ChatAffinityTokenizer
+
+    fast_api_app.state.chat_affinity_tokenizer = ChatAffinityTokenizer(
+        fast_api_app.state.openai_serving_chat
+    )
     fast_api_app.state.openai_serving_tokenize = OpenAIServingTokenize(
         _global_state.tokenizer_manager, _global_state.template_manager
     )
@@ -426,6 +431,7 @@ async def lifespan(fast_api_app: FastAPI):
                 sidecar.stop()
             except Exception:
                 logger.exception("Failed to stop sidecar")
+        fast_api_app.state.chat_affinity_tokenizer.close()
         _shutdown_native_grpc_server(grpc_handle)
         if tool_server is not None and hasattr(tool_server, "aclose"):
             await tool_server.aclose()
@@ -1789,6 +1795,28 @@ async def openai_v1_tokenize(request: TokenizeRequest, raw_request: Request):
     return await raw_request.app.state.openai_serving_tokenize.handle_request(
         request, raw_request
     )
+
+
+@app.post("/v1/chat/tokenize", dependencies=[Depends(validate_json_request)])
+async def chat_affinity_tokenize(raw_request: Request):
+    """Advisory CPU-only token IDs; never dispatch a generation request."""
+    from sglang.srt.entrypoints.openai.chat_affinity import MAX_REQUEST_BYTES
+
+    body = bytearray()
+    async for chunk in raw_request.stream():
+        if len(body) + len(chunk) > MAX_REQUEST_BYTES:
+            return ORJSONResponse({"supported": False, "reason": "too_large"})
+        body.extend(chunk)
+    try:
+        # JSON parsing and all template work run outside the inference HTTP loop.
+        # Parsing is bounded by MAX_REQUEST_BYTES.
+        result = await raw_request.app.state.chat_affinity_tokenizer.tokenize(
+            bytes(body)
+        )
+        return ORJSONResponse(result)
+    except Exception:
+        logger.debug("Chat affinity tokenization unavailable", exc_info=True)
+        return ORJSONResponse({"supported": False, "reason": "tokenization_failed"})
 
 
 @app.post(

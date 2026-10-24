@@ -519,6 +519,17 @@ impl PrefixHashPolicy {
         (least_loaded, Branch::FallbackLeastLoad)
     }
 
+    /// HTTP Chat's explicit compatibility fallback. Preserve existing load,
+    /// capacity and soft-cap logic without pretending to know prompt token IDs.
+    pub(crate) fn select_without_prefix(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+    ) -> Option<usize> {
+        self.find_worker_with_load_balance(workers, info, rand::random())
+            .0
+    }
+
     fn select_worker_impl(
         &self,
         workers: &[Arc<dyn Worker>],

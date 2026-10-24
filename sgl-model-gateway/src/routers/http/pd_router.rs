@@ -24,7 +24,8 @@ use tokio::sync::watch;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
 
-use super::pd_types::api_path;
+use super::{chat_affinity::ChatAffinity, pd_types::api_path};
+use crate::core::worker_manager::pd_chat_token_affinity_enabled;
 use crate::{
     config::types::RetryConfig,
     core::{
@@ -65,6 +66,7 @@ pub struct PDRouter {
     pub api_key: Option<String>,
     pub enable_igw: bool,
     pd_token_affinity: bool,
+    chat_affinity: Option<ChatAffinity>,
     pd_prefill_stage_reservation: bool,
     pd_decode_inflight_cap: usize,
     load_snapshots: watch::Receiver<HashMap<String, DPLoadSnapshot>>,
@@ -379,6 +381,7 @@ impl PDRouter {
             api_key: ctx.router_config.api_key.clone(),
             enable_igw: ctx.router_config.enable_igw,
             pd_token_affinity: pd_token_affinity_enabled(),
+            chat_affinity: pd_chat_token_affinity_enabled().then(ChatAffinity::default),
             pd_prefill_stage_reservation: prefill_stage_reservation_from_env(),
             pd_decode_inflight_cap: decode_inflight_cap_from_env()?,
             load_snapshots,
@@ -499,6 +502,67 @@ impl PDRouter {
                 body.text.as_deref(),
             )
             .saturating_add(1),
+            model_id,
+            headers: headers.cloned(),
+        };
+        self.execute_dual_dispatch(headers, raw_body, context).await
+    }
+
+    async fn route_chat_value(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        raw_body: &Value,
+        model_id: Option<&str>,
+    ) -> Response {
+        let tokens = if let Some(affinity) = &self.chat_affinity {
+            // CPU work is independent of the final P/D rank selection.
+            let worker = self
+                .worker_registry
+                .get_prefill_workers()
+                .into_iter()
+                .filter(|w| w.is_available())
+                .filter(|w| !self.enable_igw || model_id.is_none_or(|m| w.model_id() == m))
+                .min_by(|a, b| a.base_url().cmp(b.base_url()));
+            if let Some(worker) = worker {
+                affinity
+                    .tokenize(&self.client, worker.as_ref(), raw_body)
+                    .await
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let request_text = if self.policies_need_request_text() || self.pd_prefill_stage_reservation
+        {
+            Self::build_chat_request_text(body)
+        } else {
+            None
+        };
+        let prefill_tokens =
+            prefill_input_tokens(tokens.as_ref().map(|t| t.len()), request_text.as_deref())
+                .saturating_add(1);
+        let estimated_tokens = tokens.as_ref().map_or(0, |tokens| {
+            let output = raw_body
+                .get("max_completion_tokens")
+                .filter(|v| !v.is_null())
+                .or_else(|| raw_body.get("max_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            tokens
+                .len()
+                .saturating_add(usize::try_from(output).unwrap_or(usize::MAX))
+        });
+        let context = PDRequestContext {
+            route: "/v1/chat/completions",
+            batch_size: Self::get_chat_batch_size(body),
+            is_stream: body.stream,
+            return_logprob: body.logprobs,
+            request_text,
+            tokens,
+            estimated_tokens,
+            prefill_tokens,
             model_id,
             headers: headers.cloned(),
         };
@@ -1355,6 +1419,8 @@ impl PDRouter {
         headers: Option<&HeaderMap>,
         reserve: bool,
     ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>, PDReservationPair), String> {
+        let affinity_enabled =
+            self.pd_token_affinity || (self.chat_affinity.is_some() && tokens.is_some());
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
         debug!(
@@ -1396,7 +1462,7 @@ impl PDRouter {
 
         let attempts = decode_workers.len().saturating_mul(2).max(1);
         for _ in 0..attempts {
-            let snapshots = if self.pd_token_affinity || self.pd_prefill_stage_reservation {
+            let snapshots = if affinity_enabled || self.pd_prefill_stage_reservation {
                 self.load_snapshots.borrow().clone()
             } else {
                 HashMap::new()
@@ -1406,7 +1472,7 @@ impl PDRouter {
                 post_snapshot_reserved_tokens,
                 post_snapshot_reserved_requests,
             ) = self.reservations.views(&snapshots);
-            let policy_tokens = if self.pd_token_affinity { tokens } else { None };
+            let policy_tokens = if affinity_enabled { tokens } else { None };
 
             let prefill = Self::pick_worker_by_policy_arc(
                 &prefill_workers,
@@ -1426,6 +1492,7 @@ impl PDRouter {
                 },
                 None,
                 "prefill",
+                self.chat_affinity.is_some(),
             )
             .await?;
             let prefill_lease = if reserve && self.pd_prefill_stage_reservation {
@@ -1446,13 +1513,13 @@ impl PDRouter {
                 &post_snapshot_reserved_tokens,
                 &post_snapshot_reserved_requests,
                 estimated_tokens,
-                self.pd_token_affinity
-                    .then_some(self.pd_decode_inflight_cap),
+                affinity_enabled.then_some(self.pd_decode_inflight_cap),
                 "decode",
+                self.chat_affinity.is_some(),
             )
             .await?;
 
-            let decode_lease = if reserve && self.pd_token_affinity {
+            let decode_lease = if reserve && affinity_enabled {
                 let Some(decode_lease) = self.reservations.try_reserve(
                     decode.url(),
                     estimated_tokens,
@@ -1502,6 +1569,7 @@ impl PDRouter {
         estimated_tokens: usize,
         soft_cap: Option<usize>,
         worker_type: &str,
+        allow_tokenless_fallback: bool,
     ) -> Result<Arc<dyn Worker>, String> {
         if workers.is_empty() {
             return Err(format!(
@@ -1532,30 +1600,39 @@ impl PDRouter {
             ));
         }
 
-        let selected_idx = policy
-            .select_worker(
-                &available_workers,
-                &SelectWorkerInfo {
-                    request_text,
-                    tokens,
-                    headers,
-                    hash_ring,
-                    load_snapshots: Some(load_snapshots),
-                    local_reservations: Some(local_reservations),
-                    post_snapshot_reserved_tokens: Some(post_snapshot_reserved_tokens),
-                    post_snapshot_reserved_requests: Some(post_snapshot_reserved_requests),
-                    estimated_tokens,
-                    soft_cap,
-                },
+        let info = SelectWorkerInfo {
+            request_text,
+            tokens,
+            headers,
+            hash_ring,
+            load_snapshots: Some(load_snapshots),
+            local_reservations: Some(local_reservations),
+            post_snapshot_reserved_tokens: Some(post_snapshot_reserved_tokens),
+            post_snapshot_reserved_requests: Some(post_snapshot_reserved_requests),
+            estimated_tokens,
+            soft_cap,
+        };
+        let selected = if allow_tokenless_fallback && tokens.is_none() {
+            if let Some(prefix) = policy
+                .as_any()
+                .downcast_ref::<crate::policies::PrefixHashPolicy>()
+            {
+                // Keep MM/templates and unavailable CPU endpoints working with
+                // real load feedback, without inventing token IDs.
+                prefix.select_without_prefix(&available_workers, &info)
+            } else {
+                policy.select_worker(&available_workers, &info).await
+            }
+        } else {
+            policy.select_worker(&available_workers, &info).await
+        };
+        let selected_idx = selected.ok_or_else(|| {
+            format!(
+                "Policy {} failed to select a {} worker",
+                policy.name(),
+                worker_type
             )
-            .await
-            .ok_or_else(|| {
-                format!(
-                    "Policy {} failed to select a {} worker",
-                    policy.name(),
-                    worker_type
-                )
-            })?;
+        })?;
 
         Ok(available_workers[selected_idx].clone())
     }
@@ -2053,34 +2130,26 @@ impl RouterTrait for PDRouter {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let is_stream = body.stream;
-        let return_logprob = body.logprobs;
-
-        let request_text = if self.policies_need_request_text() || self.pd_prefill_stage_reservation
-        {
-            Self::build_chat_request_text(body)
-        } else {
-            None
+        let raw_body = match serde_json::to_value(body) {
+            Ok(body) => body,
+            Err(error) => return Self::handle_serialization_error(error),
         };
+        self.route_chat_value(headers, body, &raw_body, model_id)
+            .await
+    }
 
-        // Calculate batch size
-        let batch_size = Self::get_chat_batch_size(body);
-        let prefill_tokens = prefill_input_tokens(None, request_text.as_deref()).saturating_add(1);
-
-        let context = PDRequestContext {
-            route: "/v1/chat/completions",
-            batch_size,
-            is_stream,
-            return_logprob,
-            request_text,
-            tokens: None,
-            estimated_tokens: 0,
-            prefill_tokens,
-            model_id,
-            headers: headers.cloned(),
-        };
-
-        self.execute_dual_dispatch(headers, body, context).await
+    async fn route_chat_raw(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        raw_body: &Value,
+        model_id: Option<&str>,
+    ) -> Response {
+        if self.chat_affinity.is_none() {
+            return self.route_chat(headers, body, model_id).await;
+        }
+        self.route_chat_value(headers, body, raw_body, model_id)
+            .await
     }
 
     async fn route_completion(
@@ -2197,6 +2266,241 @@ impl RouterTrait for PDRouter {
 mod tests {
     use super::*;
     use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder, WorkerType};
+
+    #[derive(Debug)]
+    struct CaptureChatPolicy {
+        observed: Arc<Mutex<Vec<(Vec<u32>, usize)>>>,
+        pick: usize,
+    }
+    #[async_trait]
+    impl LoadBalancingPolicy for CaptureChatPolicy {
+        async fn select_worker(
+            &self,
+            _workers: &[Arc<dyn Worker>],
+            info: &SelectWorkerInfo<'_>,
+        ) -> Option<usize> {
+            self.observed.lock().unwrap().push((
+                info.tokens.unwrap_or_default().to_vec(),
+                info.estimated_tokens,
+            ));
+            Some(self.pick)
+        }
+        fn name(&self) -> &'static str {
+            "capture_chat"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    async fn mock_chat_backend(
+        token_response: Value,
+    ) -> (String, Arc<Mutex<Vec<Value>>>, Arc<Mutex<Vec<Value>>>) {
+        use axum::{routing::post, Json};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let token_bodies = Arc::new(Mutex::new(Vec::new()));
+        let generated = Arc::new(Mutex::new(Vec::new()));
+        let token_log = token_bodies.clone();
+        let generation_log = generated.clone();
+        let app = axum::Router::new()
+            .route("/v1/chat/tokenize", post(move |Json(body): Json<Value>| {
+                token_log.lock().unwrap().push(body);
+                let response = token_response.clone();
+                async move { Json(response) }
+            }))
+            .route("/v1/chat/completions", post(move |Json(body): Json<Value>| {
+                generation_log.lock().unwrap().push(body);
+                async { Json(json!({"choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 1}})) }
+            }));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, token_bodies, generated)
+    }
+
+    #[tokio::test]
+    async fn test_chat_affinity_exact_tokens_raw_extensions_and_independent_pd() {
+        let (url, token_bodies, generated) =
+            mock_chat_backend(json!({"supported":true,"version":1,"tokens":[10,20,30],"count":3}))
+                .await;
+        let mut router = create_test_pd_router();
+        router.chat_affinity = Some(ChatAffinity::default());
+        router.pd_prefill_stage_reservation = true;
+        for rank in 0..2 {
+            router.worker_registry.register(Arc::new(
+                DPAwareWorkerBuilder::new(url.clone(), rank, 2)
+                    .worker_type(WorkerType::Prefill {
+                        bootstrap_port: None,
+                    })
+                    .build(),
+            ));
+        }
+        // Distinct endpoint URLs distinguish pools in the registry.
+        let (durl, _, decode_generated) = mock_chat_backend(json!({"supported":false})).await;
+        for rank in 0..2 {
+            router.worker_registry.register(Arc::new(
+                DPAwareWorkerBuilder::new(durl.clone(), rank, 2)
+                    .worker_type(WorkerType::Decode)
+                    .build(),
+            ));
+        }
+        let p = Arc::new(Mutex::new(Vec::new()));
+        let d = Arc::new(Mutex::new(Vec::new()));
+        router
+            .policy_registry
+            .set_prefill_policy(Arc::new(CaptureChatPolicy {
+                observed: p.clone(),
+                pick: 1,
+            }));
+        router
+            .policy_registry
+            .set_decode_policy(Arc::new(CaptureChatPolicy {
+                observed: d.clone(),
+                pick: 0,
+            }));
+        let raw = json!({"model":"test-model", "messages":[{"role":"user","content":"hello","new_message_field":"keep"}], "max_tokens":7, "return_spec_tokens_details":true, "cache_details":true, "chat_template_kwargs":{"clear_thinking":true}});
+        let body = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(
+            router
+                .route_chat_raw(None, &body, &raw, None)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(*token_bodies.lock().unwrap(), vec![raw.clone()]);
+        assert_eq!(*p.lock().unwrap(), vec![(vec![10, 20, 30], 4)]);
+        assert_eq!(*d.lock().unwrap(), vec![(vec![10, 20, 30], 10)]);
+        for requests in [&generated, &decode_generated] {
+            let saved = requests.lock().unwrap();
+            assert_eq!(saved.len(), 1);
+            for key in [
+                "messages",
+                "return_spec_tokens_details",
+                "cache_details",
+                "chat_template_kwargs",
+            ] {
+                assert_eq!(saved[0][key], raw[key]);
+            }
+        }
+        assert!(router.reservations.views(&HashMap::new()).0.is_empty());
+        assert!(!router.pd_token_affinity);
+    }
+
+    #[tokio::test]
+    async fn test_chat_affinity_disabled_and_media_or_cpu_failure_fallback() {
+        for (enabled, media) in [(false, false), (true, false), (true, true)] {
+            let (purl, token_bodies, generated) =
+                mock_chat_backend(json!({"supported":false,"reason":"busy"})).await;
+            let (durl, _, _) = mock_chat_backend(json!({"supported":false})).await;
+            let mut router = create_test_pd_router();
+            router.chat_affinity = enabled.then(ChatAffinity::default);
+            router.retry_config.max_retries = 0;
+            if enabled {
+                router.policy_registry.set_prefill_policy(Arc::new(
+                    crate::policies::PrefixHashPolicy::with_defaults(),
+                ));
+                router.policy_registry.set_decode_policy(Arc::new(
+                    crate::policies::PrefixHashPolicy::with_defaults(),
+                ));
+            }
+            register_pd_workers(&router, purl, durl);
+            let content = if media {
+                json!([{"type":"image_url", "image_url":{"url":"https://never-fetch.test/image"}}])
+            } else {
+                json!("hello")
+            };
+            let raw = json!({"model":"test-model", "messages":[{"role":"user", "content":content}], "cache_details":true});
+            let body = serde_json::from_value(raw.clone()).unwrap();
+            assert_eq!(
+                router
+                    .route_chat_raw(None, &body, &raw, None)
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+            assert_eq!(
+                token_bodies.lock().unwrap().len(),
+                usize::from(enabled && !media)
+            );
+            assert_eq!(
+                generated.lock().unwrap()[0].get("cache_details").is_some(),
+                enabled
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chat_prefix_hash_reuses_owner_but_moves_decode_at_cap() {
+        let mut router = create_test_pd_router();
+        router.chat_affinity = Some(ChatAffinity::default());
+        router.pd_decode_inflight_cap = 1;
+        router
+            .policy_registry
+            .set_prefill_policy(Arc::new(crate::policies::PrefixHashPolicy::with_defaults()));
+        router
+            .policy_registry
+            .set_decode_policy(Arc::new(crate::policies::PrefixHashPolicy::with_defaults()));
+        for rank in 0..2 {
+            router.worker_registry.register(Arc::new(
+                DPAwareWorkerBuilder::new("http://prefill:1", rank, 2)
+                    .worker_type(WorkerType::Prefill {
+                        bootstrap_port: None,
+                    })
+                    .build(),
+            ));
+            router.worker_registry.register(Arc::new(
+                DPAwareWorkerBuilder::new("http://decode:2", rank, 2)
+                    .worker_type(WorkerType::Decode)
+                    .build(),
+            ));
+        }
+        let tokens = vec![42; 1024];
+        let (p1, d1, lease1) = router
+            .select_pd_pair(None, Some(&tokens), 1034, 1025, None, None, true)
+            .await
+            .unwrap();
+        let (p2, d2, lease2) = router
+            .select_pd_pair(None, Some(&tokens), 1034, 1025, None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(p1.url(), p2.url());
+        assert_ne!(d1.url(), d2.url());
+        assert!(router
+            .select_pd_pair(None, Some(&tokens), 1034, 1025, None, None, true)
+            .await
+            .is_err());
+        drop((lease1, lease2));
+        let (p3, d3, _) = router
+            .select_pd_pair(None, Some(&tokens), 1034, 1025, None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(p1.url(), p3.url());
+        assert_eq!(d1.url(), d3.url());
+    }
+
+    #[tokio::test]
+    async fn test_chat_switch_does_not_enable_native_strict_token_contract() {
+        let purl = mock_worker(StatusCode::OK, Body::from("{}")).await;
+        let durl = mock_worker(StatusCode::OK, Body::from("{}")).await;
+        let mut router = create_test_pd_router();
+        router.chat_affinity = Some(ChatAffinity::default());
+        router
+            .policy_registry
+            .set_prefill_policy(Arc::new(crate::policies::PrefixHashPolicy::with_defaults()));
+        router
+            .policy_registry
+            .set_decode_policy(Arc::new(crate::policies::PrefixHashPolicy::with_defaults()));
+        register_pd_workers(&router, purl, durl);
+        let raw =
+            json!({"text":"native text remains supported","sampling_params":{"max_new_tokens":1}});
+        let body = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(
+            router
+                .route_generate_raw(None, &body, &raw, None)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
 
     async fn mock_worker(status: StatusCode, body: Body) -> String {
         use axum::routing::post;
@@ -2398,6 +2702,7 @@ mod tests {
             api_key: Some("test_api_key".to_string()),
             enable_igw: false,
             pd_token_affinity: false,
+            chat_affinity: None,
             pd_prefill_stage_reservation: false,
             pd_decode_inflight_cap: 2,
             load_snapshots,

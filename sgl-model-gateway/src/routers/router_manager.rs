@@ -590,6 +590,47 @@ impl RouterTrait for RouterManager {
         }
     }
 
+    async fn route_chat_raw(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        raw_body: &Value,
+        model_id: Option<&str>,
+    ) -> Response {
+        // In IGW mode, resolve model_id and fail fast if not resolvable
+        // In non-IGW mode, pass through to router (router handles validation)
+        let effective_model_id = if self.enable_igw {
+            // Use provided model_id or fall back to body.model
+            let model = model_id.or(Some(&body.model));
+            match self.resolve_model_id(model) {
+                Ok(id) => Some(id),
+                Err(err_response) => return *err_response,
+            }
+        } else {
+            None
+        };
+
+        let router =
+            self.select_router_for_request(headers, effective_model_id.as_deref().or(model_id));
+
+        if let Some(router) = router {
+            router
+                .route_chat_raw(
+                    headers,
+                    body,
+                    raw_body,
+                    effective_model_id.as_deref().or(model_id),
+                )
+                .await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Model '{}' not found or no router available", body.model),
+            )
+                .into_response()
+        }
+    }
+
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,
