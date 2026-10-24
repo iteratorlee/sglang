@@ -16,7 +16,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
-from sglang.srt.utils import GLM_MEDIA_CONFIG_KEYS
+from sglang.srt.utils import GLM_MEDIA_CONFIG_KEYS, is_npu
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
 try:
@@ -481,6 +481,14 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             # Note: For GLM4v videos, it uses the video token before tokenization but uses image token after tokenization
             video_token_id=self.IM_TOKEN_ID,
         ).build(_processor)
+
+    def _fast_image_processor_device(self, processor):
+        if getattr(self.hf_config, "model_type", None) == "glm5_next" and is_npu():
+            # Match the checkpoint's CPU bicubic resize/normalization. Ascend
+            # downsampling can produce different pixels; preprocessing must not
+            # silently change the model input. The vision encoder runs on NPU.
+            return "cpu"
+        return super()._fast_image_processor_device(processor)
 
     def get_mm_item_offsets(
         self,

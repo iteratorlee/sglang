@@ -216,9 +216,16 @@ class Glm5NextImageProcessor(TorchvisionBackend):
             patch_size,
         )
         patches = patches.permute(0, 2, 5, 3, 6, 1, 4, 7)
+        # Materialize the spatial permutation before adding the temporal
+        # axis. Ascend's copy kernels accept at most eight dimensions; the
+        # equivalent expanded nine-dimensional view cannot be reshaped there.
+        # Preserve the checkpoint order: image, merged patch, C, T, H, W.
+        patches = patches.reshape(
+            batch_size, grid_h * grid_w, channel, patch_size, patch_size
+        )
         flatten_patches = (
-            patches.unsqueeze(6)
-            .expand(-1, -1, -1, -1, -1, -1, temporal_patch_size, -1, -1)
+            patches.unsqueeze(3)
+            .expand(-1, -1, -1, temporal_patch_size, -1, -1)
             .reshape(
                 batch_size,
                 grid_h * grid_w,
