@@ -111,6 +111,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import (
     BumpAllocator,
     LazyValue,
@@ -128,7 +129,9 @@ if _use_aiter_gfx95:
 logger = logging.getLogger(__name__)
 
 
-@torch.compile
+# Ascend Inductor fails when the ViT MLP and merger reuse this function
+# with different symbolic widths. Keep the same math without compiling on NPU.
+@torch.compile(disable=is_npu())
 def swiglu_clamped(y: torch.Tensor, limit: float):
     gate, up = torch.chunk(y, 2, dim=-1)
     gate = torch.clamp(gate, max=limit)
