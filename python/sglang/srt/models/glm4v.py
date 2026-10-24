@@ -84,10 +84,17 @@ class Glm4vVisionMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
+        use_dp_attention_reduce: bool = False,
     ):
         super().__init__()
-        self.tp_size = 1 if use_data_parallel else get_parallel().tp_size
-        self.tp_rank = 0 if use_data_parallel else get_parallel().tp_rank
+        if use_data_parallel:
+            self.tp_size, self.tp_rank = 1, 0
+        elif use_dp_attention_reduce:
+            self.tp_size = get_parallel().attn_tp_size
+            self.tp_rank = get_parallel().attn_tp_rank
+        else:
+            self.tp_size = get_parallel().tp_size
+            self.tp_rank = get_parallel().tp_rank
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=in_features,
             output_sizes=[hidden_features] * 2,  # [gate_proj, up_proj]
@@ -105,6 +112,7 @@ class Glm4vVisionMLP(nn.Module):
             prefix=add_prefix("down_proj", prefix),
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
+            use_dp_attention_reduce=use_dp_attention_reduce,
         )
         self.act_fn = SiluAndMul()
 
@@ -234,11 +242,18 @@ class Glm4vPatchMerger(nn.Module):
         bias: bool = False,
         prefix: str = "",
         use_data_parallel: bool = False,
+        use_dp_attention_reduce: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = d_model
-        tp_size = 1 if use_data_parallel else get_parallel().tp_size
-        tp_rank = 0 if use_data_parallel else get_parallel().tp_rank
+        if use_data_parallel:
+            tp_size, tp_rank = 1, 0
+        elif use_dp_attention_reduce:
+            tp_size = get_parallel().attn_tp_size
+            tp_rank = get_parallel().attn_tp_rank
+        else:
+            tp_size = get_parallel().tp_size
+            tp_rank = get_parallel().tp_rank
         self.proj = ReplicatedLinear(
             self.hidden_size,
             self.hidden_size,
@@ -264,6 +279,7 @@ class Glm4vPatchMerger(nn.Module):
             prefix=add_prefix("down_proj", prefix),
             tp_size=tp_size,
             tp_rank=tp_rank,
+            use_dp_attention_reduce=use_dp_attention_reduce,
         )
         self.extra_activation_func = nn.GELU()
 

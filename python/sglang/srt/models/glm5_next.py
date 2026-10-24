@@ -103,7 +103,13 @@ from sglang.srt.multimodal.mm_utils import (
     run_dp_presharded_mrope_vision_model,
     run_dp_sharded_mrope_vision_model,
 )
-from sglang.srt.runtime_context import get_forward, get_mm, get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_forward,
+    get_mm,
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
     BumpAllocator,
@@ -148,6 +154,7 @@ class Glm5NextVisionMLP(GlmOcrVisionMLP):
             quant_config=quant_config,
             prefix=prefix,
             use_data_parallel=use_data_parallel,
+            use_dp_attention_reduce=True,
         )
         self.swiglu_limit = swiglu_limit
 
@@ -176,6 +183,7 @@ class Glm5NextVisionPatchMerger(GlmOcrVisionPatchMerger):
             bias=bias,
             prefix=prefix,
             use_data_parallel=use_data_parallel,
+            use_dp_attention_reduce=True,
         )
         self.swiglu_limit = swiglu_limit
 
@@ -218,6 +226,7 @@ class Glm5NextVisionBlock(GlmOcrVisionBlock):
             prefix=add_prefix("attn", prefix),
             num_dummy_heads=num_dummy_heads,
             use_data_parallel=use_data_parallel,
+            use_dp_attention_reduce=True,
         )
         self.mlp = Glm5NextVisionMLP(
             dim,
@@ -1176,7 +1185,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
         self.mm_config = config
         text_config = config.text_config
         self.encoder_only = bool(getattr(config, "encoder_only", False))
-        self.language_only = bool(getattr(config, "language_only", False))
+        # PD decode consumes transferred KV and never runs the visual tower.
+        # Keep this local to the model so image tokenization/processing stays
+        # enabled, and avoid allocating unused attention-TP vision weights.
+        self.language_only = bool(getattr(config, "language_only", False)) or (
+            not self.encoder_only and get_disagg().disaggregation_mode == "decode"
+        )
 
         self.fuse_qkv_a_proj = (
             not self.encoder_only
