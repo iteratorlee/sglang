@@ -11,7 +11,11 @@
 //! The ring is rebuilt only when workers are added/removed, not per-request.
 //! Uses virtual nodes (150 per worker) for even distribution and blake3 for stable hashing.
 
-use std::sync::{Arc, RwLock};
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    sync::{Arc, RwLock},
+};
 
 use dashmap::DashMap;
 use smg_mesh::OptionalMeshSyncManager;
@@ -45,6 +49,7 @@ pub struct HashRing {
     /// Multiple entries per worker (virtual nodes) for even distribution.
     /// Uses Arc<str> to share URL across all virtual nodes (150 refs vs 150 copies).
     entries: Arc<[(u64, Arc<str>)]>,
+    membership_fingerprint: u64,
 }
 
 impl HashRing {
@@ -74,9 +79,24 @@ impl HashRing {
         // Sort by ring position for binary search
         entries.sort_unstable_by_key(|(pos, _)| *pos);
 
+        // Stable across health/load filtering and registration order, but not
+        // across changes to the registered model/role/URL membership.
+        let mut members: Vec<_> = workers
+            .iter()
+            .map(|w| (w.url(), w.model_id(), w.worker_type().as_metric_label()))
+            .collect();
+        members.sort_unstable();
+        let mut hasher = DefaultHasher::new();
+        members.hash(&mut hasher);
+
         Self {
             entries: Arc::from(entries.into_boxed_slice()),
+            membership_fingerprint: hasher.finish(),
         }
+    }
+
+    pub(crate) fn membership_fingerprint(&self) -> u64 {
+        self.membership_fingerprint
     }
 
     /// Hash a string to a ring position using blake3 (stable across versions).
