@@ -18,11 +18,13 @@ Records the latency of some functions
 import asyncio
 import time
 from functools import wraps
+from threading import Lock
 from typing import Any, Callable, Optional
 
 from sglang.srt.observability.utils import exponential_buckets
 
 enable_metrics = False
+_func_timer_init_lock = Lock()
 
 
 def enable_func_timer():
@@ -30,15 +32,20 @@ def enable_func_timer():
     from prometheus_client import Histogram
 
     global enable_metrics, FUNC_LATENCY
-    enable_metrics = True
-
-    FUNC_LATENCY = Histogram(
-        "sglang:func_latency_seconds",
-        "Function latency in seconds",
-        # captures latency in range [50ms - ~50s]
-        buckets=exponential_buckets(start=0.05, width=1.5, length=18),
-        labelnames=["name"],
-    )
+    # Auxiliary HTTP and primary application startup may both enable timers
+    # in this process. Preserve the collector and its observations; registering
+    # it again raises DuplicateTimeseries and can terminate a serving node.
+    with _func_timer_init_lock:
+        if FUNC_LATENCY is None:
+            FUNC_LATENCY = Histogram(
+                "sglang:func_latency_seconds",
+                "Function latency in seconds",
+                # captures latency in range [50ms - ~50s]
+                buckets=exponential_buckets(start=0.05, width=1.5, length=18),
+                labelnames=["name"],
+            )
+        # Publish only after a collector exists, including constructor failure.
+        enable_metrics = True
 
 
 FUNC_LATENCY = None
