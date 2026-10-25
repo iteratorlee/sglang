@@ -1182,9 +1182,13 @@ class SchedulerDisaggregationPrefillMixin:
         running_batch: ScheduleBatch,
     ) -> None:
         chunked_req_to_exclude = set()
+        if getattr(self, "_glm53_interleaved_resume_owner", None) is not self.chunked_req:
+            self._glm53_interleaved_resume_owner = None
         if (req := self.chunked_req) is not None:
             chunked_req_to_exclude.add(req)
-            maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+            owner_paused = getattr(self, "_glm53_interleaved_resume_owner", None) is req
+            if not owner_paused:
+                maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
             if not self.check_bootstrap(req):
                 if is_aborted(req):
@@ -1202,11 +1206,13 @@ class SchedulerDisaggregationPrefillMixin:
                     req.extend_range.end,
                     len(req.origin_input_ids),
                 )
-            else:
+            elif not owner_paused:
                 self.send_kv_chunk(req)
 
             if self.chunked_req is not None:
                 running_batch.batch_is_full = False
+            elif owner_paused:
+                self._glm53_interleaved_resume_owner = None
 
         if last_batch and last_batch.forward_mode.is_extend():
             if last_batch.chunked_req:

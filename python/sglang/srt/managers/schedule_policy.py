@@ -61,6 +61,7 @@ from sglang.srt.mem_cache.allocator.unified_mamba import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    EvictParams,
     InitLoadBackParams,
     InsertParams,
     MatchPrefixParams,
@@ -1136,6 +1137,58 @@ class PrefillAdder:
                 self.tree_cache.dec_lock_ref(last_node, dec_lock_params)
             else:
                 self.tree_cache.dec_lock_ref(last_node)
+
+    def add_interleaved_hot_req(self, req: Req, owner_reserve: int) -> bool:
+        """Admit one whole HBM hit using normal COW/admission/eviction paths.
+
+        Fixed pool only. Four recoverable states cover live + track + hot
+        donation + next-owner donation. Owner's existing states remain pinned.
+        """
+        assert not self.can_run_list and not self._mamba_slot_cost
+        pool = self.tree_cache.req_to_token_pool.mamba_allocator
+        admitted = False
+        self.rem_total_token_offset += owner_reserve
+        self.cur_rem_token_offset += owner_reserve
+        try:
+            with self._lock_node(req.last_node):
+                suffix = len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+                need = self.ceil_paged_tokens(suffix) + self.page_size
+                max_new = min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                if need + max_new >= min(self.rem_total_tokens, self.cur_rem_tokens):
+                    return False
+                free = pool.schedulable_available_size()
+                if free + self.tree_cache.mamba_evictable_size() < 4:
+                    return False
+                if free < 4:
+                    self.tree_cache.evict_for_alloc(
+                        EvictParams(num_tokens=0, mamba_num=4 - free)
+                    )
+                if pool.schedulable_available_size() < 4:
+                    return False
+                # The temporary lock protects the COW source through eviction,
+                # rematching and admission. add_one_req takes the lasting lock.
+                prefix_len = len(req.prefix_indices)
+                req.init_next_round_input(self.tree_cache)
+                if (
+                    not req.kv.holds_mamba or req.needs_host_load_back()
+                    or req.mamba_branching_seqlen is not None
+                    or len(req.prefix_indices) != prefix_len
+                ):
+                    return False
+                self.add_one_req(req, has_chunked_req=True, truncation_align_size=None)
+                admitted = bool(self.can_run_list and self.can_run_list[-1] is req)
+                if admitted:
+                    assert self.new_chunked_req is None
+                return admitted
+        finally:
+            if not admitted:
+                req.kv.mamba_cow_src_index = None
+                req.kv.mamba_needs_clear = False
+                if req.kv.holds_mamba:
+                    pool.free(req.kv.mamba_pool_idx.unsqueeze(-1))
+                    req.kv.mamba_pool_idx = None
+                self.rem_total_token_offset -= owner_reserve
+                self.cur_rem_token_offset -= owner_reserve
 
     def add_one_req_ignore_eos(self, req: Req):
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(

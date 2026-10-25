@@ -211,6 +211,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
+    CLIP_MAX_NEW_TOKENS,
     PrefillAdder,
     SchedulePolicy,
 )
@@ -3733,6 +3734,119 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _glm53_interleaved_prefill_enabled(self, adder, running_batch):
+        """Experimental fixed-pool P profile; one complete warm request per yield."""
+        if os.environ.get("SGLANG_GLM53_INTERLEAVED_PREFILL", "0") != "1":
+            return False
+        cache, owner = self.tree_cache, self.chunked_req
+        if (
+            not _is_npu
+            or self.disaggregation_mode != DisaggregationMode.PREFILL
+            or self.enable_overlap
+            or self.schedule_policy != "fcfs"
+            or self.enable_priority_scheduling
+            or self.enable_priority_preemption
+            or self.enable_lora
+            or self.is_mixed_chunk
+            or self.is_hybrid_swa
+            or self.dllm_config is not None
+            or self.dynamic_chunk_sizer is not None
+            or self.enable_unified_cache_external_linker
+            or self._use_glm53_jit_prefetch()
+            or not running_batch.is_empty()
+            or adder._mamba_slot_cost  # Shared byte pools need a separate proof.
+            or getattr(self.req_to_token_pool, "mamba_ckpt_pool", None) is not None
+            or type(cache).__name__ != "UnifiedRadixCache"
+            or type(cache).__module__ != "sglang.srt.mem_cache.unified_radix_cache"
+            or cache.disable
+            or not cache.supports_mamba()
+            or not cache.enable_mamba_extra_buffer
+            or cache.host_memory_mode != "cache"
+            or getattr(cache, "glm53_kpool_share_page_size", None) != 256
+            or cache.page_size != 256
+            or self.page_size != 64
+            or "Glm5NextForConditionalGeneration"
+            not in (getattr(self.model_config.hf_config, "architectures", None) or ())
+            or owner is None
+            or owner.finished()
+            or owner.inflight_middle_chunks != 0
+            or getattr(owner, "pending_bootstrap", False)
+            or not owner.kv.holds_kv
+            or not owner.kv.holds_mamba
+            or owner.kv.mamba_ping_pong_track_buffer is None
+            or len(owner.prefix_indices) == 0
+            or owner.extend_range.end != len(owner.prefix_indices)
+            or owner.mamba_branching_seqlen is not None
+            or self.chunked_prefill_size is None
+            or self.chunked_prefill_size <= 0
+            or adder.prefill_delayer_single_pass is not None
+        ):
+            return False
+        execution, parallel = get_exec(), get_parallel()
+        return (
+            execution.mamba.enable_mamba_extra_buffer
+            and not execution.mamba.enable_mamba_extra_buffer_lazy
+            and get_schedule().disable_overlap_schedule
+            and not execution.overlap.enable_two_batch_overlap
+            and not execution.overlap.enable_single_batch_overlap
+            and not execution.deterministic.enable_deterministic_inference
+            and parallel.pp_size == parallel.attn_cp_size == parallel.dcp_size == 1
+            and not parallel.enable_prefill_cp
+            and self.req_to_token_pool.mamba_ping_pong_track_buffer_size == 1
+        )
+
+    def _try_glm53_interleaved_prefill(self, adder, running_batch):
+        owner = self.chunked_req
+        if getattr(self, "_glm53_interleaved_resume_owner", None) is owner:
+            return False  # One hot forward, then the owner must run.
+        if (
+            self.get_num_allocatable_reqs(0, running_batch=running_batch) <= 0
+            or self.req_to_token_pool.available_size() <= 0
+            or (self.req_to_token_pool.size - self.req_to_token_pool.available_size()
+                >= self.max_running_requests)
+            or adder.prefill_max_requests == 0
+        ):
+            return False
+        remaining = len(owner.full_untruncated_fill_ids) - len(owner.prefix_indices)
+        if remaining <= 0:
+            return False
+        # Keep enough KV for the owner's unchanged next chunk while the hot
+        # request's transfer retains its row, live state, track state and KV.
+        owner_reserve = (
+            adder.ceil_paged_tokens(min(remaining, self.chunked_prefill_size))
+            + self.page_size
+            + min(owner.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+        )
+        for req in self.waiting_queue[:32]:
+            if (
+                req.finished() or req.kv.holds_kv or req.kv.holds_mamba
+                or req.session is not None or req.beam_group is not None
+                or req.multimodal_inputs is not None or req.input_embeds is not None
+                or getattr(req, "positional_embed_overrides", None) is not None
+                or req.return_logprob or getattr(req, "return_sampling_mask", False)
+                or getattr(req, "grammar", None) is not None
+                or getattr(req, "pending_bootstrap", False)
+                or req.output_ids or req.retracted_stain
+                or req.rid in getattr(self.tree_cache, "ongoing_prefetch", {})
+                or getattr(self.tree_cache, "prefetch_loaded_tokens_by_reqid", {}).get(req.rid, 0)
+                or req.storage_hit_length or req.host_loaded_length
+            ):
+                continue
+            # Probe without COW, load-back or consuming a staging/prefetch result.
+            req.init_next_round_input(self.tree_cache, cow_mamba=False)
+            suffix = len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+            if (
+                len(req.prefix_indices) == 0 or not 0 < suffix <= 512
+                or req.needs_host_load_back()
+                or req.mamba_branching_seqlen is not None
+                or adder.ceil_paged_tokens(suffix)
+                > min(adder.rem_input_tokens, adder.rem_chunk_tokens)
+            ):
+                continue
+            if adder.add_interleaved_hot_req(req, owner_reserve):
+                return True
+        return False
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -3837,7 +3951,15 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
         )
 
-        if self.chunked_req is not None:
+        interleave_owner = (
+            self.chunked_req
+            if self._glm53_interleaved_prefill_enabled(adder, running_batch)
+            else None
+        )
+        hot_only = interleave_owner is not None and self._try_glm53_interleaved_prefill(
+            adder, running_batch
+        )
+        if self.chunked_req is not None and not hot_only:
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
@@ -3856,10 +3978,12 @@ class Scheduler(
 
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
-            mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+            mamba_allocator.alloc_group_begin(0 if interleave_owner is not None else len(self.waiting_queue))
         jit_prefetch = self._use_glm53_jit_prefetch()
         jit_prefetch_owner = None
-        prefill_candidates = self.waiting_queue
+        prefill_candidates = (
+            [] if interleave_owner is not None else self.waiting_queue
+        )
         if jit_prefetch:
             # Keep the one attempted-but-unadmitted candidate ahead of
             # new arrivals/requeues even if calc_priority reordered them.
@@ -4034,8 +4158,9 @@ class Scheduler(
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
 
-        if self.chunked_req is not None:
-            self.chunked_req.inflight_middle_chunks += 1
+        batch_chunked_req = None if hot_only else self.chunked_req
+        if batch_chunked_req is not None:
+            batch_chunked_req.inflight_middle_chunks += 1
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
@@ -4048,11 +4173,11 @@ class Scheduler(
             self.model_config,
             self.enable_overlap,
             self.spec_algorithm,
-            chunked_req=self.chunked_req,
+            chunked_req=batch_chunked_req,
         )
 
         new_batch.contains_last_prefill_chunk = (
-            self.chunked_req is None or len(can_run_list) != 1
+            batch_chunked_req is None or len(can_run_list) != 1
         )
 
         if self.enable_hierarchical_cache or self.enable_unified_cache_external_linker:
@@ -4062,6 +4187,20 @@ class Scheduler(
             )
 
         new_batch.prepare_for_extend()
+        if interleave_owner is not None:
+            # CPU-only cumulative evidence, read outside the timing window.
+            counts = getattr(self, "_glm53_hot_lane_counts", None)
+            if counts is None:
+                counts = self._glm53_hot_lane_counts = [0, 0, 0, 0]
+            counts[0] += 1
+            counts[1] += int(hot_only)
+            counts[2] += int(hot_only)
+            if hot_only:
+                counts[3] += adder.ceil_paged_tokens(can_run_list[0].extend_range.length)
+        if hot_only:
+            self._glm53_interleaved_resume_owner = interleave_owner
+        elif getattr(self, "_glm53_interleaved_resume_owner", None) in can_run_list:
+            self._glm53_interleaved_resume_owner = None
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
@@ -4074,8 +4213,8 @@ class Scheduler(
             self.enable_priority_scheduling,
             num_pending_tokens=self.load_inquirer._get_num_pending_tokens(
                 chunk_deduct=(
-                    self.chunked_req.extend_range.length
-                    if self.chunked_req is not None
+                    batch_chunked_req.extend_range.length
+                    if batch_chunked_req is not None
                     else 0
                 ),
             ),
@@ -5080,6 +5219,17 @@ class Scheduler(
         )
         ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            counts = getattr(self, "_glm53_hot_lane_counts", [0, 0, 0, 0])
+            ret["glm53_prefill_hot_lane"] = {
+                "mode": "standalone",
+                "dp_rank": self.ps.attn_dp_rank,
+                "attn_tp_rank": self.ps.attn_tp_rank,
+                "eligible_batches": counts[0],
+                "admitted_batches": counts[1],
+                "admitted_requests": counts[2],
+                "admitted_paged_tokens": counts[3],
+            }
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             ret["benchmark_decode_admission_hold"] = bool(
                 getattr(self, "_benchmark_decode_admission_hold", False)
