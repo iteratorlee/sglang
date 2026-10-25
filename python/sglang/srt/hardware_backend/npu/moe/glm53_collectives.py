@@ -48,6 +48,9 @@ _reduce_scatter_check_logged = False
 _device_routing_logged = False
 _ordered_combine_logged = False
 _NORMAL_PACKED_GATHER = os.getenv("SGLANG_GLM53_NORMAL_PACKED_GATHER", "0") == "1"
+_NORMAL_STATIC_GPU_ROUTE_CAPABLE = os.getenv("SGLANG_GLM53_NORMAL_STATIC_GPU_ROUTE", "0") == "1"
+_NORMAL_STATIC_GPU_ROUTE_ENABLED = _NORMAL_STATIC_GPU_ROUTE_CAPABLE
+_NORMAL_STATIC_GPU_ROUTE_MIN_ORIGINAL_MAX = 128
 _packed_target_metadata = ContextVar("glm53_normal_packed_target_metadata", default=None)
 
 
@@ -58,6 +61,45 @@ def get_normal_packed_gather_stats():
     from .glm53_packed_gather import get_packed_gather_stats
 
     return get_packed_gather_stats()
+
+
+def set_normal_static_gpu_route(enabled):
+    """CPU enable flag only; startup capability cannot be changed here.
+
+    Caller must enforce idle-only mutation; no admin API is added here.
+
+    All ranks keep the same gather/combine protocol. Mixed local flags are
+    mathematically compatible only AFTER full FFN byte parity is established.
+    """
+    global _NORMAL_STATIC_GPU_ROUTE_ENABLED
+    if type(enabled) not in (bool, int) or enabled not in (0, 1):
+        raise ValueError("static route flag must be boolean or integer 0/1")
+    if enabled and not _NORMAL_STATIC_GPU_ROUTE_CAPABLE:
+        raise RuntimeError("static routing was not enabled as a startup capability")
+    _NORMAL_STATIC_GPU_ROUTE_ENABLED = bool(enabled)
+
+
+def get_normal_static_gpu_route_stats():
+    from .glm53_static_gpu_route import get_static_gpu_route_stats
+    return dict(get_static_gpu_route_stats(), startup_capable=_NORMAL_STATIC_GPU_ROUTE_CAPABLE,
+                enabled=_NORMAL_STATIC_GPU_ROUTE_ENABLED,
+                min_shared_original_max=_NORMAL_STATIC_GPU_ROUTE_MIN_ORIGINAL_MAX)
+
+
+def _static_route_rank_mapping(group, world, rank):
+    """Same CPU topology checks as the old whole-idle-domain route filter."""
+    from sglang.srt.runtime_context import get_parallel
+    parallel = get_parallel()
+    ep = parallel.moe_ep_group
+    tp_ranks = parallel.tp_group.ranks
+    return (
+        world == ep.world_size == 16 and ep.device_group is group
+        and len(tp_ranks) == 16 and list(ep.ranks) == list(tp_ranks)
+        and list(ep.ranks) == list(range(ep.ranks[0], ep.ranks[0] + 16))
+        and ep.rank_in_group == rank and parallel.attn_dp_size == 2
+        and parallel.attn_tp_size == 8 and parallel.attn_dp_rank == rank // 8
+        and parallel.attn_tp_rank == rank % 8
+    )
 
 
 def release_normal_hccl_cached_memory(x):
@@ -453,14 +495,17 @@ def normal_hccl_idle_dp_scope(forward_batch, mlp_context=None, *, layer_id=None)
 
         if forward_batch.forward_mode == ForwardMode.EXTEND:
             counts, padded = _normal_dp_shape_metadata(forward_batch)
-            if _NORMAL_PACKED_GATHER and layer_id is not None:
+            if (_NORMAL_PACKED_GATHER or _NORMAL_STATIC_GPU_ROUTE_CAPABLE) and layer_id is not None:
                 if forward_batch.can_run_tbo:
-                    raise RuntimeError("GLM packed gather requires non-overlap target scope")
-                packed_metadata = (counts, padded)
+                    if _NORMAL_PACKED_GATHER:
+                        raise RuntimeError("GLM packed gather requires non-overlap target scope")
+                else:
+                    packed_metadata = (counts, padded)
     with nullcontext() if mlp_context is None else mlp_context:
         token = _idle_dp_counts.set(counts)
         # NextN has idle counts too: explicitly mask a nested target scope.
-        packed_token = _packed_target_metadata.set(packed_metadata) if _NORMAL_PACKED_GATHER else None
+        packed_token = (_packed_target_metadata.set(packed_metadata)
+                        if (_NORMAL_PACKED_GATHER or _NORMAL_STATIC_GPU_ROUTE_CAPABLE) else None)
         try:
             with _normal_hccl_layer_shape_scope(forward_batch, layer_id):
                 yield
@@ -747,6 +792,25 @@ def collective_dispatch(group, x, ids, weights, num_experts=288):
             )
     if not packed:
         all_q, all_scale, all_ids, all_weights = map(gather, (q, scale, ids, weights))
+    # Local post-gather routing only: never changes quantization or collectives.
+    if (_NORMAL_STATIC_GPU_ROUTE_ENABLED and ordered and num_experts == 288
+            and os.getenv("SGLANG_GLM53_NORMAL_COMBINE_ORDERED", "0") == "2node"
+            and os.getenv("SGLANG_GLM53_NORMAL_SKIP_IDLE_DP", "0") == "1"):
+        from .glm53_static_gpu_route import (
+            payload_supported, static_gpu_dispatch, static_route_geometry,
+        )
+        metadata = _packed_target_metadata.get()
+        geometry = static_route_geometry(world, metadata)
+        if (geometry is not None
+                and max(metadata[0]) >= _NORMAL_STATIC_GPU_ROUTE_MIN_ORIGINAL_MAX
+                and tokens == geometry.local_rows
+                and _idle_dp_counts.get() == metadata[0]
+                and payload_supported(all_q, all_scale, all_ids, all_weights, geometry, rank)
+                and _static_route_rank_mapping(group, world, rank)):
+            result = static_gpu_dispatch(
+                all_q, all_scale, all_ids, all_weights, geometry, rank)
+            _last_dispatch_metadata = (rank, world, tokens, width, x.dtype, q.dtype, scale.dtype)
+            return result
     # The scope is published only for EXTEND in the eager, non-overlap
     # two-node P profile. Keep all other normal profiles on the CPU reference
     # path, even if the flag is inherited by another worker (including D).

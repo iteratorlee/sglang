@@ -5194,6 +5194,123 @@ class Scheduler(
             success = False
         return success
 
+    def _glm53_static_route_control_topology(self):
+        ps = self.ps
+        return (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            and ps.tp_size == ps.moe_ep_size == 16
+            and ps.attn_dp_size == 2 and ps.attn_tp_size == 8
+            and ps.pp_size == ps.attn_cp_size == 1
+        )
+
+    def _glm53_static_route_local_receipt(self):
+        # All fields are CPU metadata. No tensor counts, device fences or queries.
+        ps = self.ps
+        row = dict(tp_rank=ps.tp_rank, ep_rank=ps.moe_ep_rank,
+                   dp_rank=ps.attn_dp_rank, attn_tp_rank=ps.attn_tp_rank,
+                   idle=False, scope_ok=False, startup_capable=False,
+                   enabled=False, min_shared_original_max=None, error=None)
+        try:
+            from sglang.srt.hardware_backend.npu.moe.glm53_collectives import (
+                get_normal_static_gpu_route_stats, normal_hccl_skip_idle_dp_enabled,
+            )
+            # Read the mutable module flag even when startup env is absent/0.
+            stats = get_normal_static_gpu_route_stats()
+            row.update(stats=stats, idle=bool(self.is_fully_idle(for_health_check=False)),
+                       scope_ok=bool(normal_hccl_skip_idle_dp_enabled()),
+                       startup_capable=stats["startup_capable"], enabled=stats["enabled"],
+                       min_shared_original_max=stats["min_shared_original_max"])
+        except Exception as exc:
+            # A local failure must still participate in the CPU agreement round.
+            row["error"] = f"{type(exc).__name__}: {exc}"
+        return row
+
+    def _glm53_static_route_gather_receipts(self, row):
+        # Full TP CPU group covers both DP domains. dp_tp_cpu_group covers only8.
+        group = self.tp_cpu_group
+        if (torch.distributed.get_world_size(group=group) != 16
+                or torch.distributed.get_backend(group=group) != "gloo"):
+            raise RuntimeError("static-route control requires the existing full TP16 Gloo group")
+        rows = [None] * 16
+        torch.distributed.all_gather_object(rows, row, group=group)
+        return rows
+
+    @staticmethod
+    def _glm53_static_route_receipts_valid(rows):
+        if len(rows) != 16 or not all(isinstance(row, dict) for row in rows):
+            return False
+        if sorted(row.get("tp_rank", -1) for row in rows) != list(range(16)):
+            return False
+        return all(
+            row.get("ep_rank") == row["tp_rank"]
+            and row.get("dp_rank") == row["tp_rank"] // 8
+            and row.get("attn_tp_rank") == row["tp_rank"] % 8
+            and row.get("error") is None
+            and type(row.get("enabled")) is bool
+            and type(row.get("startup_capable")) is bool
+            and row.get("min_shared_original_max") == 128
+            for row in rows
+        )
+
+    def _glm53_static_route_control_readback(self):
+        if not self._glm53_static_route_control_topology():
+            return {"schema": "glm53_static_route_control/v1", "supported_topology": False}
+        rows = self._glm53_static_route_gather_receipts(self._glm53_static_route_local_receipt())
+        valid = self._glm53_static_route_receipts_valid(rows)
+        return dict(
+            schema="glm53_static_route_control/v1", supported_topology=True,
+            complete_rank_receipts=valid,
+            global_idle=valid and all(row["idle"] for row in rows),
+            all_startup_capable=valid and all(row["startup_capable"] for row in rows),
+            uniform_enabled=valid and len({row["enabled"] for row in rows}) == 1,
+            rank_receipts=rows,
+            last_control=getattr(self, "_glm53_static_route_last_control", None),
+        )
+
+    def _set_glm53_static_route_control(self, server_args_dict):
+        key = "glm53_normal_static_gpu_route"
+        if not self._glm53_static_route_control_topology():
+            return SetInternalStateReqOutput(updated=False)
+        value = server_args_dict[key]
+        local = self._glm53_static_route_local_receipt()
+        local.update(requested=value, request_valid=(
+            len(server_args_dict) == 1 and type(value) is int and value in (0, 1)))
+        before = self._glm53_static_route_gather_receipts(local)
+        valid = self._glm53_static_route_receipts_valid(before)
+        allowed = valid and all(
+            row["request_valid"] and row["requested"] == value
+            and row["idle"] and row["scope_ok"] and row["startup_capable"]
+            for row in before
+        )
+        if not allowed:
+            self._glm53_static_route_last_control = dict(
+                updated=False, requested=value, phase="rejected_before_mutation",
+                before=before, after=None)
+            return SetInternalStateReqOutput(updated=False)
+        setter_error = None
+        try:
+            from sglang.srt.hardware_backend.npu.moe.glm53_collectives import (
+                set_normal_static_gpu_route,
+            )
+            set_normal_static_gpu_route(value)
+        except Exception as exc:
+            setter_error = f"{type(exc).__name__}: {exc}"
+        local = self._glm53_static_route_local_receipt()
+        local["setter_error"] = setter_error
+        after = self._glm53_static_route_gather_receipts(local)
+        updated = self._glm53_static_route_receipts_valid(after) and all(
+            row["setter_error"] is None and row["idle"] and row["scope_ok"]
+            and row["startup_capable"] and row["enabled"] == bool(value)
+            for row in after
+        )
+        self._glm53_static_route_last_control = dict(
+            updated=updated, requested=value,
+            phase="applied_and_verified" if updated else "HOLD_partial_or_failed",
+            before=before, after=after)
+        # No automatic rollback/retry after a failed distributed mutation.
+        return SetInternalStateReqOutput(updated=updated)
+
+
     def get_internal_state(self, recv_req: GetInternalStateReq):
         # Resolved config (pristine server_args + post-publish overrides) so a
         # readback reflects values changed via /set_internal_state, not startup.
@@ -5256,6 +5373,7 @@ class Scheduler(
                 "attn_tp_rank": self.ps.attn_tp_rank,
                 **packed_stats,
             }
+            ret["glm53_static_gpu_route"] = self._glm53_static_route_control_readback()
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             ret["benchmark_decode_admission_hold"] = bool(
                 getattr(self, "_benchmark_decode_admission_hold", False)
@@ -5304,6 +5422,9 @@ class Scheduler(
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args
+        if "glm53_normal_static_gpu_route" in server_args_dict:
+            # Dedicated worker command; never reaches context.override or resets.
+            return self._set_glm53_static_route_control(server_args_dict)
         args_allow_update = set(
             [
                 "pp_max_micro_batch_size",
