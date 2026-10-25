@@ -5230,6 +5230,18 @@ class Scheduler(
                 "admitted_requests": counts[2],
                 "admitted_paged_tokens": counts[3],
             }
+            small_stats = {"short_certified_forwards": 0, "saved_layer_votes": 0}
+            if os.environ.get("SGLANG_GLM53_NORMAL_BATCH_SHAPE_AUDIT_SMALL") == "1":
+                from sglang.srt.hardware_backend.npu.moe.glm53_collectives import (
+                    get_small_batch_shape_audit_stats,
+                )
+
+                small_stats = get_small_batch_shape_audit_stats()
+            ret["glm53_small_batch_shape_audit"] = {
+                "dp_rank": self.ps.attn_dp_rank,
+                "attn_tp_rank": self.ps.attn_tp_rank,
+                **small_stats,
+            }
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             ret["benchmark_decode_admission_hold"] = bool(
                 getattr(self, "_benchmark_decode_admission_hold", False)

@@ -20,6 +20,7 @@ import test_glm53_normal_idle_dp_cpu as idle
 import test_glm53_normal_shape_cache_cpu as cache_tests
 
 FLAG = "SGLANG_GLM53_NORMAL_BATCH_SHAPE_AUDIT"
+SMALL = FLAG + "_SMALL"
 
 
 class BatchShapeAuditCPU(unittest.TestCase):
@@ -30,7 +31,7 @@ class BatchShapeAuditCPU(unittest.TestCase):
         self.module = self.cache.module
         self.group = self.cache.group
         mock.patch.dict(
-            os.environ, {FLAG: "1", "SGLANG_GLM53_NORMAL_ALL_TO_ALL": "0"}
+            os.environ, {FLAG: "1", SMALL: "0", "SGLANG_GLM53_NORMAL_ALL_TO_ALL": "0"}
         ).start()
         communicator = ModuleType("sglang.srt.layers.communicator")
         communicator.ScatterMode = NS(SCATTERED=object())
@@ -541,6 +542,219 @@ class BatchShapeAuditCPU(unittest.TestCase):
             forward(layer, None, torch.zeros(2, 3), self.batch(), None)
         self.assertEqual(seen, [3, None])
         self.assert_clean()
+
+
+    def test_small_all_16_ranks_boundary_sizes_and_asymmetric_vectors(self):
+        parallel = self.cache.fixture.parallel
+        certified = 0
+        for tokens in (1, 7, 8, 9, 63, 128, 180, 255, 256, 511, 512, 4095, 4096):
+            for counts in ((tokens, 0), (0, tokens), (tokens, max(1, tokens // 3))):
+                for rank in range(16):
+                    parallel.moe_ep_group.rank_in_group = rank
+                    parallel.attn_dp_rank, parallel.attn_tp_rank = divmod(rank, 8)
+                    for enabled in (False, True):
+                        with self.subTest(tokens=tokens, counts=counts, rank=rank, enabled=enabled), mock.patch.dict(os.environ, {SMALL: str(int(enabled))}):
+                            self.module._dispatch_shape_cache.clear()
+                            self.cache.calls.clear()
+                            self.forward(self.batch(counts))
+                            want = 1 if tokens >= 4096 or enabled else 42
+                            self.assertEqual(self.events().count("vote"), want)
+                            self.assertEqual(self.events().count("audit"), 1)
+                            self.assertEqual(self.events()[:2], ["vote", "audit"])
+                            certified += int(enabled and tokens < 4096)
+        self.assertEqual(self.module.get_small_batch_shape_audit_stats(), {
+            "short_certified_forwards": certified, "saved_layer_votes": certified * 41})
+
+    def test_small_exact_optin_zero_and_original_flags_remain_required(self):
+        for value in (None, "0", "", "true", "2"):
+            with mock.patch.dict(os.environ):
+                os.environ.pop(SMALL, None) if value is None else os.environ.__setitem__(SMALL, value)
+                self.cache.calls.clear()
+                self.forward(self.batch((0, 180)))
+                self.assertEqual(self.events().count("vote"), 42)
+        with mock.patch.dict(os.environ, {SMALL: "1"}):
+            self.cache.calls.clear()
+            self.forward(self.batch((0, 0)))
+            self.assertEqual(self.events().count("vote"), 42)
+            for flag in (FLAG, cache_tests.FLAG):
+                with mock.patch.dict(os.environ, {flag: "0"}):
+                    self.cache.calls.clear()
+                    self.forward(self.batch((0, 180)))
+                    self.assertEqual(self.events().count("vote" if flag == FLAG else "audit"), 42)
+        self.assertEqual(self.module.get_small_batch_shape_audit_stats()["short_certified_forwards"], 0)
+
+    def test_small_new_epoch_remote_dirty_mismatch_and_failure_cleanup(self):
+        with mock.patch.dict(os.environ, {SMALL: "1"}):
+            fb = self.batch((0, 180))
+            self.forward(fb)
+            self.forward(fb)
+            self.forward(self.batch((180, 0)))
+            self.assertEqual(self.events(), ["vote", "audit", "vote", "vote"])
+            self.cache.remote_dirty = True
+            self.forward(self.batch((180, 1)))
+            self.assertEqual(self.events()[-2:], ["vote", "audit"])
+            self.cache.remote_shape = [22, 4096, 2, 22, 8, 2, 22, 8]
+            with self.assertRaisesRegex(RuntimeError, "EP16 requires equal"):
+                self.forward(self.batch((0, 180)))
+            self.assertNotIn(self.group, self.module._dispatch_shape_cache)
+            self.assert_clean()
+            self.assertEqual(self.module.get_small_batch_shape_audit_stats()["short_certified_forwards"], 4)
+            self.cache.remote_shape = None
+            self.cache.remote_dirty = False
+            for failure in ("raise", "metadata", "small_flag", "missing", "repeat"):
+                with self.subTest(failure=failure), mock.patch.dict(os.environ):
+                    fb = self.batch((0, 180))
+                    with self.assertRaises((RuntimeError, ValueError)):
+                        with self.scope(fb):
+                            self.layer(fb, 3)
+                            before = list(self.cache.calls)
+                            if failure == "raise":
+                                raise ValueError("injected failure")
+                            if failure == "metadata":
+                                fb.original_global_num_tokens_cpu[:] = [180, 0]
+                            if failure == "small_flag":
+                                os.environ[SMALL] = "0"
+                            self.layer(fb, 5 if failure == "missing" else 3 if failure == "repeat" else 4)
+                    self.assertEqual(before, self.cache.calls)
+                    self.assert_clean()
+                    self.assertNotIn(self.group, self.module._dispatch_shape_cache)
+            self.assertEqual(self.module.get_small_batch_shape_audit_stats()["short_certified_forwards"], 4)
+            self.forward(self.batch((0, 180)))
+            self.assertEqual(self.events()[-2:], ["vote", "audit"])
+            self.assertEqual(self.module.get_small_batch_shape_audit_stats()["saved_layer_votes"], 205)
+
+    def test_small_draft_decode_and_nextn_keep_fallback(self):
+        with mock.patch.dict(os.environ, {SMALL: "1"}):
+            for mode in idle.Mode:
+                if mode == idle.Mode.EXTEND:
+                    continue
+                self.cache.calls.clear()
+                self.forward(self.batch((0, 180), mode=mode))
+                self.assertEqual(self.events(), ["audit"] * 42)
+            # Existing production decoder AST test proves NextN passes None.
+            self.test_actual_decoder_passes_target_layer_id_but_masks_nextn()
+            fb = self.batch((0, 180))
+            self.cache.calls.clear()
+            with self.scope(fb):
+                self.layer(fb, 3)
+                with self.module.normal_hccl_idle_dp_scope(fb):
+                    self.assertIsNone(self.module._active_batch_shape_epoch())
+                    self.check(fb)
+                for i in range(4, 45):
+                    self.layer(fb, i)
+            with self.module.normal_hccl_idle_dp_scope(fb):
+                self.check(fb)
+            self.assertEqual(self.events().count("vote"), 3)
+            self.assertEqual(self.module.get_small_batch_shape_audit_stats()["short_certified_forwards"], 1)
+            nextn = (idle.SRT / "models/deepseek_nextn.py").read_text()
+            self.assertNotIn("normal_hccl_batch_shape_audit_scope", nextn)
+            glm_nextn = (idle.SRT / "models/glm5_next_nextn.py").read_text()
+            self.assertIn("(DeepseekV3ForCausalLMNextN)", glm_nextn)
+            # A malformed target with a NextN layer must fail before a vote.
+            before = list(self.cache.calls)
+            with mock.patch.object(self.layers[3], "is_nextn", True):
+                with self.assertRaisesRegex(RuntimeError, "42-MoE"):
+                    self.forward(fb)
+            self.assertEqual(self.cache.calls, before)
+            self.assert_clean()
+
+    def test_small_actual_target_model_scope_and_stats_snapshot(self):
+        # Run existing production target-forward AST with short batches.
+        old_batch = self.batch
+        with mock.patch.dict(os.environ, {SMALL: "1"}), mock.patch.object(
+            self, "batch", side_effect=lambda: old_batch((0, 180))
+        ):
+            self.test_actual_target_model_forward_owns_fresh_scope_and_unwinds()
+        stats = self.module.get_small_batch_shape_audit_stats()
+        self.assertEqual(stats, {"short_certified_forwards": 3, "saved_layer_votes": 123})
+        stats["short_certified_forwards"] = -1
+        self.assertEqual(self.module.get_small_batch_shape_audit_stats()["short_certified_forwards"], 3)
+
+    def test_small_dynamic_expert_counts_and_four_payloads_are_not_cached(self):
+        fb = self.batch((180, 0))
+        rows = 23
+        x = torch.ones(rows, 4096, dtype=torch.bfloat16)
+        ids = [torch.full((rows, 8), i, dtype=torch.int64) for i in (0, 1)]
+        weights = [torch.full((rows, 8), w, dtype=torch.float32) for w in (0.125, 0.0625)]
+        gathers = []
+
+        def gather(out, value, group):
+            gathers.append((value.dtype, tuple(value.shape)))
+            out.copy_(value.repeat(16, *([1] * (value.ndim - 1))))
+
+        def dispatch(i):
+            return self.module.collective_dispatch(self.group, x, ids[i], weights[i])
+
+        with mock.patch.dict(os.environ, {SMALL: "1", "SGLANG_GLM53_NORMAL_DEVICE_ROUTING": "0"}), mock.patch.object(self.module.dist, "get_world_size", return_value=16), mock.patch.object(self.module.dist, "get_rank", return_value=0), mock.patch.object(self.module.dist, "all_gather_into_tensor", side_effect=gather), mock.patch.object(torch.ops.npu, "npu_dynamic_quant", side_effect=cache_tests.dynamic_quant_reference, create=True):
+            with self.scope(fb):
+                outputs = []
+                for i in (0, 1):
+                    with self.module.normal_hccl_idle_dp_scope(fb, layer_id=3+i):
+                        outputs.append(dispatch(i))
+                for layer_id in range(5, 45):
+                    self.layer(fb, layer_id)
+            self.assertEqual(self.events(), ["vote"])
+            payloads = [(torch.int8, (rows, 4096)), (torch.float32, (rows,)), (torch.int64, (rows, 8)), (torch.float32, (rows, 8))]
+            self.assertEqual(gathers, [(torch.int64, (8,))] + payloads * 2)
+            self.assertNotEqual(outputs[0][2], outputs[1][2])
+            for i in (0, 1):
+                with self.module.normal_hccl_idle_dp_scope(fb):
+                    reference = dispatch(i)
+                torch.testing.assert_close(outputs[i], reference, rtol=0, atol=0)
+            self.assertEqual(gathers[-8:], payloads * 2)
+        self.assert_clean()
+
+    def test_small_actual_idle_conversion_is_uniform_on_all_16_peers(self):
+        # Execute the complete frozen production padding method on CPU, then
+        # feed that exact ForwardBatch to the real candidate scope.
+        tree = ast.parse((idle.SRT / "model_executor/forward_batch_info.py").read_text())
+        owner = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ForwardBatch")
+        method = next(n for n in owner.body if isinstance(n, ast.FunctionDef) and n.name == "prepare_mlp_sync_batch")
+        module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), method], type_ignores=[])
+        parallel = self.cache.fixture.parallel
+        max_len = NS(is_max_len=lambda: True)
+        namespace = dict(torch=torch, ForwardMode=idle.Mode, _is_cpu=True,
+            get_parallel=lambda: parallel,
+            get_exec=lambda: NS(graph=NS(cuda_graph_config=NS(prefill=NS(bs=[])))),
+            ceil_align=lambda n, unit: (n+unit-1)//unit*unit,
+            DpPaddingMode=NS(get_dp_padding_mode=lambda *a: max_len),
+            _elastic_should_preserve_local_token_counts=lambda **kw: False,
+            mambaish_config=lambda cfg: object(), set_dp_buffer_len=mock.Mock(),
+            set_is_extend_in_batch=mock.Mock())
+        exec(compile(ast.fix_missing_locations(module), "<frozen actual padding>", "exec"), namespace)
+        tbo=ModuleType("sglang.srt.batch_overlap.two_batch_overlap")
+        tbo.TboForwardBatchPreparer=NS(prepare=lambda **kw: None)
+        with mock.patch.dict(os.environ, {SMALL:"1"}), mock.patch.dict(sys.modules,{tbo.__name__:tbo}), mock.patch.object(idle.Mode, "is_extend", lambda mode: mode == idle.Mode.EXTEND, create=True):
+            vectors = [counts for size in (1, 7, 8, 9, 63, 128, 180, 255, 256, 511, 512, 4095, 4096)
+                       for counts in ((0, size), (size, 0), (min(7, size), size))]
+            for counts in vectors:
+                for rank in range(16):
+                    parallel.moe_ep_group.rank_in_group=rank
+                    parallel.attn_dp_rank,parallel.attn_tp_rank=divmod(rank,8)
+                    local=counts[rank//8]
+                    fb=self.batch(counts,mode=idle.Mode.EXTEND if local else idle.Mode.IDLE)
+                    original=fb.original_global_num_tokens_cpu
+                    fb.global_num_tokens_cpu=list(counts)
+                    fb.global_num_tokens_for_logprob_cpu=list(counts)
+                    fb.global_num_tokens_gpu=torch.tensor(counts)
+                    fb.batch_size=int(local>0);fb.is_extend_in_batch=True
+                    fb.extend_num_tokens=local
+                    fb.can_run_dp_prefill_cuda_graph=False;fb.spec_info=None
+                    fb.seq_lens=torch.tensor([local] if local else [],dtype=torch.int64)
+                    fb.orig_seq_lens=fb.seq_lens.clone();fb.seq_lens_cpu=None
+                    fb.global_num_token_non_padded=None;fb.tbo_children=None
+                    fb._pad_inputs_to_size=mock.Mock()
+                    runner=NS(model_config=NS(),is_draft_worker=False,attn_tp_sequence_sharded=lambda n:True)
+                    namespace[method.name](fb,runner)
+                    self.assertEqual(fb.forward_mode,idle.Mode.EXTEND)
+                    self.assertIs(fb.original_global_num_tokens_cpu,original)
+                    self.assertEqual(original,list(counts))
+                    capacity = (max(counts) + 7) // 8 * 8
+                    self.assertEqual(fb.global_num_tokens_cpu,[capacity,capacity])
+                    if not local:self.assertEqual(fb._original_forward_mode,idle.Mode.IDLE)
+                    self.module._dispatch_shape_cache.clear();self.cache.calls.clear()
+                    self.forward(fb)
+                    self.assertEqual(self.events(),["vote","audit"])
 
 
 if __name__ == "__main__":

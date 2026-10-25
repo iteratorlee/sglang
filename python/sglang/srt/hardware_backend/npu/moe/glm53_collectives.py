@@ -8,6 +8,7 @@ in eager two-node DP2/TP8/EP16 prefill (all names have the SGLANG_GLM53_ prefix)
 NORMAL_SHAPE_CACHE=1 replaces repeated shape audits with an invalidation vote;
 NORMAL_BATCH_SHAPE_AUDIT=1 keeps that vote once per large target forward,
 with a CPU certificate for the remaining 41 MoE layers (requires SHAPE_CACHE);
+NORMAL_BATCH_SHAPE_AUDIT_SMALL=1 also admits positive short target forwards;
 NORMAL_REDUCE_SCATTER=2node selects the scoped FP32 combine collective;
 NORMAL_REDUCE_SCATTER_CHECK=1 adds an expensive all-reduce reference check;
 NORMAL_DEVICE_ROUTING=1 keeps route sorting and expert counts on device.
@@ -38,6 +39,7 @@ _batch_shape_epoch = ContextVar("glm53_normal_batch_shape_epoch", default=None)
 _layer_shape_epoch = ContextVar("glm53_normal_layer_shape_epoch", default=None)
 _batch_shape_excluded = object()
 _batch_shape_logged = False
+_short_certified_forwards = 0
 _reduce_scatter_check_logged = False
 _device_routing_logged = False
 _ordered_combine_logged = False
@@ -209,6 +211,10 @@ class _BatchShapeEpoch:
             or batch is not self.batch
             or batch.forward_mode != ForwardMode.EXTEND
             or batch.can_run_tbo
+            or (
+                max(self.metadata[0]) < 4096
+                and os.getenv("SGLANG_GLM53_NORMAL_BATCH_SHAPE_AUDIT_SMALL", "0") != "1"
+            )
             or metadata != self.metadata
             or _batch_shape_parallel_signature() != self.parallel_signature
             or _idle_dp_counts.get() != self.metadata[0]
@@ -272,6 +278,14 @@ def _active_batch_shape_epoch():
     return epoch
 
 
+def get_small_batch_shape_audit_stats():
+    """CPU-only process-local totals; read outside performance windows."""
+    return {
+        "short_certified_forwards": _short_certified_forwards,
+        "saved_layer_votes": 41 * _short_certified_forwards,
+    }
+
+
 @contextmanager
 def normal_hccl_batch_shape_audit_scope(forward_batch, layers):
     """Own the certificate outside the target loop; FB reuse starts a new epoch.
@@ -280,6 +294,7 @@ def normal_hccl_batch_shape_audit_scope(forward_batch, layers):
     Admission uses its global maximum, including on the idle attention domain.
     The finite eager/non-overlap profile excludes concurrent cache mutation.
     """
+    global _short_certified_forwards
     if _batch_shape_epoch.get() is not None:
         _batch_shape_epoch.get().fail("nested target forwards")
     epoch = None
@@ -292,7 +307,11 @@ def normal_hccl_batch_shape_audit_scope(forward_batch, layers):
 
         if forward_batch.forward_mode == ForwardMode.EXTEND:
             metadata = _normal_dp_shape_metadata(forward_batch)
-            if max(metadata[0]) >= 4096:
+            peak_tokens = max(metadata[0])
+            if peak_tokens >= 4096 or (
+                0 < peak_tokens < 4096
+                and os.getenv("SGLANG_GLM53_NORMAL_BATCH_SHAPE_AUDIT_SMALL", "0") == "1"
+            ):
                 from sglang.srt.layers.communicator import ScatterMode
                 from sglang.srt.layers.communicator_mhc import (
                     AscendMHCLayerCommunicator,
@@ -359,6 +378,8 @@ def normal_hccl_batch_shape_audit_scope(forward_batch, layers):
         yield
         if epoch is not None and (epoch.failed or epoch.next_layer != epoch.end_layer):
             epoch.fail("incomplete target layer sequence")
+        if epoch is not None and 0 < max(epoch.metadata[0]) < 4096:
+            _short_certified_forwards += 1
         complete = True
     finally:
         if epoch is not None and not complete:
