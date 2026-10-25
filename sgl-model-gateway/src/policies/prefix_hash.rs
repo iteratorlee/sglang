@@ -269,6 +269,8 @@ impl PrefixHashPolicy {
         };
         let cache_aware_prefill = self.pd_prefill_cache_capacity
             && matches!(worker.worker_type(), WorkerType::Prefill { .. });
+        let stage_aware_prefill = self.pd_prefill_stage_reservation
+            && matches!(worker.worker_type(), WorkerType::Prefill { .. });
         let runnable_waiting = snapshot
             .queues
             .as_ref()
@@ -346,12 +348,15 @@ impl PrefixHashPolicy {
         // For SSE, the gateway's P WorkerLoadGuard survives until D finishes
         // streaming, even though P is done. A fresh P snapshot represents its
         // actual lifecycle; stale/missing snapshots still fall back to local.
-        let active = if cache_aware_prefill {
+        // A P-stage lease ends when P's response has been consumed. Its
+        // lifecycle must not depend on opting into reclaimable-cache capacity:
+        // the generic WorkerLoadGuard can outlive P through all of D's stream.
+        let active = if cache_aware_prefill || stage_aware_prefill {
             Self::local_reservations(worker, info)
         } else {
             local
         };
-        if cache_aware_prefill && self.pd_prefill_stage_reservation {
+        if stage_aware_prefill {
             // The local P lease spans dispatch through its consumed response
             // body. These same requests can already occur in SRT's snapshot;
             // take the larger lifecycle count instead of counting them twice.
@@ -1311,6 +1316,57 @@ mod tests {
     }
 
     #[test]
+    fn test_prefill_stage_load_does_not_require_reclaimable_capacity_opt_in() {
+        use crate::core::worker_manager::{DisaggregationLoadSnapshot, KVCapacitySnapshot};
+
+        let worker = BasicWorkerBuilder::new("http://p:8000")
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(9000),
+            })
+            .build();
+        for _ in 0..8 {
+            worker.increment_load(); // P is finished; D is still streaming.
+        }
+        let snapshots = std::collections::HashMap::from([(
+            worker.url().to_string(),
+            DPLoadSnapshot {
+                age_at_observation: Some(Duration::ZERO),
+                num_waiting_reqs: 1,
+                disaggregation: Some(DisaggregationLoadSnapshot {
+                    prefill_inflight_queue_reqs: 1,
+                    ..Default::default()
+                }),
+                kv_capacity: Some(KVCapacitySnapshot {
+                    full_available_tokens: 100_000,
+                    request_slots_available: Some(4),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )]);
+        let reservations = std::collections::HashMap::from([(worker.url().to_string(), 1)]);
+        let info = SelectWorkerInfo {
+            load_snapshots: Some(&snapshots),
+            local_reservations: Some(&reservations),
+            estimated_tokens: 10_000,
+            ..Default::default()
+        };
+        let mut policy = PrefixHashPolicy::with_defaults();
+        policy.pd_prefill_cache_capacity = false;
+        policy.pd_prefill_stage_reservation = true;
+        assert_eq!(policy.effective_load(&worker, &info), 2);
+
+        // Stage feedback must not silently enable reclaimable KV capacity.
+        let pressured = SelectWorkerInfo {
+            estimated_tokens: 200_000,
+            ..info
+        };
+        assert_eq!(policy.effective_load(&worker, &pressured), 3);
+        policy.pd_prefill_stage_reservation = false;
+        assert!(policy.effective_load(&worker, &pressured) >= 8);
+    }
+
+    #[test]
     fn test_prefill_work_pressure_observes_chunked_prompt_and_stays_prefill_only() {
         let prefill = BasicWorkerBuilder::new("http://p:8000")
             .worker_type(WorkerType::Prefill {
@@ -1405,6 +1461,7 @@ mod tests {
         };
         let mut policy = PrefixHashPolicy::with_defaults();
         policy.pd_prefill_cache_capacity = true;
+        policy.pd_prefill_stage_reservation = true;
         assert_eq!(policy.effective_load(&worker, &info), 3);
     }
 
