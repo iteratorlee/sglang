@@ -5242,6 +5242,20 @@ class Scheduler(
                 "attn_tp_rank": self.ps.attn_tp_rank,
                 **small_stats,
             }
+            # CPU-only activation readback outside model execution. Disabled
+            # runs do not import the Triton payload implementation.
+            packed_stats = {"packed_gather_calls": 0}
+            if os.environ.get("SGLANG_GLM53_NORMAL_PACKED_GATHER") == "1":
+                from sglang.srt.hardware_backend.npu.moe.glm53_collectives import (
+                    get_normal_packed_gather_stats,
+                )
+
+                packed_stats = get_normal_packed_gather_stats()
+            ret["glm53_packed_moe_gather"] = {
+                "dp_rank": self.ps.attn_dp_rank,
+                "attn_tp_rank": self.ps.attn_tp_rank,
+                **packed_stats,
+            }
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             ret["benchmark_decode_admission_hold"] = bool(
                 getattr(self, "_benchmark_decode_admission_hold", False)

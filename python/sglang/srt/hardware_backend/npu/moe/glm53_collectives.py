@@ -16,6 +16,10 @@ NORMAL_COMBINE_ORDERED=2node uses fixed-order FP32 Triton accumulation with
 CPU routing; it is mutually exclusive with NORMAL_DEVICE_ROUTING=1.
 NORMAL_DEVICE_ROUTING=ordered explicitly enables device routing with the
 same ordered combine and a device inverse map in that two-node P scope.
+NORMAL_PACKED_GATHER=1 packs the four payloads into one raw INT32 gather for
+positive target EXTEND with original/padded DP counts <=4096 (local rows<=512).
+This artifact uses power-of-two packet capacities and runtime actual rows.
+It is read at module import; set identically on all EP ranks before startup.
 Use identical collective flags on every EP rank. All experiments default off.
 """
 
@@ -43,6 +47,17 @@ _short_certified_forwards = 0
 _reduce_scatter_check_logged = False
 _device_routing_logged = False
 _ordered_combine_logged = False
+_NORMAL_PACKED_GATHER = os.getenv("SGLANG_GLM53_NORMAL_PACKED_GATHER", "0") == "1"
+_packed_target_metadata = ContextVar("glm53_normal_packed_target_metadata", default=None)
+
+
+def get_normal_packed_gather_stats():
+    """Read CPU-only execution evidence outside measurement windows."""
+    if not _NORMAL_PACKED_GATHER:
+        return {"packed_gather_calls": 0}
+    from .glm53_packed_gather import get_packed_gather_stats
+
+    return get_packed_gather_stats()
 
 
 def release_normal_hccl_cached_memory(x):
@@ -432,17 +447,26 @@ def _normal_hccl_layer_shape_scope(forward_batch, layer_id):
 def normal_hccl_idle_dp_scope(forward_batch, mlp_context=None, *, layer_id=None):
     """Publish immutable original CPU counts for just this GLM MLP invocation."""
     counts = None
+    packed_metadata = None
     if normal_hccl_skip_idle_dp_enabled():
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
         if forward_batch.forward_mode == ForwardMode.EXTEND:
-            counts, _ = _normal_dp_shape_metadata(forward_batch)
+            counts, padded = _normal_dp_shape_metadata(forward_batch)
+            if _NORMAL_PACKED_GATHER and layer_id is not None:
+                if forward_batch.can_run_tbo:
+                    raise RuntimeError("GLM packed gather requires non-overlap target scope")
+                packed_metadata = (counts, padded)
     with nullcontext() if mlp_context is None else mlp_context:
         token = _idle_dp_counts.set(counts)
+        # NextN has idle counts too: explicitly mask a nested target scope.
+        packed_token = _packed_target_metadata.set(packed_metadata) if _NORMAL_PACKED_GATHER else None
         try:
             with _normal_hccl_layer_shape_scope(forward_batch, layer_id):
                 yield
         finally:
+            if packed_token is not None:
+                _packed_target_metadata.reset(packed_token)
             _idle_dp_counts.reset(token)
 
 
@@ -709,7 +733,20 @@ def collective_dispatch(group, x, ids, weights, num_experts=288):
     q, scale = torch.ops.npu.npu_dynamic_quant(x)
     if q.dtype != torch.int8 or scale.dtype != torch.float32:
         raise RuntimeError("GLM HCCL normal dispatch requires INT8 rows/FP32 scales")
-    all_q, all_scale, all_ids, all_weights = map(gather, (q, scale, ids, weights))
+    packed = False
+    if _NORMAL_PACKED_GATHER:
+        from .glm53_packed_gather import packed_all_gather, target_metadata_eligible
+
+        metadata = _packed_target_metadata.get()
+        packed = target_metadata_eligible(world, metadata)
+        if packed:
+            if _idle_dp_counts.get() != metadata[0]:
+                raise RuntimeError("GLM packed gather lost its checked idle-DP scope")
+            all_q, all_scale, all_ids, all_weights = packed_all_gather(
+                group, q, scale, ids, weights, expected_rows=metadata[1][0] // 8
+            )
+    if not packed:
+        all_q, all_scale, all_ids, all_weights = map(gather, (q, scale, ids, weights))
     # The scope is published only for EXTEND in the eager, non-overlap
     # two-node P profile. Keep all other normal profiles on the CPU reference
     # path, even if the flag is inherited by another worker (including D).
