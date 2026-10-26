@@ -138,6 +138,7 @@ class ProfileTests(unittest.TestCase):
         topologies = (
             {},
             dict(tp_size=8, dp_size=4, ep_size=8),
+            dict(tp_size=8, dp_size=2, ep_size=8),
             dict(nnodes=2, moe_dp_size=1, dwdp_size=1, enable_prefill_cp=False),
         )
         with mock.patch.dict(os.environ, {"SGLANG_GLM53_2NODE_PD": "1"}):
@@ -179,7 +180,8 @@ class ProfileTests(unittest.TestCase):
                 )
 
     def test_exact_supported_profile(self):
-        for topology in ({}, {"tp_size": 8, "dp_size": 4, "ep_size": 8}):
+        for topology in ({}, {"tp_size": 8, "dp_size": 4, "ep_size": 8},
+                         {"tp_size": 8, "dp_size": 2, "ep_size": 8}):
             with self.subTest(topology=topology):
                 profile = glm53_pd_decode_prefix_profile(
                     target_cfg(**topology), target_model()
@@ -190,12 +192,20 @@ class ProfileTests(unittest.TestCase):
 
     def test_910b_requires_complete_profile_not_a_loose_eight_rank_match(self):
         topology = {"tp_size": 8, "dp_size": 4, "ep_size": 8}
-        for change in ({"dp_size": 2}, {"ep_size": 16}, {"page_size": 128},
+        for change in ({"dp_size": 1}, {"ep_size": 16}, {"page_size": 128},
                        {"speculative_num_draft_tokens": 5}):
             with self.subTest(change=change):
                 self.assertIsNone(glm53_pd_decode_prefix_profile(
                     target_cfg(**(topology | change)), target_model()
                 ))
+
+    def test_910b_tp4_decode_stays_single_node(self):
+        topology = dict(tp_size=8, dp_size=2, ep_size=8, nnodes=2,
+                        moe_dp_size=1, dwdp_size=1, enable_prefill_cp=False)
+        with mock.patch.dict(os.environ, {"SGLANG_GLM53_2NODE_PD": "1"}):
+            self.assertIsNone(glm53_pd_decode_prefix_profile(
+                target_cfg(**topology), target_model()
+            ))
 
     def test_two_node_decode_prefix_preserves_mtp_and_page_contract(self):
         base = dict(nnodes=2, moe_dp_size=1, dwdp_size=1, enable_prefill_cp=False)

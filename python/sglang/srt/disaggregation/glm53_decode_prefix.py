@@ -72,7 +72,7 @@ def glm53_pd_decode_prefix_profile(
             == "modelslim"
             and (getattr(cfg, "tp_size", None),
                  getattr(cfg, "dp_size", None),
-                 getattr(cfg, "ep_size", None)) in ((16, 8, 16), (8, 4, 8))
+                 getattr(cfg, "ep_size", None)) in ((16, 8, 16), (8, 4, 8), (8, 2, 8))
             and getattr(cfg, "pp_size", None) == 1
             and getattr(cfg, "dcp_size", None) == 1
             and getattr(cfg, "attn_cp_size", None) == 1
