@@ -1,0 +1,4237 @@
+{
+  "id": null,
+  "uid": "glm53-910b-pd",
+  "title": "GLM-5.3 | 910B PD",
+  "description": "One P (16/28, DP2) → one D (17/27, DP8). Gateway-observed latency, strict MTP, independent cache tiers and explicit telemetry health.",
+  "tags": [
+    "glm53",
+    "910b",
+    "PD"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "editable": false,
+  "graphTooltip": 1,
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": [
+      "5s",
+      "10s",
+      "30s",
+      "1m"
+    ]
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "cluster",
+        "type": "constant",
+        "label": "Cluster",
+        "query": "glm53-910b",
+        "current": {
+          "text": "glm53-910b",
+          "value": "glm53-910b"
+        },
+        "hide": 2
+      },
+      {
+        "name": "model",
+        "label": "Model",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "glm53-pd-prometheus"
+        },
+        "query": {
+          "query": "label_values({__name__=~\"llm_pd_build_info|llm_gateway_requests_total\",cluster=\"$cluster\"}, model_name)",
+          "refId": "model"
+        },
+        "refresh": 1,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "window",
+        "label": "Rate / quantile window",
+        "type": "custom",
+        "query": "1m,5m,15m,30m",
+        "current": {
+          "selected": true,
+          "text": "5m",
+          "value": "5m"
+        },
+        "options": [
+          {
+            "text": "1m",
+            "value": "1m",
+            "selected": false
+          },
+          {
+            "text": "5m",
+            "value": "5m",
+            "selected": true
+          },
+          {
+            "text": "15m",
+            "value": "15m",
+            "selected": false
+          },
+          {
+            "text": "30m",
+            "value": "30m",
+            "selected": false
+          }
+        ]
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  },
+  "links": [],
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "GLM-5.3 · 910B · PD observatory",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 3
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**P** 910b-16 + 28 · TP16 / DP2 / EP16　 **D** 910b-17 + 27 · TP16 / DP8 / EP16\n\nOne logical P → one logical D · Gateway timing is observed at ingress, not full client latency · 5s sampling · NA = missing / unsupported / no qualifying samples · Device timing OFF"
+      }
+    },
+    {
+      "id": 2,
+      "title": "Gateway · completed RPS",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 3,
+        "w": 4,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "noValue": "NA",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "light-blue"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          },
+          "decimals": 0,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "last"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "description": "",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (cluster, model_name) ((rate(llm_gateway_requests_total{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1))",
+          "legendFormat": "{{model_name}} · all outcomes",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": false,
+          "instant": true,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Gateway · error fraction",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 4,
+        "y": 3,
+        "w": 4,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "NA",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "light-blue"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          },
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "last"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "description": "",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum by (cluster, model_name) ((rate(llm_gateway_requests_total{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\",outcome=\"error\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1))) / ((sum by (cluster, model_name) ((rate(llm_gateway_requests_total{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1))) > 0)",
+          "legendFormat": "{{model_name}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": false,
+          "instant": true,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Gateway · output tokens/s",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 3,
+        "w": 4,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "tps",
+          "noValue": "NA",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "light-blue"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          },
+          "decimals": 0,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "last"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "description": "",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (cluster, model_name) ((rate(llm_gateway_output_tokens_total{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1))",
+          "legendFormat": "{{model_name}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": false,
+          "instant": true,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Gateway · live stream inflight",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 3,
+        "w": 4,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "NA",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "light-blue"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          },
+          "decimals": 0,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "last"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "description": "",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (cluster, model_name) ((llm_gateway_inflight_requests{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\"}) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1))",
+          "legendFormat": "{{model_name}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": false,
+          "instant": true,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "P · fresh DP / expected",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 3,
+        "w": 4,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "NA",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "light-blue"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          },
+          "decimals": 0,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "last"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "description": "",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "llm_pd:observed_dp_ranks{cluster=~\"$cluster\",role=\"prefill\"}",
+          "legendFormat": "observed P",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": false,
+          "instant": true,
+          "interval": "5s",
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "llm_pd:expected_dp_ranks{cluster=~\"$cluster\",role=\"prefill\"}",
+          "legendFormat": "expected P",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": false,
+          "instant": true,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "D · fresh DP / expected",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 20,
+        "y": 3,
+        "w": 4,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "NA",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "light-blue"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          },
+          "decimals": 0,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "last"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "description": "",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "llm_pd:observed_dp_ranks{cluster=~\"$cluster\",role=\"decode\"}",
+          "legendFormat": "observed D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": false,
+          "instant": true,
+          "interval": "5s",
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "llm_pd:expected_dp_ranks{cluster=~\"$cluster\",role=\"decode\"}",
+          "legendFormat": "expected D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": false,
+          "instant": true,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "row",
+      "title": "01 / Gateway · request weighted latency & traffic",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 7,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 9,
+      "title": "Semantic TTFT · reasoning / text / tool arguments",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 12,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "NA",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Observed at the gateway, not the client. Sum classic histogram bucket rates before quantile. Window follows $window; no completed qualifying observations yields NA. Samples are window increase estimates.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (cluster, model_name, le) ((rate(llm_gateway_ttft_seconds_bucket{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\",first_event=\"semantic\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1))) and on (cluster, model_name) (sum by (cluster, model_name) ((increase(llm_gateway_ttft_seconds_count{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\",first_event=\"semantic\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1)) > 0)",
+          "legendFormat": "{{model_name}} · p50",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.75, sum by (cluster, model_name, le) ((rate(llm_gateway_ttft_seconds_bucket{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\",first_event=\"semantic\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1))) and on (cluster, model_name) (sum by (cluster, model_name) ((increase(llm_gateway_ttft_seconds_count{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\",first_event=\"semantic\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1)) > 0)",
+          "legendFormat": "{{model_name}} · p75",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.9, sum by (cluster, model_name, le) ((rate(llm_gateway_ttft_seconds_bucket{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\",first_event=\"semantic\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1))) and on (cluster, model_name) (sum by (cluster, model_name) ((increase(llm_gateway_ttft_seconds_count{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\",first_event=\"semantic\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1)) > 0)",
+          "legendFormat": "{{model_name}} · p90",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        },
+        {
+          "refId": "D",
+          "expr": "histogram_quantile(0.99, sum by (cluster, model_name, le) ((rate(llm_gateway_ttft_seconds_bucket{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\",first_event=\"semantic\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1))) and on (cluster, model_name) (sum by (cluster, model_name) ((increase(llm_gateway_ttft_seconds_count{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\",first_event=\"semantic\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1)) > 0)",
+          "legendFormat": "{{model_name}} · p99",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Visible TTFT · excludes reasoning",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 8,
+        "w": 12,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "NA",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Observed at the gateway, not the client. Sum classic histogram bucket rates before quantile. Window follows $window; no completed qualifying observations yields NA. Samples are window increase estimates.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (cluster, model_name, le) ((rate(llm_gateway_ttft_seconds_bucket{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\",first_event=\"visible\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1))) and on (cluster, model_name) (sum by (cluster, model_name) ((increase(llm_gateway_ttft_seconds_count{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\",first_event=\"visible\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1)) > 0)",
+          "legendFormat": "{{model_name}} · p50",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.75, sum by (cluster, model_name, le) ((rate(llm_gateway_ttft_seconds_bucket{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\",first_event=\"visible\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1))) and on (cluster, model_name) (sum by (cluster, model_name) ((increase(llm_gateway_ttft_seconds_count{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\",first_event=\"visible\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1)) > 0)",
+          "legendFormat": "{{model_name}} · p75",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.9, sum by (cluster, model_name, le) ((rate(llm_gateway_ttft_seconds_bucket{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\",first_event=\"visible\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1))) and on (cluster, model_name) (sum by (cluster, model_name) ((increase(llm_gateway_ttft_seconds_count{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\",first_event=\"visible\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1)) > 0)",
+          "legendFormat": "{{model_name}} · p90",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        },
+        {
+          "refId": "D",
+          "expr": "histogram_quantile(0.99, sum by (cluster, model_name, le) ((rate(llm_gateway_ttft_seconds_bucket{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\",first_event=\"visible\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1))) and on (cluster, model_name) (sum by (cluster, model_name) ((increase(llm_gateway_ttft_seconds_count{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\",first_event=\"visible\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1)) > 0)",
+          "legendFormat": "{{model_name}} · p99",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Request TPOT · known final completion usage",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 15,
+        "w": 12,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "NA",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Observed at the gateway, not the client. Sum classic histogram bucket rates before quantile. Window follows $window; no completed qualifying observations yields NA. Samples are window increase estimates.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (cluster, model_name, le) ((rate(llm_gateway_request_tpot_seconds_bucket{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1))) and on (cluster, model_name) (sum by (cluster, model_name) ((increase(llm_gateway_request_tpot_seconds_count{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1)) > 0)",
+          "legendFormat": "{{model_name}} · p50",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.75, sum by (cluster, model_name, le) ((rate(llm_gateway_request_tpot_seconds_bucket{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1))) and on (cluster, model_name) (sum by (cluster, model_name) ((increase(llm_gateway_request_tpot_seconds_count{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1)) > 0)",
+          "legendFormat": "{{model_name}} · p75",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.9, sum by (cluster, model_name, le) ((rate(llm_gateway_request_tpot_seconds_bucket{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1))) and on (cluster, model_name) (sum by (cluster, model_name) ((increase(llm_gateway_request_tpot_seconds_count{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1)) > 0)",
+          "legendFormat": "{{model_name}} · p90",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        },
+        {
+          "refId": "D",
+          "expr": "histogram_quantile(0.99, sum by (cluster, model_name, le) ((rate(llm_gateway_request_tpot_seconds_bucket{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1))) and on (cluster, model_name) (sum by (cluster, model_name) ((increase(llm_gateway_request_tpot_seconds_count{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1)) > 0)",
+          "legendFormat": "{{model_name}} · p99",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "title": "E2E · gateway body completion",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 15,
+        "w": 12,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "NA",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Observed at the gateway, not the client. Sum classic histogram bucket rates before quantile. Window follows $window; no completed qualifying observations yields NA. Samples are window increase estimates.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (cluster, model_name, le) ((rate(llm_gateway_e2e_seconds_bucket{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1))) and on (cluster, model_name) (sum by (cluster, model_name) ((increase(llm_gateway_e2e_seconds_count{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1)) > 0)",
+          "legendFormat": "{{model_name}} · p50",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.75, sum by (cluster, model_name, le) ((rate(llm_gateway_e2e_seconds_bucket{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1))) and on (cluster, model_name) (sum by (cluster, model_name) ((increase(llm_gateway_e2e_seconds_count{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1)) > 0)",
+          "legendFormat": "{{model_name}} · p75",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.9, sum by (cluster, model_name, le) ((rate(llm_gateway_e2e_seconds_bucket{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1))) and on (cluster, model_name) (sum by (cluster, model_name) ((increase(llm_gateway_e2e_seconds_count{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1)) > 0)",
+          "legendFormat": "{{model_name}} · p90",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        },
+        {
+          "refId": "D",
+          "expr": "histogram_quantile(0.99, sum by (cluster, model_name, le) ((rate(llm_gateway_e2e_seconds_bucket{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1))) and on (cluster, model_name) (sum by (cluster, model_name) ((increase(llm_gateway_e2e_seconds_count{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1)) > 0)",
+          "legendFormat": "{{model_name}} · p99",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "title": "Semantic TTFT · samples / window",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 22,
+        "w": 6,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "NA",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "light-blue"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          },
+          "decimals": 0,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "last"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "description": "Observed at the gateway, not the client. Sum classic histogram bucket rates before quantile. Window follows $window; no completed qualifying observations yields NA. Samples are window increase estimates.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (cluster, model_name) ((increase(llm_gateway_ttft_seconds_count{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\",first_event=\"semantic\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1))",
+          "legendFormat": "{{model_name}} · samples",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": false,
+          "instant": true,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "title": "Visible TTFT · samples / window",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 22,
+        "w": 6,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "NA",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "light-blue"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          },
+          "decimals": 0,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "last"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "description": "Observed at the gateway, not the client. Sum classic histogram bucket rates before quantile. Window follows $window; no completed qualifying observations yields NA. Samples are window increase estimates.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (cluster, model_name) ((increase(llm_gateway_ttft_seconds_count{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\",first_event=\"visible\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1))",
+          "legendFormat": "{{model_name}} · samples",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": false,
+          "instant": true,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "title": "Request TPOT · samples / window",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 22,
+        "w": 6,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "NA",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "light-blue"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          },
+          "decimals": 0,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "last"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "description": "Observed at the gateway, not the client. Sum classic histogram bucket rates before quantile. Window follows $window; no completed qualifying observations yields NA. Samples are window increase estimates.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (cluster, model_name) ((increase(llm_gateway_request_tpot_seconds_count{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1))",
+          "legendFormat": "{{model_name}} · samples",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": false,
+          "instant": true,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "title": "E2E · samples / window",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 22,
+        "w": 6,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "NA",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "light-blue"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          },
+          "decimals": 0,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "last"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "description": "Observed at the gateway, not the client. Sum classic histogram bucket rates before quantile. Window follows $window; no completed qualifying observations yields NA. Samples are window increase estimates.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (cluster, model_name) ((increase(llm_gateway_e2e_seconds_count{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1))",
+          "legendFormat": "{{model_name}} · samples",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": false,
+          "instant": true,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "title": "Gateway · request outcomes / s",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 26,
+        "w": 8,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "noValue": "NA",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Terminal request rates: success, error and cancellation remain separate. Inflight is measured over the full stream.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (cluster, model_name, outcome) ((rate(llm_gateway_requests_total{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1))",
+          "legendFormat": "{{model_name}} · {{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "title": "Gateway · known usage tokens / s",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 26,
+        "w": 8,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "tps",
+          "noValue": "NA",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (cluster, model_name) ((rate(llm_gateway_prompt_tokens_total{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1))",
+          "legendFormat": "{{model_name}} · prompt",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (cluster, model_name) ((rate(llm_gateway_output_tokens_total{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1))",
+          "legendFormat": "{{model_name}} · output",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "title": "Gateway · missing final usage / window",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 26,
+        "w": 8,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "NA",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Unknown usage is not zero tokens. TPOT requires completion_tokens > 1 and real first/last semantic timestamps; it is never inferred from chunks.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (cluster, model_name) ((increase(llm_gateway_usage_missing_total{job=\"llm-gateway\",cluster=~\"$cluster\",model_name=~\"$model\"}[$window])) and on (cluster, node, role, service_id) (up{job=\"llm-gateway\",cluster=~\"$cluster\"} == 1))",
+          "legendFormat": "{{model_name}} · missing usage",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "row",
+      "title": "02 / Scheduler · actual concurrency & pending work",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 33,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 21,
+      "title": "P / D · actual running requests",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 34,
+        "w": 12,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "NA",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Logical requests before graph padding. One sample per attention DP; service totals require all expected fresh DP ranks. Not NPU utilization.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum by (cluster, model_name, role, service_id) ((max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_running_requests{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\"})) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"running\"}) == 1))) and on (cluster, model_name, role, service_id) (count by (cluster, model_name, role, service_id) ((max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_running_requests{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\"})) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"running\"}) == 1)) == on (cluster, role, service_id) group_left() (llm_pd:expected_dp_ranks{cluster=~\"$cluster\"})) and on (cluster, role, service_id) llm_pd:service_complete{cluster=~\"$cluster\"}",
+          "legendFormat": "{{role}} · {{model_name}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "title": "P / D · queues by stage",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 34,
+        "w": 12,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "NA",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Queue depths over time, in requests. Stages are separate pipeline populations and are not blindly summed into unique requests. Contract does not expose queue wait duration.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum by (cluster, model_name, role, service_id, stage) ((max by (cluster, model_name, role, service_id, node, dp_rank, stage) (llm_pd_queue_requests{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\"})) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"queues\"}) == 1))) and on (cluster, model_name, role, service_id, stage) (count by (cluster, model_name, role, service_id, stage) ((max by (cluster, model_name, role, service_id, node, dp_rank, stage) (llm_pd_queue_requests{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\"})) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"queues\"}) == 1)) == on (cluster, role, service_id) group_left() (llm_pd:expected_dp_ranks{cluster=~\"$cluster\"})) and on (cluster, role, service_id) llm_pd:service_complete{cluster=~\"$cluster\"}",
+          "legendFormat": "{{role}} · {{stage}} · {{model_name}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "title": "P · concurrency by DP / time",
+      "type": "state-timeline",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 41,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "NA",
+          "color": {
+            "mode": "continuous-GrYlRd"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "lineWidth": 0,
+            "fillOpacity": 90,
+            "spanNulls": false,
+            "insertNulls": 15000,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": false
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "showValue": "never",
+        "mergeValues": true,
+        "rowHeight": 0.8,
+        "alignValue": "left"
+      },
+      "description": "Heatmap: rows are actual attention DP ranks, x is time, color is logical concurrent requests. Gaps remain NA; no TP/EP replica sum.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_running_requests{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"prefill\"})) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"running\"}) == 1)",
+          "legendFormat": "{{node}} · DP {{dp_rank}} · {{model_name}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "title": "D · concurrency by DP / time",
+      "type": "state-timeline",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 41,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "NA",
+          "color": {
+            "mode": "continuous-GrYlRd"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "lineWidth": 0,
+            "fillOpacity": 90,
+            "spanNulls": false,
+            "insertNulls": 15000,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": false
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "showValue": "never",
+        "mergeValues": true,
+        "rowHeight": 0.8,
+        "alignValue": "left"
+      },
+      "description": "Heatmap: rows are actual attention DP ranks, x is time, color is logical concurrent requests. Gaps remain NA; no TP/EP replica sum.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_running_requests{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"decode\"})) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"running\"}) == 1)",
+          "legendFormat": "{{node}} · DP {{dp_rank}} · {{model_name}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 25,
+      "title": "DP · queue depth by stage",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 49,
+        "w": 16,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "NA",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(max by (cluster, model_name, role, service_id, node, dp_rank, stage) (llm_pd_queue_requests{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\"})) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"queues\"}) == 1)",
+          "legendFormat": "{{role}} · {{node}} · DP {{dp_rank}} · {{stage}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 26,
+      "title": "P delivery → D completion / s",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 49,
+        "w": 8,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "noValue": "NA",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "P kv_delivered and D completed are independent event rates; transfer/stream residence makes short-window differences normal.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum by (cluster, model_name, role, service_id) ((max by (cluster, model_name, role, service_id, node, dp_rank) (rate(llm_pd_requests_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"prefill\",event=\"kv_delivered\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1))) and on (cluster, model_name, role, service_id) (count by (cluster, model_name, role, service_id) ((max by (cluster, model_name, role, service_id, node, dp_rank) (rate(llm_pd_requests_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"prefill\",event=\"kv_delivered\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1)) == on (cluster, role, service_id) group_left() (llm_pd:expected_dp_ranks{cluster=~\"$cluster\"})) and on (cluster, role, service_id) llm_pd:service_complete{cluster=~\"$cluster\"}",
+          "legendFormat": "P · KV delivered",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "(sum by (cluster, model_name, role, service_id) ((max by (cluster, model_name, role, service_id, node, dp_rank) (rate(llm_pd_requests_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"decode\",event=\"completed\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1))) and on (cluster, model_name, role, service_id) (count by (cluster, model_name, role, service_id) ((max by (cluster, model_name, role, service_id, node, dp_rank) (rate(llm_pd_requests_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"decode\",event=\"completed\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1)) == on (cluster, role, service_id) group_left() (llm_pd:expected_dp_ranks{cluster=~\"$cluster\"})) and on (cluster, role, service_id) llm_pd:service_complete{cluster=~\"$cluster\"}",
+          "legendFormat": "D · completed",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 27,
+      "type": "row",
+      "title": "03 / Capacity · token pool & Mamba state slots",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 56,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 28,
+      "title": "KV token pool · logical service",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 57,
+        "w": 12,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "NA",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Used / available / evictable / total are distinct exporter states. Evictable may overlap used: never add states to derive capacity. Missing rank/state suppresses its total.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum by (cluster, model_name, role, service_id, state) ((max by (cluster, model_name, role, service_id, node, dp_rank, state) (llm_pd_kv_tokens{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\"})) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"kv\"}) == 1))) and on (cluster, model_name, role, service_id, state) (count by (cluster, model_name, role, service_id, state) ((max by (cluster, model_name, role, service_id, node, dp_rank, state) (llm_pd_kv_tokens{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\"})) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"kv\"}) == 1)) == on (cluster, role, service_id) group_left() (llm_pd:expected_dp_ranks{cluster=~\"$cluster\"})) and on (cluster, role, service_id) llm_pd:service_complete{cluster=~\"$cluster\"}",
+          "legendFormat": "{{role}} · {{state}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 29,
+      "title": "KV token pool · immediate headroom by DP",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 57,
+        "w": 12,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "NA",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Available / total per DP, not a ratio averaged across ranks. Mamba is measured in slots, KV in tokens.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "((max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_kv_tokens{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",state=\"available\"})) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"kv\"}) == 1)) / (((max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_kv_tokens{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",state=\"total\"})) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"kv\"}) == 1)) > 0)",
+          "legendFormat": "{{role}} · {{node}} · DP {{dp_rank}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 30,
+      "title": "Mamba state slots · logical service",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 64,
+        "w": 12,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "NA",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Used / available / evictable / total are distinct exporter states. Evictable may overlap used: never add states to derive capacity. Missing rank/state suppresses its total.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum by (cluster, model_name, role, service_id, state) ((max by (cluster, model_name, role, service_id, node, dp_rank, state) (llm_pd_mamba_slots{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\"})) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"mamba\"}) == 1))) and on (cluster, model_name, role, service_id, state) (count by (cluster, model_name, role, service_id, state) ((max by (cluster, model_name, role, service_id, node, dp_rank, state) (llm_pd_mamba_slots{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\"})) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"mamba\"}) == 1)) == on (cluster, role, service_id) group_left() (llm_pd:expected_dp_ranks{cluster=~\"$cluster\"})) and on (cluster, role, service_id) llm_pd:service_complete{cluster=~\"$cluster\"}",
+          "legendFormat": "{{role}} · {{state}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 31,
+      "title": "Mamba state slots · immediate headroom by DP",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 64,
+        "w": 12,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "NA",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Available / total per DP, not a ratio averaged across ranks. Mamba is measured in slots, KV in tokens.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "((max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_mamba_slots{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",state=\"available\"})) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"mamba\"}) == 1)) / (((max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_mamba_slots{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",state=\"total\"})) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"mamba\"}) == 1)) > 0)",
+          "legendFormat": "{{role}} · {{node}} · DP {{dp_rank}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 32,
+      "type": "row",
+      "title": "04 / Cache · P global hit, attribution & independent D reuse",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 71,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 33,
+      "title": "P · global prefix hit incl. unattributed",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 72,
+        "w": 8,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "NA",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "(hbm + host + ssd + unattributed) / all source tokens including miss. All expected DP ranks must have authoritative cached and miss rates. Unknown tier detail is not filled with zero.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "((sum by (cluster, model_name, role, service_id) (sum by (cluster, model_name, role, service_id, node, dp_rank) ((max by (cluster, model_name, role, service_id, node, dp_rank, source) (rate(llm_pd_prefix_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"prefill\",source=~\"hbm|host|ssd|unattributed\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"prefix\"}) == 1)))) and on (cluster, model_name, role, service_id) (count by (cluster, model_name, role, service_id) (sum by (cluster, model_name, role, service_id, node, dp_rank) ((max by (cluster, model_name, role, service_id, node, dp_rank, source) (rate(llm_pd_prefix_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"prefill\",source=~\"hbm|host|ssd|unattributed\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"prefix\"}) == 1))) == on (cluster, role, service_id) group_left() (llm_pd:expected_dp_ranks{cluster=~\"$cluster\"})) and on (cluster, role, service_id) llm_pd:service_complete{cluster=~\"$cluster\"}) / (((sum by (cluster, model_name, role, service_id) ((sum by (cluster, model_name, role, service_id, node, dp_rank) ((max by (cluster, model_name, role, service_id, node, dp_rank, source) (rate(llm_pd_prefix_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"prefill\",source=~\"hbm|host|ssd|unattributed|miss\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"prefix\"}) == 1))) and on (cluster, model_name, role, service_id, node, dp_rank) ((max by (cluster, model_name, role, service_id, node, dp_rank) (rate(llm_pd_prefix_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"prefill\",source=\"miss\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"prefix\"}) == 1)) and on (cluster, model_name, role, service_id, node, dp_rank) (sum by (cluster, model_name, role, service_id, node, dp_rank) ((max by (cluster, model_name, role, service_id, node, dp_rank, source) (rate(llm_pd_prefix_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"prefill\",source=~\"hbm|host|ssd|unattributed\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"prefix\"}) == 1))))) and on (cluster, model_name, role, service_id) (count by (cluster, model_name, role, service_id) ((sum by (cluster, model_name, role, service_id, node, dp_rank) ((max by (cluster, model_name, role, service_id, node, dp_rank, source) (rate(llm_pd_prefix_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"prefill\",source=~\"hbm|host|ssd|unattributed|miss\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"prefix\"}) == 1))) and on (cluster, model_name, role, service_id, node, dp_rank) ((max by (cluster, model_name, role, service_id, node, dp_rank) (rate(llm_pd_prefix_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"prefill\",source=\"miss\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"prefix\"}) == 1)) and on (cluster, model_name, role, service_id, node, dp_rank) (sum by (cluster, model_name, role, service_id, node, dp_rank) ((max by (cluster, model_name, role, service_id, node, dp_rank, source) (rate(llm_pd_prefix_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"prefill\",source=~\"hbm|host|ssd|unattributed\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"prefix\"}) == 1)))) == on (cluster, role, service_id) group_left() (llm_pd:expected_dp_ranks{cluster=~\"$cluster\"})) and on (cluster, role, service_id) llm_pd:service_complete{cluster=~\"$cluster\"}) > 0)",
+          "legendFormat": "{{model_name}} · global cached",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 34,
+      "title": "P · tiers incl. unattributed (未分层)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 72,
+        "w": 8,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "NA",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Sum per-DP counter rates before division; never average rank ratios. Unattributed = known cached tokens without trustworthy tier attribution (未分层). All categories are disjoint; missing tier details stay NA. D local_reuse excludes inherited P cache hits.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "((sum by (cluster, model_name, role, service_id, source) ((((max by (cluster, model_name, role, service_id, node, dp_rank, source) (rate(llm_pd_prefix_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"prefill\",source=~\"hbm|host|ssd\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"prefix\"}) == 1)) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"prefill\",metric_group=\"prefix_tiers\"}) == 1)) or ((max by (cluster, model_name, role, service_id, node, dp_rank, source) (rate(llm_pd_prefix_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"prefill\",source=~\"unattributed|miss\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"prefix\"}) == 1)))) and on (cluster, model_name, role, service_id, source) (count by (cluster, model_name, role, service_id, source) ((((max by (cluster, model_name, role, service_id, node, dp_rank, source) (rate(llm_pd_prefix_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"prefill\",source=~\"hbm|host|ssd\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"prefix\"}) == 1)) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"prefill\",metric_group=\"prefix_tiers\"}) == 1)) or ((max by (cluster, model_name, role, service_id, node, dp_rank, source) (rate(llm_pd_prefix_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"prefill\",source=~\"unattributed|miss\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"prefix\"}) == 1))) == on (cluster, role, service_id) group_left() (llm_pd:expected_dp_ranks{cluster=~\"$cluster\"})) and on (cluster, role, service_id) llm_pd:service_complete{cluster=~\"$cluster\"}) / on (cluster, model_name, role, service_id) group_left() (((sum by (cluster, model_name, role, service_id) ((sum by (cluster, model_name, role, service_id, node, dp_rank) ((max by (cluster, model_name, role, service_id, node, dp_rank, source) (rate(llm_pd_prefix_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"prefill\",source=~\"hbm|host|ssd|unattributed|miss\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"prefix\"}) == 1))) and on (cluster, model_name, role, service_id, node, dp_rank) ((max by (cluster, model_name, role, service_id, node, dp_rank) (rate(llm_pd_prefix_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"prefill\",source=\"miss\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"prefix\"}) == 1)) and on (cluster, model_name, role, service_id, node, dp_rank) (sum by (cluster, model_name, role, service_id, node, dp_rank) ((max by (cluster, model_name, role, service_id, node, dp_rank, source) (rate(llm_pd_prefix_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"prefill\",source=~\"hbm|host|ssd|unattributed\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"prefix\"}) == 1))))) and on (cluster, model_name, role, service_id) (count by (cluster, model_name, role, service_id) ((sum by (cluster, model_name, role, service_id, node, dp_rank) ((max by (cluster, model_name, role, service_id, node, dp_rank, source) (rate(llm_pd_prefix_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"prefill\",source=~\"hbm|host|ssd|unattributed|miss\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"prefix\"}) == 1))) and on (cluster, model_name, role, service_id, node, dp_rank) ((max by (cluster, model_name, role, service_id, node, dp_rank) (rate(llm_pd_prefix_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"prefill\",source=\"miss\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"prefix\"}) == 1)) and on (cluster, model_name, role, service_id, node, dp_rank) (sum by (cluster, model_name, role, service_id, node, dp_rank) ((max by (cluster, model_name, role, service_id, node, dp_rank, source) (rate(llm_pd_prefix_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"prefill\",source=~\"hbm|host|ssd|unattributed\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"prefix\"}) == 1)))) == on (cluster, role, service_id) group_left() (llm_pd:expected_dp_ranks{cluster=~\"$cluster\"})) and on (cluster, role, service_id) llm_pd:service_complete{cluster=~\"$cluster\"}) > 0)",
+          "legendFormat": "{{source}} · {{model_name}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 35,
+      "title": "D · independent local reuse / transferred",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 72,
+        "w": 8,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "NA",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Sum per-DP counter rates before division; never average rank ratios. Unattributed = known cached tokens without trustworthy tier attribution (未分层). All categories are disjoint; missing tier details stay NA. D local_reuse excludes inherited P cache hits.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "((sum by (cluster, model_name, role, service_id, source) ((max by (cluster, model_name, role, service_id, node, dp_rank, source) (rate(llm_pd_prefix_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"decode\",source=~\"local_reuse|transferred\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"prefix\"}) == 1))) and on (cluster, model_name, role, service_id, source) (count by (cluster, model_name, role, service_id, source) ((max by (cluster, model_name, role, service_id, node, dp_rank, source) (rate(llm_pd_prefix_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"decode\",source=~\"local_reuse|transferred\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"prefix\"}) == 1)) == on (cluster, role, service_id) group_left() (llm_pd:expected_dp_ranks{cluster=~\"$cluster\"})) and on (cluster, role, service_id) llm_pd:service_complete{cluster=~\"$cluster\"}) / on (cluster, model_name, role, service_id) group_left() (((sum by (cluster, model_name, role, service_id) ((sum by (cluster, model_name, role, service_id, node, dp_rank) ((max by (cluster, model_name, role, service_id, node, dp_rank, source) (rate(llm_pd_prefix_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"decode\",source=~\"local_reuse|transferred\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"prefix\"}) == 1))) and on (cluster, model_name, role, service_id, node, dp_rank) (count by (cluster, model_name, role, service_id, node, dp_rank) ((max by (cluster, model_name, role, service_id, node, dp_rank, source) (rate(llm_pd_prefix_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"decode\",source=~\"local_reuse|transferred\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"prefix\"}) == 1)) == 2))) and on (cluster, model_name, role, service_id) (count by (cluster, model_name, role, service_id) ((sum by (cluster, model_name, role, service_id, node, dp_rank) ((max by (cluster, model_name, role, service_id, node, dp_rank, source) (rate(llm_pd_prefix_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"decode\",source=~\"local_reuse|transferred\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"prefix\"}) == 1))) and on (cluster, model_name, role, service_id, node, dp_rank) (count by (cluster, model_name, role, service_id, node, dp_rank) ((max by (cluster, model_name, role, service_id, node, dp_rank, source) (rate(llm_pd_prefix_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"decode\",source=~\"local_reuse|transferred\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"prefix\"}) == 1)) == 2)) == on (cluster, role, service_id) group_left() (llm_pd:expected_dp_ranks{cluster=~\"$cluster\"})) and on (cluster, role, service_id) llm_pd:service_complete{cluster=~\"$cluster\"}) > 0)",
+          "legendFormat": "{{source}} · {{model_name}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 36,
+      "title": "P · unattributed cached tokens / s (未分层)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 79,
+        "w": 24,
+        "h": 5
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "tps",
+          "noValue": "NA",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Keep the authoritative unattributed cached amount visible even when another DP cannot expose this category. It is included in global hits and the all-source denominator; unavailable tier details are never treated as zero.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(max by (cluster, model_name, role, service_id, node, dp_rank) (rate(llm_pd_prefix_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"prefill\",source=\"unattributed\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"prefix\"}) == 1)",
+          "legendFormat": "{{node}} · DP {{dp_rank}} · unattributed / 未分层",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 37,
+      "type": "row",
+      "title": "05 / MTP · strict counters, no inferred acceptance",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 84,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 38,
+      "title": "MTP · accepted drafts / proposed drafts",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 85,
+        "w": 8,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "NA",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Accepted counts actual accepted draft tokens only. Never reverse-engineered from acceptance length. Unsupported counters or zero proposed rate produce NA.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "((sum by (cluster, model_name, role, service_id) ((max by (cluster, model_name, role, service_id, node, dp_rank) (rate(llm_pd_spec_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"decode\",kind=\"accepted\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"spec\"}) == 1))) and on (cluster, model_name, role, service_id) (count by (cluster, model_name, role, service_id) ((max by (cluster, model_name, role, service_id, node, dp_rank) (rate(llm_pd_spec_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"decode\",kind=\"accepted\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"spec\"}) == 1)) == on (cluster, role, service_id) group_left() (llm_pd:expected_dp_ranks{cluster=~\"$cluster\"})) and on (cluster, role, service_id) llm_pd:service_complete{cluster=~\"$cluster\"}) / (((sum by (cluster, model_name, role, service_id) ((max by (cluster, model_name, role, service_id, node, dp_rank) (rate(llm_pd_spec_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"decode\",kind=\"proposed\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"spec\"}) == 1))) and on (cluster, model_name, role, service_id) (count by (cluster, model_name, role, service_id) ((max by (cluster, model_name, role, service_id, node, dp_rank) (rate(llm_pd_spec_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"decode\",kind=\"proposed\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"spec\"}) == 1)) == on (cluster, role, service_id) group_left() (llm_pd:expected_dp_ranks{cluster=~\"$cluster\"})) and on (cluster, role, service_id) llm_pd:service_complete{cluster=~\"$cluster\"}) > 0)",
+          "legendFormat": "{{model_name}} · strict acceptance",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 39,
+      "title": "MTP · acceptance length incl. bonus",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 85,
+        "w": 8,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "NA",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Optional: emitted must count accepted + bonus tokens for the same request verify calls. Uses emitted / verify only if both are available; never infers accepted. Missing metrics remain NA.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "((sum by (cluster, model_name, role, service_id) ((max by (cluster, model_name, role, service_id, node, dp_rank) (rate(llm_pd_spec_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"decode\",kind=\"emitted\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"spec\"}) == 1))) and on (cluster, model_name, role, service_id) (count by (cluster, model_name, role, service_id) ((max by (cluster, model_name, role, service_id, node, dp_rank) (rate(llm_pd_spec_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"decode\",kind=\"emitted\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"spec\"}) == 1)) == on (cluster, role, service_id) group_left() (llm_pd:expected_dp_ranks{cluster=~\"$cluster\"})) and on (cluster, role, service_id) llm_pd:service_complete{cluster=~\"$cluster\"}) / (((sum by (cluster, model_name, role, service_id) ((max by (cluster, model_name, role, service_id, node, dp_rank) (rate(llm_pd_spec_verify_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"decode\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"spec\"}) == 1))) and on (cluster, model_name, role, service_id) (count by (cluster, model_name, role, service_id) ((max by (cluster, model_name, role, service_id, node, dp_rank) (rate(llm_pd_spec_verify_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"decode\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"spec\"}) == 1)) == on (cluster, role, service_id) group_left() (llm_pd:expected_dp_ranks{cluster=~\"$cluster\"})) and on (cluster, role, service_id) llm_pd:service_complete{cluster=~\"$cluster\"}) > 0)",
+          "legendFormat": "{{model_name}} · emitted / verify",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 40,
+      "title": "MTP · supporting token / verify rates",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 85,
+        "w": 8,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "NA",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "These rates support both ratios. Verify counts request verification calls, not graph iterations or a TP/EP sum.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum by (cluster, model_name, role, service_id) ((max by (cluster, model_name, role, service_id, node, dp_rank) (rate(llm_pd_spec_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"decode\",kind=\"accepted\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"spec\"}) == 1))) and on (cluster, model_name, role, service_id) (count by (cluster, model_name, role, service_id) ((max by (cluster, model_name, role, service_id, node, dp_rank) (rate(llm_pd_spec_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"decode\",kind=\"accepted\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"spec\"}) == 1)) == on (cluster, role, service_id) group_left() (llm_pd:expected_dp_ranks{cluster=~\"$cluster\"})) and on (cluster, role, service_id) llm_pd:service_complete{cluster=~\"$cluster\"}",
+          "legendFormat": "accepted drafts/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "(sum by (cluster, model_name, role, service_id) ((max by (cluster, model_name, role, service_id, node, dp_rank) (rate(llm_pd_spec_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"decode\",kind=\"proposed\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"spec\"}) == 1))) and on (cluster, model_name, role, service_id) (count by (cluster, model_name, role, service_id) ((max by (cluster, model_name, role, service_id, node, dp_rank) (rate(llm_pd_spec_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"decode\",kind=\"proposed\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"spec\"}) == 1)) == on (cluster, role, service_id) group_left() (llm_pd:expected_dp_ranks{cluster=~\"$cluster\"})) and on (cluster, role, service_id) llm_pd:service_complete{cluster=~\"$cluster\"}",
+          "legendFormat": "proposed drafts/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        },
+        {
+          "refId": "C",
+          "expr": "(sum by (cluster, model_name, role, service_id) ((max by (cluster, model_name, role, service_id, node, dp_rank) (rate(llm_pd_spec_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"decode\",kind=\"emitted\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"spec\"}) == 1))) and on (cluster, model_name, role, service_id) (count by (cluster, model_name, role, service_id) ((max by (cluster, model_name, role, service_id, node, dp_rank) (rate(llm_pd_spec_tokens_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"decode\",kind=\"emitted\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"spec\"}) == 1)) == on (cluster, role, service_id) group_left() (llm_pd:expected_dp_ranks{cluster=~\"$cluster\"})) and on (cluster, role, service_id) llm_pd:service_complete{cluster=~\"$cluster\"}",
+          "legendFormat": "emitted tokens/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        },
+        {
+          "refId": "D",
+          "expr": "(sum by (cluster, model_name, role, service_id) ((max by (cluster, model_name, role, service_id, node, dp_rank) (rate(llm_pd_spec_verify_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"decode\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"spec\"}) == 1))) and on (cluster, model_name, role, service_id) (count by (cluster, model_name, role, service_id) ((max by (cluster, model_name, role, service_id, node, dp_rank) (rate(llm_pd_spec_verify_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",role=\"decode\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1) and on (cluster, model_name, role, service_id, node, dp_rank) (max by (cluster, model_name, role, service_id, node, dp_rank) (llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\",metric_group=\"spec\"}) == 1)) == on (cluster, role, service_id) group_left() (llm_pd:expected_dp_ranks{cluster=~\"$cluster\"})) and on (cluster, role, service_id) llm_pd:service_complete{cluster=~\"$cluster\"}",
+          "legendFormat": "request verify calls/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 41,
+      "type": "row",
+      "title": "06 / Observability · coverage, freshness & collector health",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 92,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 42,
+      "title": "Targets · scrape availability",
+      "type": "state-timeline",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 93,
+        "w": 8,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "NA",
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            },
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "Unavailable",
+                  "color": "red"
+                },
+                "1": {
+                  "text": "Available",
+                  "color": "green"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          },
+          "custom": {
+            "lineWidth": 0,
+            "fillOpacity": 90,
+            "spanNulls": false,
+            "insertNulls": 15000,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          },
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": false
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "showValue": "never",
+        "mergeValues": true,
+        "rowHeight": 0.8,
+        "alignValue": "left"
+      },
+      "description": "0 = scrape failed, 1 = reachable. This only proves HTTP scrape availability, not collector correctness.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "up{cluster=~\"$cluster\",job=~\"llm-pd|llm-gateway\"}",
+          "legendFormat": "{{node}} · {{role}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 43,
+      "title": "DP coverage · global observed vs inventory",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 93,
+        "w": 8,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "NA",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "llm_pd:observed_dp_ranks{cluster=~\"$cluster\"}",
+          "legendFormat": "{{role}} · fresh observed",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "llm_pd:expected_dp_ranks{cluster=~\"$cluster\"}",
+          "legendFormat": "{{role}} · expected",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 44,
+      "title": "DP coverage · per-node observed vs expected",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 93,
+        "w": 8,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "NA",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "llm_pd:observed_local_dp_ranks{cluster=~\"$cluster\"}",
+          "legendFormat": "{{node}} · fresh observed",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "llm_pd:expected_local_dp_ranks{cluster=~\"$cluster\"}",
+          "legendFormat": "{{node}} · inventory expected",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        },
+        {
+          "refId": "C",
+          "expr": "llm_pd_expected_local_dp_ranks{job=\"llm-pd\",cluster=~\"$cluster\"}",
+          "legendFormat": "{{node}} · exporter expected",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 45,
+      "title": "DP snapshot age · seconds",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 100,
+        "w": 12,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "NA",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "At 30s or more a DP is stale and its operational values are excluded. A missing snapshot remains NA, never idle.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "llm_pd:dp_snapshot_age_seconds{cluster=~\"$cluster\",model_name=~\"$model\"}",
+          "legendFormat": "{{role}} · {{node}} · DP {{dp_rank}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 46,
+      "title": "Collector groups · explicit availability",
+      "type": "state-timeline",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 100,
+        "w": 12,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "NA",
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            },
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "Unavailable",
+                  "color": "red"
+                },
+                "1": {
+                  "text": "Available",
+                  "color": "green"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          },
+          "custom": {
+            "lineWidth": 0,
+            "fillOpacity": 90,
+            "spanNulls": false,
+            "insertNulls": 15000,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          },
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": false
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "showValue": "never",
+        "mergeValues": true,
+        "rowHeight": 0.8,
+        "alignValue": "left"
+      },
+      "description": "Original metric_group labels are preserved without guessing their enum. 1 = available, 0 = unavailable, absent = NA; unsupported is never zero load.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "llm_pd_metric_available{job=\"llm-pd\",cluster=~\"$cluster\"}",
+          "legendFormat": "{{node}} · DP {{dp_rank}} · {{metric_group}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 47,
+      "title": "Gateway · scrape health and local rule alerts",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 107,
+        "w": 12,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "NA",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Alerts evaluate locally. No Alertmanager, receiver, remote write or external notifications are configured. Empty alert results mean no active alert series.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "up{job=\"llm-gateway\",cluster=~\"$cluster\"}",
+          "legendFormat": "Gateway reachable",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        },
+        {
+          "refId": "B",
+          "expr": "count by (alertname, alertstate) (ALERTS{cluster=~\"$cluster\",scope=\"local-only\"})",
+          "legendFormat": "{{alertstate}} · {{alertname}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 48,
+      "title": "DP · concurrency telemetry availability",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 107,
+        "w": 12,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "NA",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Expected one canonical running_requests series per attention DP leader. >1 indicates duplicated TP/EP or other unexpected labels; alert diagnoses duplication.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count by (cluster, role, service_id, node, dp_rank) (llm_pd_running_requests{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\"})",
+          "legendFormat": "{{role}} · {{node}} · DP {{dp_rank}} · copies",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 49,
+      "type": "row",
+      "title": "07 / Optional · concurrency residence time",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 114,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 50,
+      "title": "Residence fraction · logical requests per DP",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "glm53-pd-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 115,
+        "w": 24,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "NA",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "NA",
+                  "color": "text"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Optional counter: seconds spent at each actual logical concurrency. Rank-seconds are normalized across all expected fresh DP ranks. This is a residence distribution, not a latency histogram; absent support stays NA.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum by (cluster, model_name, role, service_id, requests) ((max by (cluster, model_name, role, service_id, node, dp_rank, requests) (rate(llm_pd_concurrency_seconds_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1))) / on (cluster, model_name, role, service_id) group_left() (((sum by (cluster, model_name, role, service_id) (sum by (cluster, model_name, role, service_id, node, dp_rank) ((max by (cluster, model_name, role, service_id, node, dp_rank, requests) (rate(llm_pd_concurrency_seconds_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1)))) and on (cluster, model_name, role, service_id) (count by (cluster, model_name, role, service_id) (sum by (cluster, model_name, role, service_id, node, dp_rank) ((max by (cluster, model_name, role, service_id, node, dp_rank, requests) (rate(llm_pd_concurrency_seconds_total{job=\"llm-pd\",cluster=~\"$cluster\",model_name=~\"$model\"}[$window]))) and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh{cluster=~\"$cluster\",model_name=~\"$model\"} == 1))) == on (cluster, role, service_id) group_left() (llm_pd:expected_dp_ranks{cluster=~\"$cluster\"})) and on (cluster, role, service_id) llm_pd:service_complete{cluster=~\"$cluster\"}) > 0)",
+          "legendFormat": "{{role}} · concurrency {{requests}} · {{model_name}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "glm53-pd-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "interval": "5s",
+          "format": "time_series"
+        }
+      ]
+    }
+  ]
+}

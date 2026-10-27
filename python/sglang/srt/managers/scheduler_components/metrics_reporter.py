@@ -1,4 +1,5 @@
 from __future__ import annotations
+from sglang.srt.observability import pd_monitoring as _pd_mon
 
 import dataclasses
 import logging
@@ -200,6 +201,7 @@ class SchedulerMetricsReporter:
         # Windowed rate for waiting-queue load estimation only; the exported
         # cache_hit_rate stats keep their per-report semantics.
         self.recent_cache_hit_rate = 0.0
+        _pd_mon.configure(self.scheduler)
 
     def _current_gen_throughput(self, now: float) -> float:
         """last_gen_throughput, decayed to 0 once decode-stats stop arriving.
@@ -472,6 +474,7 @@ class SchedulerMetricsReporter:
         self.spec_num_forward_ct += bs
         self.spec_num_block_accept_tokens += num_block_accept_tokens
         self.spec_num_cap_tokens += num_cap_tokens
+        _pd_mon.spec_verify(bs, num_correct_drafts, num_accept_tokens, self._active_spec_config_snapshot())
 
     def _init_estimated_perf_constants(self) -> None:
         model_config = self.scheduler.model_config
@@ -1265,6 +1268,7 @@ class SchedulerMetricsReporter:
             return
 
         now_wall_ns = time.monotonic_ns()
+        _pd_mon.heartbeat(self.scheduler, now_wall_ns, is_idle)
         accounting = self._scheduler_time_accounting
         if accounting is None:
             self._scheduler_time_accounting = _SchedulerTimeAccountingSnapshot.init(

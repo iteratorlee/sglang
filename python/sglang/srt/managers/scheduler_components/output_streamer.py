@@ -1,4 +1,5 @@
 from __future__ import annotations
+from sglang.srt.observability import pd_monitoring as _pd_mon
 
 import logging
 from dataclasses import dataclass, field
@@ -183,6 +184,7 @@ class SchedulerOutputStreamer:
                 # because of the one additional delayed token. This "continue" prevented the dummy output.
                 continue
 
+            _pd_mon.finished(req)
             acc.accept(req=req)
             self._maybe_log_time_stats(req=req)
 

@@ -19,6 +19,7 @@ Life cycle of a request in the decode server
 """
 
 from __future__ import annotations
+from sglang.srt.observability import pd_monitoring as _pd_mon
 
 import hashlib
 import logging
@@ -2564,6 +2565,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
         decode_req.req.time_stats.set_wait_queue_entry_time()
+        _pd_mon.decode_transfer(decode_req)
         return
 
     def _poll_with_metadata_gate(self) -> List[int]:

@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
+from sglang.srt.observability import pd_monitoring as _pd_mon
 
 import dataclasses
 import faulthandler
@@ -2730,6 +2731,7 @@ class Scheduler(
         mm_input_error: Optional[str] = None,
     ):
         # Route: normal request / session request / session-not-found
+        _pd_mon.received(recv_req)
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
         )
@@ -4437,6 +4439,7 @@ class Scheduler(
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
+        _pd_mon.batch_started(batch)
         batch.after_idle_gap = self._sched_idled
         self._sched_idled = False
 
@@ -4818,6 +4821,7 @@ class Scheduler(
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
+        _pd_mon.batch_finished(batch)
 
     def _record_step_counters(
         self, batch: ScheduleBatch, result: GenerationBatchResult
@@ -5585,6 +5589,7 @@ class Scheduler(
         }
 
     def abort_request(self, recv_req: AbortReq):
+        _pd_mon.abort_requested(self, recv_req)
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
@@ -5606,6 +5611,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            _pd_mon.aborted(req, recv_req)
             self._release_aborted_request(req.rid)
             self.beam_coordinator.retire_group(req)
             # Without the initiator's reason the tokenizer falls back to a
@@ -5715,6 +5721,7 @@ class Scheduler(
                             self.tree_cache,
                             get_disagg().disaggregation_decode_retraction_backup,
                         )
+                        _pd_mon.aborted(decode_req, recv_req)
                         self.ipc_channels.send_to_tokenizer.send_output(
                             _make_abort_req(decode_req), decode_req
                         )

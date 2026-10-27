@@ -1,0 +1,46 @@
+{
+  "schema": 1,
+  "deployment": "one logical prefill instance over 910b-16/28; one logical decode instance over 910b-17/27",
+  "labels": ["cluster", "model_name", "role", "service_id", "node", "dp_rank"],
+  "prometheus": {"host": "10.0.0.16", "port": 19090, "scrape_interval": "5s"},
+  "grafana": {"host": "10.0.0.16", "port": 13000, "dashboard_uid": "glm53-910b-pd", "datasource_uid": "glm53-pd-prometheus"},
+  "targets": [
+    {"host": "10.0.0.16", "node": "910b-16", "port": 19100, "role": "prefill", "service_id": "prefill-0", "expected_local_dp_ranks": 1},
+    {"host": "10.0.0.28", "node": "910b-28", "port": 19100, "role": "prefill", "service_id": "prefill-0", "expected_local_dp_ranks": 1},
+    {"host": "10.0.0.17", "node": "910b-17", "port": 19100, "role": "decode", "service_id": "decode-0", "expected_local_dp_ranks": 4},
+    {"host": "10.0.0.27", "node": "910b-27", "port": 19100, "role": "decode", "service_id": "decode-0", "expected_local_dp_ranks": 4}
+  ],
+  "gateway_target": {"host": "10.0.0.16", "port": 29266, "role": "gateway", "service_id": "gateway-0", "node": "910b-16"},
+  "pd_metrics": {
+    "llm_pd_running_requests": "gauge, logical actual requests before graph padding, not device utilization",
+    "llm_pd_queue_requests": "gauge with stage waiting/bootstrap/prefill_inflight/decode_prealloc/decode_transfer/decode_ready/retracted",
+    "llm_pd_kv_tokens": "gauge with state used/available/evictable/total",
+    "llm_pd_mamba_slots": "gauge with state used/available/evictable/total; slots, not tokens",
+    "llm_pd_requests_total": "counter with event received/kv_delivered/completed/failed/cancelled; success and cancellation separate",
+    "llm_pd_prefix_tokens_total": "counter; prefill source hbm/host/ssd/unattributed/miss; decode source local_reuse/transferred, independent of carried P cache",
+    "llm_pd_running_context_tokens": "gauge, input plus generated tokens of actual running logical requests",
+    "llm_pd_spec_tokens_total": "counter with kind accepted/proposed/emitted; accepted counts accepted drafts only",
+    "llm_pd_spec_verify_total": "counter, request verify calls; acceptance length includes bonus separately",
+    "llm_pd_concurrency_seconds_total": "counter with requests integer label, time residence by actual logical concurrency",
+    "llm_pd_snapshot_age_seconds": "gauge per dp_rank; staleness is not zero load",
+    "llm_pd_last_snapshot_monotonic_seconds": "native gauge; exporter computes snapshot age using the same host's monotonic clock",
+    "llm_pd_instrumentation_errors_total": "counter by operation; absent before the first error, never an inference exception",
+    "llm_pd_expected_local_dp_ranks": "gauge per node, no dp_rank; sum gives P2/D8 expected coverage",
+    "llm_pd_metric_available": "gauge with metric_group label; unknown is not zero",
+    "llm_pd_build_info": "info gauge, bounded deployment topology/version/config labels"
+  },
+  "gateway_metrics": {
+    "llm_gateway_requests_total": "counter with outcome success/error/cancelled",
+    "llm_gateway_inflight_requests": "gauge, held for full downstream response stream lifetime",
+    "llm_gateway_ttft_seconds": "request-weighted histogram, first_event semantic/visible; semantic includes reasoning/text/tool argument deltas; visible excludes reasoning",
+    "llm_gateway_request_tpot_seconds": "request-weighted histogram, real first/last semantic output timestamps divided by known final completion_tokens minus one; no token/chunk-count inference",
+    "llm_gateway_e2e_seconds": "request-weighted histogram through body completion",
+    "llm_gateway_prompt_tokens_total": "counter based only on known final usage",
+    "llm_gateway_output_tokens_total": "counter based only on known final usage",
+    "llm_gateway_usage_missing_total": "counter, no fabricated TPOT when usage unknown"
+  },
+  "gateway_metric_labels": ["model_name"],
+  "latency_buckets_seconds": [0.05, 0.1, 0.25, 0.5, 1, 2, 3, 5, 8, 10, 15, 20, 30, 60, 120, 240, 480, 900, 1800],
+  "tpot_buckets_seconds": [0.001, 0.002, 0.005, 0.008, 0.01, 0.012, 0.014, 0.016, 0.018, 0.02, 0.022, 0.025, 0.028, 0.03, 0.035, 0.04, 0.05, 0.075, 0.1, 0.2, 0.5, 1],
+  "notes": ["Implemented and validated on the two-host P / two-host D reference deployment on 2026-10-27; see monitoring/docs/validation.md for limits.", "Gateway times are observed at the gateway, not full client network latency.", "Each attention DP leader publishes once; never sum identical TP/EP copies.", "Missing telemetry must remain unavailable and must not be zero-filled."]
+}
