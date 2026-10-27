@@ -332,6 +332,7 @@ pub(crate) fn init_metrics() {
 
     // Initialize mesh metrics
     smg_mesh::metrics::init_mesh_metrics();
+    super::pd_metrics::describe_metrics();
 }
 
 pub fn start_prometheus(config: PrometheusConfig) {
@@ -351,7 +352,7 @@ pub fn start_prometheus(config: PrometheusConfig) {
         .unwrap_or(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
     let socket_addr = SocketAddr::new(ip_addr, config.port);
 
-    PrometheusBuilder::new()
+    super::pd_metrics::configure_buckets(PrometheusBuilder::new())
         .with_http_listener(socket_addr)
         .upkeep_timeout(Duration::from_secs(5 * 60))
         .set_buckets_for_metric(duration_matcher, &duration_bucket)

@@ -31,6 +31,7 @@ use crate::{
     observability::{
         inflight_tracker::InFlightRequestTracker,
         metrics::{method_to_static_str, metrics_labels, Metrics},
+        pd_metrics::{PdMetrics, RequestObservation},
     },
     routers::error::extract_error_code_from_response,
     server::AppState,
@@ -625,11 +626,20 @@ static ACTIVE_HTTP_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone)]
 pub struct HttpMetricsLayer {
     tracker: Arc<InFlightRequestTracker>,
+    pd_metrics: Option<Arc<PdMetrics>>,
 }
 
 impl HttpMetricsLayer {
     pub fn new(tracker: Arc<InFlightRequestTracker>) -> Self {
-        Self { tracker }
+        Self {
+            tracker,
+            pd_metrics: None,
+        }
+    }
+
+    pub fn with_pd_metrics(mut self, metrics: Option<Arc<PdMetrics>>) -> Self {
+        self.pd_metrics = metrics;
+        self
     }
 }
 
@@ -640,6 +650,7 @@ impl<S> Layer<S> for HttpMetricsLayer {
         HttpMetricsMiddleware {
             inner,
             in_flight_request_tracker: self.tracker.clone(),
+            pd_metrics: self.pd_metrics.clone(),
         }
     }
 }
@@ -649,6 +660,7 @@ impl<S> Layer<S> for HttpMetricsLayer {
 pub struct HttpMetricsMiddleware<S> {
     inner: S,
     in_flight_request_tracker: Arc<InFlightRequestTracker>,
+    pd_metrics: Option<Arc<PdMetrics>>,
 }
 
 impl<S> Service<Request> for HttpMetricsMiddleware<S>
@@ -670,11 +682,25 @@ where
         let method = method_to_static_str(req.method().as_str());
         let path = normalize_path_for_metrics(req.uri().path());
         let start = Instant::now();
+        // This is outside admission, JSON extraction, token affinity and P/D
+        // dispatch. Reuse the HTTP ingress clock, not the response-header clock.
+        let pd_metrics = self
+            .pd_metrics
+            .as_ref()
+            .filter(|_| {
+                method == "POST"
+                    && matches!(
+                        req.uri().path(),
+                        "/generate" | "/v1/chat/completions" | "/v1/completions"
+                    )
+            })
+            .cloned();
 
         let mut inner = self.inner.clone();
         let in_flight_request_tracker = self.in_flight_request_tracker.clone();
 
         Box::pin(async move {
+            let mut pd_observation = pd_metrics.map(|m| RequestObservation::new(m, start));
             // Increment inside async block - ensures no leak if future is dropped before polling
             let active = ACTIVE_HTTP_CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
             Metrics::set_http_connections_active(active as usize);
@@ -690,12 +716,23 @@ where
             let active = ACTIVE_HTTP_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
             Metrics::set_http_connections_active(active as usize);
 
-            let response = result?;
+            let response = match result {
+                Ok(response) => response,
+                Err(error) => {
+                    if let Some(mut observation) = pd_observation.take() {
+                        observation.fail();
+                    }
+                    return Err(error);
+                }
+            };
 
             let duration = start.elapsed();
             Metrics::record_http_duration(method, &path, duration);
 
-            Ok(response)
+            Ok(match pd_observation {
+                Some(observation) => observation.wrap_response(response),
+                None => response,
+            })
         })
     }
 }
@@ -1045,5 +1082,102 @@ mod tests {
         // Regular words
         assert!(!is_dynamic_id("completions"));
         assert!(!is_dynamic_id("chat"));
+    }
+
+    #[tokio::test]
+    async fn pd_experience_metrics_cover_handler_wait_and_body_lifetime() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        let recorder = crate::observability::pd_metrics::configure_buckets(
+            metrics_exporter_prometheus::PrometheusBuilder::new(),
+        )
+        .build_recorder();
+        let handle = recorder.handle();
+        let pd = metrics::with_local_recorder(&recorder, || PdMetrics::new("middleware-fixture"));
+        let inner = tower::service_fn(|req: Request| async move {
+            let bytes = req.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(
+                bytes.as_ref(),
+                b"original request, no added usage/tokenization"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let body = Body::from_stream(tokio_stream::iter(vec![
+                Ok::<_, std::convert::Infallible>(Bytes::from_static(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n",
+                )),
+                Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+            ]));
+            let mut response = Response::new(body);
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            Ok::<_, std::convert::Infallible>(response)
+        });
+        let layer = HttpMetricsLayer::new(InFlightRequestTracker::new()).with_pd_metrics(Some(pd));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .body(Body::from("original request, no added usage/tokenization"))
+            .unwrap();
+        let response = layer.layer(inner).oneshot(req).await.unwrap();
+        assert!(handle
+            .render()
+            .lines()
+            .any(|l| l.starts_with("llm_gateway_inflight_requests{") && l.ends_with(" 1")));
+        response.into_body().collect().await.unwrap();
+        let text = handle.render();
+        assert!(text
+            .lines()
+            .any(|l| l.starts_with("llm_gateway_inflight_requests{") && l.ends_with(" 0")));
+        let ttft = text
+            .lines()
+            .find(|l| l.starts_with("llm_gateway_ttft_seconds_sum{") && l.contains("semantic"))
+            .unwrap()
+            .rsplit(' ')
+            .next()
+            .unwrap()
+            .parse::<f64>()
+            .unwrap();
+        assert!(ttft >= 0.025, "handler/P wait must be included: {ttft}");
+    }
+
+    #[tokio::test]
+    async fn pd_experience_metrics_pending_handler_drop_and_excluded_route() {
+        use tower::ServiceExt;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let pd = metrics::with_local_recorder(&recorder, || PdMetrics::new("cancel-fixture"));
+        let layer = HttpMetricsLayer::new(InFlightRequestTracker::new()).with_pd_metrics(Some(pd));
+        let inner = tower::service_fn(|_: Request| async {
+            std::future::pending::<Result<Response, std::convert::Infallible>>().await
+        });
+        for route in [
+            "/v1/chat/completions",
+            "/generate",
+            "/v1/completions",
+            "/health",
+        ] {
+            let req = Request::builder()
+                .method("POST")
+                .uri(route)
+                .body(Body::empty())
+                .unwrap();
+            assert!(tokio::time::timeout(
+                Duration::from_millis(5),
+                layer.layer(inner).oneshot(req)
+            )
+            .await
+            .is_err());
+        }
+        let text = handle.render();
+        assert!(text
+            .lines()
+            .any(|l| l.starts_with("llm_gateway_requests_total{")
+                && l.contains("cancelled")
+                && l.ends_with(" 3")));
+        assert!(text
+            .lines()
+            .any(|l| l.starts_with("llm_gateway_inflight_requests{") && l.ends_with(" 0")));
     }
 }

@@ -749,9 +749,12 @@ pub fn build_app(
             max_payload_size,
         ))
         .layer(middleware::create_logging_layer())
-        .layer(middleware::HttpMetricsLayer::new(
-            app_state.context.inflight_tracker.clone(),
-        ))
+        .layer(
+            middleware::HttpMetricsLayer::new(app_state.context.inflight_tracker.clone())
+                .with_pd_metrics(crate::observability::pd_metrics::PdMetrics::from_config(
+                    &app_state.context.router_config,
+                )),
+        )
         .layer(middleware::RequestIdLayer::new(request_id_headers))
         .layer(create_cors_layer(cors_allowed_origins))
         .fallback(sink_handler)
