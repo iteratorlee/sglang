@@ -38,9 +38,17 @@ scrape_configs:
       node: 910b-27
       role: decode
       service_id: decode-0
+  metric_relabel_configs: &id001
+  - source_labels:
+    - model_name
+    regex: /models/([^/]+)
+    target_label: model_name
+    replacement: $1
+    action: replace
 - job_name: llm-gateway
   honor_labels: false
   metrics_path: /metrics
+  metric_relabel_configs: *id001
   static_configs:
   - targets:
     - 10.0.0.16:29266

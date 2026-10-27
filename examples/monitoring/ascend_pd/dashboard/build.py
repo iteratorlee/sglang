@@ -191,11 +191,15 @@ def prometheus():
         targets.append({"targets": [f'{t["host"]}:{t["port"]}'],
                         "labels": {"cluster": CLUSTER, **{k: t[k] for k in ("node", "role", "service_id")}}})
     g = CONTRACT["gateway_target"]
+    model_identity = [{"source_labels": ["model_name"], "regex": "/models/([^/]+)",
+                       "target_label": "model_name", "replacement": "$1", "action": "replace"}]
     return {"global": {"scrape_interval": "5s", "scrape_timeout": "4s", "evaluation_interval": "5s"},
             "rule_files": ["alerts.yml"],
             "scrape_configs": [
-                {"job_name": "llm-pd", "honor_labels": False, "metrics_path": "/metrics", "static_configs": targets},
+                {"job_name": "llm-pd", "honor_labels": False, "metrics_path": "/metrics", "static_configs": targets,
+                 "metric_relabel_configs": model_identity},
                 {"job_name": "llm-gateway", "honor_labels": False, "metrics_path": "/metrics",
+                 "metric_relabel_configs": model_identity,
                  "static_configs": [{"targets": [f'{g["host"]}:{g["port"]}'],
                                      "labels": {"cluster": CLUSTER, **{k: g[k] for k in ("node", "role", "service_id")}}}]}]}
 

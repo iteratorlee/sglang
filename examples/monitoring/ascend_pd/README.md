@@ -69,7 +69,7 @@ For another cluster, update `exporter.py:TARGETS`, `config/metric-contract.json`
 
 ## Prometheus and Grafana
 
-`config/prometheus.yml` scrapes four node exporters and the existing Gateway endpoint. Use `--config.file=/etc/prometheus/prometheus.yml`, keep `alerts.yml` alongside it, and validate with `promtool check config`. Reference Prometheus listens on 19090 with 5s scrape/evaluation intervals. There is no external Alertmanager or notification receiver configured.
+`config/prometheus.yml` scrapes four node exporters and the existing Gateway endpoint. A metric relabel rule maps `/models/NAME` to `NAME`, aligning native and Gateway model identities for dashboard filters. Adjust that explicit reference-path rule for another model layout. Use `--config.file=/etc/prometheus/prometheus.yml`, keep `alerts.yml` alongside it, and validate with `promtool check config`. Reference Prometheus listens on 19090 with 5s scrape/evaluation intervals. There is no external Alertmanager or notification receiver configured.
 
 Provision Grafana with these read-only mounts:
 
