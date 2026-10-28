@@ -53,14 +53,7 @@ def main():
     (args.output/'release/release.json').write_text(json.dumps(metadata,indent=2)+'\n')
     dockerfile=f'''FROM {BASE}
 COPY release/ /opt/flagos-express/release-audit/
-RUN python3 -B /opt/flagos-express/release-audit/audit.py base
-RUN patch --fuzz=0 --no-backup-if-mismatch -p1 -d /sgl-workspace/roles/prefill < /opt/flagos-express/release-audit/prefill-topology.patch \\
- && patch --fuzz=0 --no-backup-if-mismatch -p1 -d /sgl-workspace/roles/prefill/python < /opt/flagos-express/release-audit/runtime-prefill-rank.patch \\
- && patch --fuzz=0 --no-backup-if-mismatch -p1 -d /sgl-workspace/roles/decode/python < /opt/flagos-express/release-audit/runtime-decode-rank.patch \\
- && cp /opt/flagos-express/release-audit/runtime/sglang_pd_monitoring.py /opt/flagos-express/deps/monitoring/sglang_pd_monitoring.py \\
- && mkdir -p /opt/flagos-express/deps/monitoring/exporter \\
- && cp /opt/flagos-express/release-audit/runtime/exporter/exporter.py /opt/flagos-express/deps/monitoring/exporter/exporter.py \\
- && python3 -B /opt/flagos-express/release-audit/audit.py final
+COPY overlay/ /
 LABEL org.opencontainers.image.version="{args.tag}" \\
       org.opencontainers.image.revision="{commit}" \\
       org.flagos.base-image="{BASE_ID}" \\
@@ -68,7 +61,8 @@ LABEL org.opencontainers.image.version="{args.tag}" \\
       org.flagos.decode.topology="DP8TP2-EP16"
 '''
     (args.output/'Dockerfile').write_text(dockerfile)
-    (args.output/'.dockerignore').write_text('*\n!Dockerfile\n!release/\n!release/**\n')
+    (args.output/'Dockerfile.source').write_text(f'FROM {BASE}\nCOPY release/ /opt/flagos-express/release-audit/\n')
+    (args.output/'.dockerignore').write_text('*\n!Dockerfile\n!Dockerfile.source\n!release/\n!release/**\n!overlay/\n!overlay/**\n')
     print(json.dumps(dict(context=str(args.output),commit=commit,version=args.tag,files=len(data),
         context_bytes=sum(len(x) for x in data.values()),base_image_id=BASE_ID)))
 
