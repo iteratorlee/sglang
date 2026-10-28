@@ -19,7 +19,7 @@
     "patches/runtime-prefill-rank.patch",
     "patches/runtime-decode-rank.patch"
   ],
-  "adapter_sha256": "25a892ccda9ba9a6116ef135b739bf152aef907d3dc643ed291cb62cbf5ff804",
+  "adapter_sha256": "82ac83ec31d75f23713b6342899b69c74dd2bdb89c6eefc96e1441866fe21c1b",
   "adapter_source_verified_sha256": "d5c9b544a1deacfefa5eec50e5ef9685015acdc45074c79dc72fb07052d51c46",
   "topology": {
     "old": {
@@ -115,10 +115,11 @@
       "7",
       "unknown"
     ],
-    "finite_buckets": 23,
-    "histogram_series_per_new_d_rank": 780,
-    "histogram_series_per_d_node": 3120,
-    "note": "23 finite buckets plus +Inf, sum, count => 26 samples x 2 kinds x 5 P ranks x 3 statuses; native single-process created timestamps excluded by official multiprocess collector"
+    "histogram_series_per_new_d_rank": 1005,
+    "histogram_series_per_d_node": 4020,
+    "note": "31 input and30 output finite buckets; +Inf/sum/count each; five P labels inclunknown x3statuses. All within tested2MiB/node publicationlimit.",
+    "finite_input_buckets": 31,
+    "finite_output_buckets": 30
   },
   "collector": {
     "base": "benchmark_suite/coding_flagos_1027/support/exporter_binding_1028/exporter.py",
@@ -126,12 +127,13 @@
     "timeout_seconds": 3,
     "container_binding": "Exact one-to-four allowlisted names. Proposed new names glm53-flagos-express-1028-4p2d-{p0,p1,p2,p3,d0,d1}; reconcile static JSON with final launcher before rollout.",
     "run_example": "python3 -B exporter/exporter.py --config config/topology-4p2d.json --node 910b-25",
-    "legacy_cli_preserved": true,
+    "legacy_cli_preserved": false,
     "prometheus_static_targets": 10,
     "gateway_targets": [
-      "10.0.0.16:30266",
-      "10.0.0.25:30266"
-    ]
+      "10.0.0.16:29266",
+      "10.0.0.25:29266"
+    ],
+    "configuration_policy": "Explicit runtime --config supports both topologies; no machine/IP bindings embedded in image code."
   },
   "integration_steps": [
     "Apply SG source patch on the parent SG branch; git apply --check first. It changes only adapter and two rank observation hooks.",
@@ -139,7 +141,7 @@
     "Run scripts/run_cpu_tests.py with promql-parser available (optional --parser-path) and a delegated --output directory; only CPU30/31 and local fake sockets.",
     "Parent commits all reviewed code with author liyan <yan.l@pku.edu.cn>, then pushes the SG branch. Do not use uncommitted files as image source.",
     "Run scripts/package_image_payload.py --sg-repo SG_REPO --commit INTEGRATED_SHA --output NEW_CONTEXT_DIRECTORY. It uses git show of explicit paths and records adapter_commit, monitoring_assets_commit, SHA256.",
-    "Build from the privacy-audited 7de5 base using explicit COPY of payload/monitoring to /opt/flagos-express/deps/monitoring. Merge only the two rank hooks into both role decode.py files using role-specific patches; do not replace whole role files with repository source.",
+    "Build from privacy-audited7de5 base; COPY only generic monitoring adapter/exporter and exact source hook patches. Deployment addresses/native-env/topology/Prom configs are runtime mounts and excluded from image.",
     "Parent records role source commit/SHA plus adapter metadata in image package version, builds/pushes image, then deploys new six-node service. Preserve old containers and monitoring endpoints.",
     "Apply config/native-env per node, explicit allowlisted collector config and combined Prometheus/Grafana files during parent-owned monitoring rollout. Old services show NA for new histograms until separately upgraded."
   ],

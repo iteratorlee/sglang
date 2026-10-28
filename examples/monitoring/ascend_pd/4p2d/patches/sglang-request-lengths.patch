@@ -1,17 +1,45 @@
+diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disaggregation/decode.py
+index 1de9d66..e478912 100644
+--- a/python/sglang/srt/disaggregation/decode.py
++++ b/python/sglang/srt/disaggregation/decode.py
+@@ -751,6 +751,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
+             logger.debug(f"prefill_dp_rank: {prefill_dp_rank}")
+             if prefill_dp_rank is not None:
+                 decode_req.kv_receiver.init(prefill_dp_rank)
++                _pd_mon.prefill_resolved(decode_req.req, prefill_dp_rank)
+                 return
+ 
+             self.pending_reqs.append(decode_req)
+@@ -1188,6 +1189,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
+ 
+         for decode_req, prefill_dp_rank in resolved:
+             decode_req.kv_receiver.init(prefill_dp_rank)
++            _pd_mon.prefill_resolved(decode_req.req, prefill_dp_rank)
+ 
+     def pop_preallocated(
+         self,
+diff --git a/python/sglang/srt/observability/pd_monitoring.py b/python/sglang/srt/observability/pd_monitoring.py
+index 3a7ac7f..c6570f0 100644
 --- a/python/sglang/srt/observability/pd_monitoring.py
 +++ b/python/sglang/srt/observability/pd_monitoring.py
-@@ -19,6 +19,10 @@
+@@ -19,6 +19,16 @@ import time
  
  LOGGER = logging.getLogger(__name__)
  LABELS = ("cluster", "model_name", "role", "service_id", "node", "dp_rank")
-+TOKEN_BUCKETS = (0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048,
-+                 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288,
-+                 786432, 1048576)
++INPUT_TOKEN_BUCKETS = (0, 256, 512, 1024, 2048, 4096, 8192, 12288, 16384,
++                       24576, 32768, 49152, 65536, 81920, 98304, 114688,
++                       131072, 147456, 163840, 196608, 229376, 262144,
++                       294912, 327680, 393216, 458752, 524288, 655360,
++                       786432, 917504, 1048576)
++OUTPUT_TOKEN_BUCKETS = (0, 1, 2, 4, 8, 16, 32, 64, 96, 128, 192, 256, 384,
++                        512, 768, 1024, 1536, 2048, 3072, 4096, 6144,
++                        8192, 12288, 16384, 24576, 32768, 49152, 65536,
++                        81920, 131072)
 +TERMINAL_STATUSES = ("completed", "cancelled", "failed")
  _observer = None
  _configured = False
  _last_warning = 0.0
-@@ -35,17 +39,33 @@
+@@ -35,17 +45,33 @@ def _health(req):
      return "HEALTH_CHECK" in str(getattr(req, "rid", ""))
  
  
@@ -46,14 +74,15 @@
          self.clock = clock
          self._last_state = self.clock()
          self._last_refresh = -math.inf
-@@ -179,6 +199,76 @@
+@@ -179,6 +205,77 @@ class PDObserver:
          }
          self.child("llm_pd_build_info", **values).set(1)
  
 +        def histogram(name, description, extra):
 +            kwargs = {} if registry is None else {"registry": registry}
 +            self._metrics[name] = Histogram(
-+                name, description, LABELS + extra, buckets=TOKEN_BUCKETS, **kwargs
++                name, description, LABELS + extra,
++                buckets=OUTPUT_TOKEN_BUCKETS if name == "llm_pd_request_output_tokens" else INPUT_TOKEN_BUCKETS, **kwargs
 +            )
 +
 +        if self.role == "decode":
@@ -123,7 +152,7 @@
      def child(self, name, **extra):
          key = (name, tuple(sorted(extra.items())))
          child = self._children.get(key)
-@@ -297,7 +387,9 @@
+@@ -297,7 +394,9 @@ class PDObserver:
          # Queued/retracted removals send AbortReq directly, without the normal
          # output streamer. Observe that existing terminal path once.
          if not _health(req) and not getattr(req, "_pd_metrics_finished", False):
@@ -134,7 +163,7 @@
              req._pd_metrics_finished = True
  
      def finished(self, req):
-@@ -316,6 +408,7 @@
+@@ -316,6 +415,7 @@ class PDObserver:
              )
          else:
              event = "kv_delivered" if self.role == "prefill" else "completed"
@@ -142,7 +171,7 @@
          self.child("llm_pd_requests_total", event=event).inc()
          req._pd_metrics_finished = True
          if self.role == "prefill" and not aborted:
-@@ -496,6 +589,8 @@
+@@ -496,6 +596,8 @@ def configure(scheduler):
              "topk": args.speculative_eagle_topk,
              "kv_dtype": args.kv_cache_dtype,
              "monitor_version": os.environ.get("SGLANG_PD_METRICS_VERSION", "v1"),
@@ -151,7 +180,7 @@
          }
          labels = {
              "cluster": os.environ.get("SGLANG_PD_METRICS_CLUSTER", "glm53-910b"),
-@@ -503,7 +598,7 @@
+@@ -503,7 +605,7 @@ def configure(scheduler):
              "role": role,
              "service_id": os.environ["SGLANG_PD_METRICS_SERVICE_ID"],
              "node": os.environ["SGLANG_PD_METRICS_NODE"],
@@ -160,7 +189,7 @@
          }
          _observer = PDObserver(labels=labels, config=config)
          LOGGER.info(
-@@ -548,5 +643,9 @@
+@@ -548,5 +650,9 @@ def decode_transfer(req):
      _call("decode_transfer", req)
  
  
@@ -170,21 +199,3 @@
 +
  def spec_verify(bs, correct, emitted, active_config):
      _call("spec_verify", bs, correct, emitted, active_config)
---- a/python/sglang/srt/disaggregation/decode.py
-+++ b/python/sglang/srt/disaggregation/decode.py
-@@ -751,6 +751,7 @@
-             logger.debug(f"prefill_dp_rank: {prefill_dp_rank}")
-             if prefill_dp_rank is not None:
-                 decode_req.kv_receiver.init(prefill_dp_rank)
-+                _pd_mon.prefill_resolved(decode_req.req, prefill_dp_rank)
-                 return
- 
-             self.pending_reqs.append(decode_req)
-@@ -1188,6 +1189,7 @@
- 
-         for decode_req, prefill_dp_rank in resolved:
-             decode_req.kv_receiver.init(prefill_dp_rank)
-+            _pd_mon.prefill_resolved(decode_req.req, prefill_dp_rank)
- 
-     def pop_preallocated(
-         self,
