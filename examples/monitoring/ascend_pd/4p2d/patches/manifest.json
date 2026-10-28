@@ -1,0 +1,23 @@
+{
+  "author": "liyan <yan.l@pku.edu.cn>",
+  "base_commit": "aa232279da28c4b8827b52ec43b544d79e03cec8",
+  "source_ast_preserved_after_removing_new_hooks": true,
+  "files": {
+    "python/sglang/srt/observability/pd_monitoring.py": {
+      "before_sha256": "d5c9b544a1deacfefa5eec50e5ef9685015acdc45074c79dc72fb07052d51c46",
+      "after_sha256": "25a892ccda9ba9a6116ef135b739bf152aef907d3dc643ed291cb62cbf5ff804"
+    },
+    "python/sglang/srt/disaggregation/decode.py": {
+      "before_sha256": "d453ddf8178b453a20a7487f6f04b42bb69da04d84a3fa84f6a5395b182c1518",
+      "after_sha256": "37e8eb8c6463bda2c1a9b4b77321ec0d155e8ea6f926c464b7a20c4cb3d141f1"
+    },
+    "runtime-prefill/sglang/srt/disaggregation/decode.py": {
+      "before_sha256": "bdb409453a1710710eedf5785ad0316a9aa95425374d3f60625608fbfa92cb07",
+      "after_sha256": "6adda92a3a35f709f0bb35e7e4c89ed23fd8366d63fa22400b60704d2bc813e7"
+    },
+    "runtime-decode/sglang/srt/disaggregation/decode.py": {
+      "before_sha256": "bdb409453a1710710eedf5785ad0316a9aa95425374d3f60625608fbfa92cb07",
+      "after_sha256": "6adda92a3a35f709f0bb35e7e4c89ed23fd8366d63fa22400b60704d2bc813e7"
+    }
+  }
+}

@@ -1,0 +1,127 @@
+{
+  "schema": 1,
+  "cluster": "glm53-910b-4p2d",
+  "dp_sizes": {
+    "prefill": 4,
+    "decode": 8
+  },
+  "refresh_seconds": 5,
+  "targets": [
+    {
+      "host": "10.0.0.25",
+      "port": 19100,
+      "node": "910b-25",
+      "cluster": "glm53-910b-4p2d",
+      "role": "prefill",
+      "service_id": "prefill-0",
+      "source_cluster": "glm53-flagos-express-4p2d",
+      "source_node": "p0",
+      "containers": [
+        "glm53-flagos-express-1028-4p2d-p0"
+      ],
+      "expected_ranks": [
+        "0"
+      ],
+      "expected_local_dp_ranks": 1
+    },
+    {
+      "host": "10.0.0.26",
+      "port": 19100,
+      "node": "910b-26",
+      "cluster": "glm53-910b-4p2d",
+      "role": "prefill",
+      "service_id": "prefill-0",
+      "source_cluster": "glm53-flagos-express-4p2d",
+      "source_node": "p1",
+      "containers": [
+        "glm53-flagos-express-1028-4p2d-p1"
+      ],
+      "expected_ranks": [
+        "1"
+      ],
+      "expected_local_dp_ranks": 1
+    },
+    {
+      "host": "10.0.0.29",
+      "port": 19100,
+      "node": "910b-29",
+      "cluster": "glm53-910b-4p2d",
+      "role": "prefill",
+      "service_id": "prefill-0",
+      "source_cluster": "glm53-flagos-express-4p2d",
+      "source_node": "p2",
+      "containers": [
+        "glm53-flagos-express-1028-4p2d-p2"
+      ],
+      "expected_ranks": [
+        "2"
+      ],
+      "expected_local_dp_ranks": 1
+    },
+    {
+      "host": "10.0.0.30",
+      "port": 19100,
+      "node": "910b-30",
+      "cluster": "glm53-910b-4p2d",
+      "role": "prefill",
+      "service_id": "prefill-0",
+      "source_cluster": "glm53-flagos-express-4p2d",
+      "source_node": "p3",
+      "containers": [
+        "glm53-flagos-express-1028-4p2d-p3"
+      ],
+      "expected_ranks": [
+        "3"
+      ],
+      "expected_local_dp_ranks": 1
+    },
+    {
+      "host": "10.0.0.31",
+      "port": 19100,
+      "node": "910b-31",
+      "cluster": "glm53-910b-4p2d",
+      "role": "decode",
+      "service_id": "decode-0",
+      "source_cluster": "glm53-flagos-express-4p2d",
+      "source_node": "d0",
+      "containers": [
+        "glm53-flagos-express-1028-4p2d-d0"
+      ],
+      "expected_ranks": [
+        "0",
+        "1",
+        "2",
+        "3"
+      ],
+      "expected_local_dp_ranks": 4
+    },
+    {
+      "host": "10.0.0.32",
+      "port": 19100,
+      "node": "910b-32",
+      "cluster": "glm53-910b-4p2d",
+      "role": "decode",
+      "service_id": "decode-0",
+      "source_cluster": "glm53-flagos-express-4p2d",
+      "source_node": "d1",
+      "containers": [
+        "glm53-flagos-express-1028-4p2d-d1"
+      ],
+      "expected_ranks": [
+        "4",
+        "5",
+        "6",
+        "7"
+      ],
+      "expected_local_dp_ranks": 4
+    }
+  ],
+  "gateway": {
+    "host": "10.0.0.25",
+    "node": "910b-25",
+    "port": 29266,
+    "cluster": "glm53-910b-4p2d",
+    "role": "gateway",
+    "service_id": "gateway-0"
+  }
+}

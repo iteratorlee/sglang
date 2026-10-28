@@ -1,0 +1,93 @@
+{
+  "schema": 1,
+  "cluster": "glm53-910b",
+  "dp_sizes": {
+    "prefill": 2,
+    "decode": 8
+  },
+  "refresh_seconds": 5,
+  "targets": [
+    {
+      "host": "10.0.0.16",
+      "port": 19100,
+      "node": "910b-16",
+      "cluster": "glm53-910b",
+      "role": "prefill",
+      "service_id": "prefill-0",
+      "source_cluster": "glm53-flagos-express",
+      "source_node": "p0",
+      "containers": [
+        "glm53-flagos-express-1028-abi1-2p2d-p0"
+      ],
+      "expected_ranks": [
+        "0"
+      ],
+      "expected_local_dp_ranks": 1
+    },
+    {
+      "host": "10.0.0.28",
+      "port": 19100,
+      "node": "910b-28",
+      "cluster": "glm53-910b",
+      "role": "prefill",
+      "service_id": "prefill-0",
+      "source_cluster": "glm53-flagos-express",
+      "source_node": "p1",
+      "containers": [
+        "glm53-flagos-express-1028-abi1-2p2d-p1"
+      ],
+      "expected_ranks": [
+        "1"
+      ],
+      "expected_local_dp_ranks": 1
+    },
+    {
+      "host": "10.0.0.17",
+      "port": 19100,
+      "node": "910b-17",
+      "cluster": "glm53-910b",
+      "role": "decode",
+      "service_id": "decode-0",
+      "source_cluster": "glm53-flagos-express",
+      "source_node": "d0",
+      "containers": [
+        "glm53-flagos-express-1028-abi1-2p2d-d0"
+      ],
+      "expected_ranks": [
+        "0",
+        "1",
+        "2",
+        "3"
+      ],
+      "expected_local_dp_ranks": 4
+    },
+    {
+      "host": "10.0.0.27",
+      "port": 19100,
+      "node": "910b-27",
+      "cluster": "glm53-910b",
+      "role": "decode",
+      "service_id": "decode-0",
+      "source_cluster": "glm53-flagos-express",
+      "source_node": "d1",
+      "containers": [
+        "glm53-flagos-express-1028-abi1-2p2d-d1"
+      ],
+      "expected_ranks": [
+        "4",
+        "5",
+        "6",
+        "7"
+      ],
+      "expected_local_dp_ranks": 4
+    }
+  ],
+  "gateway": {
+    "host": "10.0.0.16",
+    "node": "910b-16",
+    "port": 29266,
+    "cluster": "glm53-910b",
+    "role": "gateway",
+    "service_id": "gateway-0"
+  }
+}

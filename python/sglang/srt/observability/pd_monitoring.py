@@ -19,6 +19,16 @@ import time
 
 LOGGER = logging.getLogger(__name__)
 LABELS = ("cluster", "model_name", "role", "service_id", "node", "dp_rank")
+INPUT_TOKEN_BUCKETS = (0, 256, 512, 1024, 2048, 4096, 8192, 12288, 16384,
+                       24576, 32768, 49152, 65536, 81920, 98304, 114688,
+                       131072, 147456, 163840, 196608, 229376, 262144,
+                       294912, 327680, 393216, 458752, 524288, 655360,
+                       786432, 917504, 1048576)
+OUTPUT_TOKEN_BUCKETS = (0, 1, 2, 4, 8, 16, 32, 64, 96, 128, 192, 256, 384,
+                        512, 768, 1024, 1536, 2048, 3072, 4096, 6144,
+                        8192, 12288, 16384, 24576, 32768, 49152, 65536,
+                        81920, 131072)
+TERMINAL_STATUSES = ("completed", "cancelled", "failed")
 _observer = None
 _configured = False
 _last_warning = 0.0
@@ -35,17 +45,33 @@ def _health(req):
     return "HEALTH_CHECK" in str(getattr(req, "rid", ""))
 
 
+def _rank(value, size):
+    # No int(tensor), user-controlled strings, negative ranks, or fallback zero.
+    if isinstance(value, str) and value.isascii() and value.isdecimal() and len(value) <= 2:
+        value = int(value)
+    if isinstance(value, Integral) and not isinstance(value, bool) and 0 <= value < size:
+        return str(value)
+    return "unknown"
+
+
 class PDObserver:
     """One owner per logical attention-DP rank and process lifecycle."""
 
     def __init__(self, *, labels, config, registry=None, clock=time.monotonic):
-        from prometheus_client import Counter, Gauge
+        from prometheus_client import Counter, Gauge, Histogram
 
         self.labels = {k: str(labels[k]) for k in LABELS}
         self.role = self.labels["role"]
         if self.role not in ("prefill", "decode"):
             raise ValueError("PD observer requires a prefill or decode role")
         self.config = config
+        self.prefill_dp_size = _integer(config.get("prefill_dp_size", 2))
+        self.decode_dp_size = _integer(config.get("decode_dp_size", 8))
+        if not 1 <= self.prefill_dp_size <= 64 or not 1 <= self.decode_dp_size <= 64:
+            raise ValueError("metrics DP sizes must be in 1..64")
+        self.labels["dp_rank"] = _rank(
+            labels["dp_rank"], self.prefill_dp_size if self.role == "prefill" else self.decode_dp_size
+        )
         self.clock = clock
         self._last_state = self.clock()
         self._last_refresh = -math.inf
@@ -179,6 +205,77 @@ class PDObserver:
         }
         self.child("llm_pd_build_info", **values).set(1)
 
+        def histogram(name, description, extra):
+            kwargs = {} if registry is None else {"registry": registry}
+            self._metrics[name] = Histogram(
+                name, description, LABELS + extra,
+                buckets=OUTPUT_TOKEN_BUCKETS if name == "llm_pd_request_output_tokens" else INPUT_TOKEN_BUCKETS, **kwargs
+            )
+
+        if self.role == "decode":
+            for kind in ("input", "output"):
+                histogram(
+                    "llm_pd_request_" + kind + "_tokens",
+                    "Actual logical request " + kind + " length at D terminal, once per attention TP leader; stop included.",
+                    ("prefill_dp_rank", "status"),
+                )
+                # Zero baselines make the first request observable by rate().
+                # Bounded by configured P DP size, independent of request IDs.
+                for rank in [str(i) for i in range(self.prefill_dp_size)] + ["unknown"]:
+                    for status in TERMINAL_STATUSES:
+                        self.child("llm_pd_request_" + kind + "_tokens", prefill_dp_rank=rank, status=status)
+        else:
+            histogram("llm_pd_prefill_stage_input_tokens",
+                      "Actual P stage input length at stage terminal; not a complete request output distribution.",
+                      ("status",))
+            for status in TERMINAL_STATUSES:
+                self.child("llm_pd_prefill_stage_input_tokens", status=status)
+
+    def prefill_resolved(self, req, rank):
+        if self.role != "decode" or _health(req):
+            return
+        # Retain the initial dispatch domain through rebootstrap/retraction.
+        # An unresolved/invalid value may be replaced by a later real resolution.
+        if getattr(req, "_pd_metrics_prefill_dp_rank", "unknown") == "unknown":
+            req._pd_metrics_prefill_dp_rank = _rank(rank, self.prefill_dp_size)
+
+    def request_lengths(self, req, event):
+        # Called only at terminal paths, never from the model/token loop.
+        if getattr(req, "_pd_metrics_lengths_finished", False):
+            return
+        status = "completed" if event == "kv_delivered" else event
+        if status not in TERMINAL_STATUSES:
+            raise ValueError("invalid request terminal status")
+        # set_finish_with_abort replaces origin_input_ids by [0]. The original
+        # unpadded prompt remains intact and is the logical text-token length.
+        prompt = getattr(req, "origin_input_ids_unpadded", None)
+        if prompt is None:
+            prompt = req.origin_input_ids
+        input_len = len(prompt)
+        if self.role == "prefill":
+            observations = [("llm_pd_prefill_stage_input_tokens", {"status": status}, input_len)]
+        else:
+            output_len = len(req.output_ids)
+            # MTP can append accepted tokens beyond a stop; use the same stop
+            # position as output_ids_through_stop without slicing/copying IDs.
+            stop = getattr(req, "finished_len", None)
+            if stop is not None:
+                output_len = min(output_len, _integer(stop))
+            elif getattr(req, "pd_rebootstrap_forced_output_id", None) is not None:
+                # Rebootstrap temporarily pops one already generated token.
+                output_len += 1
+            rank = getattr(req, "_pd_metrics_prefill_dp_rank", "unknown")
+            if rank == "unknown":
+                rank = getattr(req, "disagg_prefill_dp_rank", None)
+            extra = {"prefill_dp_rank": _rank(rank, self.prefill_dp_size), "status": status}
+            observations = [("llm_pd_request_input_tokens", extra, input_len),
+                            ("llm_pd_request_output_tokens", extra, output_len)]
+        # Claim once before writes: a rare storage error must not double count
+        # on a repeated terminal callback. _call exposes instrumentation errors.
+        req._pd_metrics_lengths_finished = True
+        for name, extra, count in observations:
+            self.child(name, **extra).observe(count)
+
     def child(self, name, **extra):
         key = (name, tuple(sorted(extra.items())))
         child = self._children.get(key)
@@ -297,7 +394,9 @@ class PDObserver:
         # Queued/retracted removals send AbortReq directly, without the normal
         # output streamer. Observe that existing terminal path once.
         if not _health(req) and not getattr(req, "_pd_metrics_finished", False):
-            self.child("llm_pd_requests_total", event=self._abort_event(abort)).inc()
+            event = self._abort_event(abort)
+            self.request_lengths(req, event)
+            self.child("llm_pd_requests_total", event=event).inc()
             req._pd_metrics_finished = True
 
     def finished(self, req):
@@ -316,6 +415,7 @@ class PDObserver:
             )
         else:
             event = "kv_delivered" if self.role == "prefill" else "completed"
+        self.request_lengths(req, event)
         self.child("llm_pd_requests_total", event=event).inc()
         req._pd_metrics_finished = True
         if self.role == "prefill" and not aborted:
@@ -496,6 +596,8 @@ def configure(scheduler):
             "topk": args.speculative_eagle_topk,
             "kv_dtype": args.kv_cache_dtype,
             "monitor_version": os.environ.get("SGLANG_PD_METRICS_VERSION", "v1"),
+            "prefill_dp_size": int(os.environ.get("SGLANG_PD_METRICS_PREFILL_DP_SIZE", "2")),
+            "decode_dp_size": int(os.environ.get("SGLANG_PD_METRICS_DECODE_DP_SIZE", "8")),
         }
         labels = {
             "cluster": os.environ.get("SGLANG_PD_METRICS_CLUSTER", "glm53-910b"),
@@ -503,7 +605,7 @@ def configure(scheduler):
             "role": role,
             "service_id": os.environ["SGLANG_PD_METRICS_SERVICE_ID"],
             "node": os.environ["SGLANG_PD_METRICS_NODE"],
-            "dp_rank": scheduler.ps.dp_rank if scheduler.ps.dp_rank is not None else 0,
+            "dp_rank": scheduler.ps.dp_rank if scheduler.ps.dp_rank is not None else "unknown",
         }
         _observer = PDObserver(labels=labels, config=config)
         LOGGER.info(
@@ -546,6 +648,10 @@ def finished(req):
 
 def decode_transfer(req):
     _call("decode_transfer", req)
+
+
+def prefill_resolved(req, rank):
+    _call("prefill_resolved", req, rank)
 
 
 def spec_verify(bs, correct, emitted, active_config):

@@ -751,6 +751,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             logger.debug(f"prefill_dp_rank: {prefill_dp_rank}")
             if prefill_dp_rank is not None:
                 decode_req.kv_receiver.init(prefill_dp_rank)
+                _pd_mon.prefill_resolved(decode_req.req, prefill_dp_rank)
                 return
 
             self.pending_reqs.append(decode_req)
@@ -1188,6 +1189,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         for decode_req, prefill_dp_rank in resolved:
             decode_req.kv_receiver.init(prefill_dp_rank)
+            _pd_mon.prefill_resolved(decode_req.req, prefill_dp_rank)
 
     def pop_preallocated(
         self,

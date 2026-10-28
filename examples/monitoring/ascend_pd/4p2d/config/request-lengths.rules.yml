@@ -1,0 +1,76 @@
+groups:
+- name: pd-request-lengths
+  interval: 5s
+  rules:
+  - record: llm_pd:request_input_tokens_global:bucket_rate5m
+    expr: (sum by (cluster, model_name, status, le) (rate(llm_pd_request_input_tokens_bucket{job="llm-pd",role="decode"}[5m])
+      and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh
+      == 1))) and on (cluster) llm_pd:service_complete{role="decode"}
+  - record: llm_pd:request_input_tokens_global:p50_5m
+    expr: histogram_quantile(0.5, llm_pd:request_input_tokens_global:bucket_rate5m)
+  - record: llm_pd:request_input_tokens_global:p75_5m
+    expr: histogram_quantile(0.75, llm_pd:request_input_tokens_global:bucket_rate5m)
+  - record: llm_pd:request_input_tokens_global:p90_5m
+    expr: histogram_quantile(0.9, llm_pd:request_input_tokens_global:bucket_rate5m)
+  - record: llm_pd:request_input_tokens_global:p99_5m
+    expr: histogram_quantile(0.99, llm_pd:request_input_tokens_global:bucket_rate5m)
+  - record: llm_pd:request_output_tokens_global:bucket_rate5m
+    expr: (sum by (cluster, model_name, status, le) (rate(llm_pd_request_output_tokens_bucket{job="llm-pd",role="decode"}[5m])
+      and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh
+      == 1))) and on (cluster) llm_pd:service_complete{role="decode"}
+  - record: llm_pd:request_output_tokens_global:p50_5m
+    expr: histogram_quantile(0.5, llm_pd:request_output_tokens_global:bucket_rate5m)
+  - record: llm_pd:request_output_tokens_global:p75_5m
+    expr: histogram_quantile(0.75, llm_pd:request_output_tokens_global:bucket_rate5m)
+  - record: llm_pd:request_output_tokens_global:p90_5m
+    expr: histogram_quantile(0.9, llm_pd:request_output_tokens_global:bucket_rate5m)
+  - record: llm_pd:request_output_tokens_global:p99_5m
+    expr: histogram_quantile(0.99, llm_pd:request_output_tokens_global:bucket_rate5m)
+  - record: llm_pd:request_input_tokens_prefill_dp:bucket_rate5m
+    expr: (sum by (cluster, model_name, prefill_dp_rank, status, le) (rate(llm_pd_request_input_tokens_bucket{job="llm-pd",role="decode"}[5m])
+      and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh
+      == 1))) and on (cluster) llm_pd:service_complete{role="decode"}
+  - record: llm_pd:request_input_tokens_prefill_dp:p50_5m
+    expr: histogram_quantile(0.5, llm_pd:request_input_tokens_prefill_dp:bucket_rate5m)
+  - record: llm_pd:request_input_tokens_prefill_dp:p75_5m
+    expr: histogram_quantile(0.75, llm_pd:request_input_tokens_prefill_dp:bucket_rate5m)
+  - record: llm_pd:request_input_tokens_prefill_dp:p90_5m
+    expr: histogram_quantile(0.9, llm_pd:request_input_tokens_prefill_dp:bucket_rate5m)
+  - record: llm_pd:request_input_tokens_prefill_dp:p99_5m
+    expr: histogram_quantile(0.99, llm_pd:request_input_tokens_prefill_dp:bucket_rate5m)
+  - record: llm_pd:request_output_tokens_prefill_dp:bucket_rate5m
+    expr: (sum by (cluster, model_name, prefill_dp_rank, status, le) (rate(llm_pd_request_output_tokens_bucket{job="llm-pd",role="decode"}[5m])
+      and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh
+      == 1))) and on (cluster) llm_pd:service_complete{role="decode"}
+  - record: llm_pd:request_output_tokens_prefill_dp:p50_5m
+    expr: histogram_quantile(0.5, llm_pd:request_output_tokens_prefill_dp:bucket_rate5m)
+  - record: llm_pd:request_output_tokens_prefill_dp:p75_5m
+    expr: histogram_quantile(0.75, llm_pd:request_output_tokens_prefill_dp:bucket_rate5m)
+  - record: llm_pd:request_output_tokens_prefill_dp:p90_5m
+    expr: histogram_quantile(0.9, llm_pd:request_output_tokens_prefill_dp:bucket_rate5m)
+  - record: llm_pd:request_output_tokens_prefill_dp:p99_5m
+    expr: histogram_quantile(0.99, llm_pd:request_output_tokens_prefill_dp:bucket_rate5m)
+  - record: llm_pd:request_input_tokens_decode_dp:bucket_rate5m
+    expr: (sum by (cluster, model_name, node, dp_rank, status, le) (rate(llm_pd_request_input_tokens_bucket{job="llm-pd",role="decode"}[5m])
+      and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh
+      == 1))) and on (cluster) llm_pd:service_complete{role="decode"}
+  - record: llm_pd:request_input_tokens_decode_dp:p50_5m
+    expr: histogram_quantile(0.5, llm_pd:request_input_tokens_decode_dp:bucket_rate5m)
+  - record: llm_pd:request_input_tokens_decode_dp:p75_5m
+    expr: histogram_quantile(0.75, llm_pd:request_input_tokens_decode_dp:bucket_rate5m)
+  - record: llm_pd:request_input_tokens_decode_dp:p90_5m
+    expr: histogram_quantile(0.9, llm_pd:request_input_tokens_decode_dp:bucket_rate5m)
+  - record: llm_pd:request_input_tokens_decode_dp:p99_5m
+    expr: histogram_quantile(0.99, llm_pd:request_input_tokens_decode_dp:bucket_rate5m)
+  - record: llm_pd:request_output_tokens_decode_dp:bucket_rate5m
+    expr: (sum by (cluster, model_name, node, dp_rank, status, le) (rate(llm_pd_request_output_tokens_bucket{job="llm-pd",role="decode"}[5m])
+      and on (cluster, model_name, role, service_id, node, dp_rank) (llm_pd:dp_fresh
+      == 1))) and on (cluster) llm_pd:service_complete{role="decode"}
+  - record: llm_pd:request_output_tokens_decode_dp:p50_5m
+    expr: histogram_quantile(0.5, llm_pd:request_output_tokens_decode_dp:bucket_rate5m)
+  - record: llm_pd:request_output_tokens_decode_dp:p75_5m
+    expr: histogram_quantile(0.75, llm_pd:request_output_tokens_decode_dp:bucket_rate5m)
+  - record: llm_pd:request_output_tokens_decode_dp:p90_5m
+    expr: histogram_quantile(0.9, llm_pd:request_output_tokens_decode_dp:bucket_rate5m)
+  - record: llm_pd:request_output_tokens_decode_dp:p99_5m
+    expr: histogram_quantile(0.99, llm_pd:request_output_tokens_decode_dp:bucket_rate5m)

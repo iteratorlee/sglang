@@ -1,0 +1,9 @@
+{
+  "source": "/sgl-workspace/roles/decode/python/sglang/srt/disaggregation/decode.py",
+  "source_sha256": "bdb409453a1710710eedf5785ad0316a9aa95425374d3f60625608fbfa92cb07",
+  "methods": [
+    "_resolve_pending_reqs",
+    "_resolve_prefill_dp_rank"
+  ],
+  "patch_applied": "runtime-decode-rank.patch"
+}

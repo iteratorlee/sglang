@@ -1,0 +1,154 @@
+{
+  "schema": 1,
+  "author": "liyan <yan.l@pku.edu.cn>",
+  "commit_push_owner": "parent",
+  "deployment_owner": "parent",
+  "tracked_assets_proposal": "examples/monitoring/ascend_pd/4p2d",
+  "sg_patch": "patches/sglang-request-lengths.patch",
+  "assets_patch": "patches/sglang-monitoring-assets.patch",
+  "sg_changed_files": [
+    "python/sglang/srt/observability/pd_monitoring.py",
+    "python/sglang/srt/disaggregation/decode.py"
+  ],
+  "runtime_adapter_destination": "/opt/flagos-express/deps/monitoring/sglang_pd_monitoring.py",
+  "runtime_rank_patch_roots": {
+    "prefill": "/sgl-workspace/roles/prefill/python",
+    "decode": "/sgl-workspace/roles/decode/python"
+  },
+  "runtime_patches": [
+    "patches/runtime-prefill-rank.patch",
+    "patches/runtime-decode-rank.patch"
+  ],
+  "adapter_sha256": "25a892ccda9ba9a6116ef135b739bf152aef907d3dc643ed291cb62cbf5ff804",
+  "adapter_source_verified_sha256": "d5c9b544a1deacfefa5eec50e5ef9685015acdc45074c79dc72fb07052d51c46",
+  "topology": {
+    "old": {
+      "cluster": "glm53-910b",
+      "source_cluster": "glm53-flagos-express",
+      "p": [
+        16,
+        28
+      ],
+      "d": [
+        17,
+        27
+      ]
+    },
+    "new": {
+      "cluster": "glm53-910b-4p2d",
+      "source_cluster": "glm53-flagos-express-4p2d",
+      "p": [
+        25,
+        26,
+        29,
+        30
+      ],
+      "d": [
+        31,
+        32
+      ]
+    }
+  },
+  "metrics": {
+    "llm_pd_request_input_tokens": "D terminal actual original unpadded prompt token count; once per scheduler Req, includes successful/cancelled/failed cohorts separately.",
+    "llm_pd_request_output_tokens": "D terminal actual output_ids length clipped at finished_len; includes P handoff token and stop token, excludes MTP tokens after stop. A temporarily popped rebootstrap boundary token is included. Never requested max_new_tokens.",
+    "llm_pd_prefill_stage_input_tokens": "Separate P stage terminal input only; never full-request output and never added to D counts."
+  },
+  "labels": {
+    "inherited": [
+      "cluster",
+      "model_name",
+      "role",
+      "service_id",
+      "node",
+      "dp_rank"
+    ],
+    "terminal_extra": [
+      "prefill_dp_rank",
+      "status"
+    ],
+    "dp_rank_meaning": "global D consumption rank on full-request histograms; global P rank on P stage histogram",
+    "prefill_dp_rank_meaning": "first actual receiver init rank; fallback req.disagg_prefill_dp_rank; unknown if unresolved; no guessed zero",
+    "status": [
+      "completed",
+      "cancelled",
+      "failed"
+    ],
+    "one_service_each_role_per_cluster": true,
+    "no_request_id_labels": true
+  },
+  "quantiles": {
+    "values": [
+      0.5,
+      0.75,
+      0.9,
+      0.99
+    ],
+    "algorithm": "histogram_quantile(q, sum(rate(bucket)) by (le, cluster, model_name, optional_domain)); never average rank quantiles",
+    "recording_window": "5m",
+    "dashboard_windows": [
+      "1m",
+      "5m",
+      "15m",
+      "30m"
+    ],
+    "default_status": "completed",
+    "no_samples": "NaN/NA, never fabricated zero",
+    "coverage": "global and P/D grouped terminal distributions require full fresh D service coverage; failures/unknown D identity suppress complete totals"
+  },
+  "cardinality": {
+    "prefill_rank_values_new": [
+      "0",
+      "1",
+      "2",
+      "3",
+      "unknown"
+    ],
+    "decode_rank_values_new": [
+      "0",
+      "1",
+      "2",
+      "3",
+      "4",
+      "5",
+      "6",
+      "7",
+      "unknown"
+    ],
+    "finite_buckets": 23,
+    "histogram_series_per_new_d_rank": 780,
+    "histogram_series_per_d_node": 3120,
+    "note": "23 finite buckets plus +Inf, sum, count => 26 samples x 2 kinds x 5 P ranks x 3 statuses; native single-process created timestamps excluded by official multiprocess collector"
+  },
+  "collector": {
+    "base": "benchmark_suite/coding_flagos_1027/support/exporter_binding_1028/exporter.py",
+    "refresh_seconds": 5,
+    "timeout_seconds": 3,
+    "container_binding": "Exact one-to-four allowlisted names. Proposed new names glm53-flagos-express-1028-4p2d-{p0,p1,p2,p3,d0,d1}; reconcile static JSON with final launcher before rollout.",
+    "run_example": "python3 -B exporter/exporter.py --config config/topology-4p2d.json --node 910b-25",
+    "legacy_cli_preserved": true,
+    "prometheus_static_targets": 10,
+    "gateway_targets": [
+      "10.0.0.16:30266",
+      "10.0.0.25:30266"
+    ]
+  },
+  "integration_steps": [
+    "Apply SG source patch on the parent SG branch; git apply --check first. It changes only adapter and two rank observation hooks.",
+    "Apply assets patch (new tracked directory) or remap its prefix consistently. Preserve adapter byte identity in native asset and python module.",
+    "Run scripts/run_cpu_tests.py with promql-parser available (optional --parser-path) and a delegated --output directory; only CPU30/31 and local fake sockets.",
+    "Parent commits all reviewed code with author liyan <yan.l@pku.edu.cn>, then pushes the SG branch. Do not use uncommitted files as image source.",
+    "Run scripts/package_image_payload.py --sg-repo SG_REPO --commit INTEGRATED_SHA --output NEW_CONTEXT_DIRECTORY. It uses git show of explicit paths and records adapter_commit, monitoring_assets_commit, SHA256.",
+    "Build from the privacy-audited 7de5 base using explicit COPY of payload/monitoring to /opt/flagos-express/deps/monitoring. Merge only the two rank hooks into both role decode.py files using role-specific patches; do not replace whole role files with repository source.",
+    "Parent records role source commit/SHA plus adapter metadata in image package version, builds/pushes image, then deploys new six-node service. Preserve old containers and monitoring endpoints.",
+    "Apply config/native-env per node, explicit allowlisted collector config and combined Prometheus/Grafana files during parent-owned monitoring rollout. Old services show NA for new histograms until separately upgraded."
+  ],
+  "limits": [
+    "Terminal observations cannot recover requests lost in a hard process crash or rejected before reaching D scheduler; no inference from requested lengths.",
+    "D cancel/error output is actual generated partial length, not guaranteed delivered-to-client length.",
+    "Exactly-once scope is one logical scheduler Req, including overlap/retraction callbacks; separate external retries are separate admitted requests.",
+    "Metrics path is validated with CPU fixtures and exact witnessed source; new 4p2d inference and live scrape are intentionally not exercised.",
+    "No model/device imports, per-token hooks, device synchronization, new RPC or rank labels from request IDs."
+  ],
+  "no_markdown_files": true
+}
