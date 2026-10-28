@@ -222,7 +222,7 @@ def _glm53_npu_prefix_page_size(
     return math.lcm(tree_page_size, physical_page_size * kpool)
 
 
-_GLM53_VALIDATED_PREFILL_DP_TOPOLOGIES = frozenset(((2, 8), (4, 4), (2, 4), (4, 2)))
+_GLM53_VALIDATED_PREFILL_DP_TOPOLOGIES = frozenset(((2, 8), (4, 8), (4, 4), (2, 4), (4, 2)))
 
 
 def _glm53_npu_prefill_prefix_topology_supported(parallel):
@@ -238,15 +238,16 @@ def _glm53_npu_prefill_prefix_topology_supported(parallel):
         and (
             parallel.nnodes == 1
             or (
-                os.getenv("SGLANG_GLM53_2NODE_PD", "0") == "1"
-                and parallel.nnodes == 2
-                and parallel.tp_size == parallel.ep_size == 16
-                and parallel.dp_size == 2
+                parallel.nnodes in (2, 4)
+                and os.getenv(f"SGLANG_GLM53_{parallel.nnodes}NODE_PD", "0") == "1"
+                and parallel.tp_size == parallel.ep_size == 8 * parallel.nnodes
+                and parallel.dp_size == parallel.nnodes
                 and parallel.attn_tp_size == 8
                 and parallel.dcp_size == 1
             )
         )
-        and (parallel.tp_size, parallel.ep_size) in ((16, 16), (8, 8))
+        and (parallel.tp_size, parallel.ep_size) in ((32, 32), (16, 16), (8, 8))
+        and (parallel.tp_size != 32 or parallel.nnodes == 4)
         and parallel.attn_dp_size == parallel.dp_size
         and parallel.moe_dp_size == parallel.dwdp_size == 1
         and (parallel.dp_size, parallel.attn_tp_size)

@@ -137,10 +137,10 @@ class DpPaddingMode(IntEnum):
                             and parallel.attn_tp_size == 2
                         )
                         or (
-                            os.getenv("SGLANG_GLM53_2NODE_PD", "0") == "1"
-                            and parallel.nnodes == 2
-                            and parallel.tp_size == parallel.moe_ep_size == 16
-                            and parallel.dp_size == parallel.attn_dp_size == 2
+                            parallel.nnodes in (2, 4)
+                            and os.getenv(f"SGLANG_GLM53_{parallel.nnodes}NODE_PD", "0") == "1"
+                            and parallel.tp_size == parallel.moe_ep_size == 8 * parallel.nnodes
+                            and parallel.dp_size == parallel.nnodes == parallel.attn_dp_size
                             and parallel.attn_tp_size == 8
                             and parallel.moe_dp_size == parallel.dwdp_size == 1
                         )

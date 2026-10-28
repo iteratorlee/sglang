@@ -1,0 +1,59 @@
+{
+  "base_image": "harbor.baai.ac.cn/flagos-inner-models-release/glm-5.3-flash-w8a8-mtp-flagos-express:2026-10-28",
+  "base_image_id": "sha256:7de5a8779d489607082c16554f6c73969c800495003c38753f3ac77fa37a0686",
+  "base_prefill_manifest_sha256": "6714a5319c9854a088e9f390b1e520b9e3ffeb7ec1cbbb9f29c5807da6f8b74a",
+  "candidate_prefill_manifest_sha256": "9e00ab0647921cdbc315dbd79b46788f2c418e698e75e555bbe253ca49473d79",
+  "role": "prefill",
+  "required_opt_in": "SGLANG_GLM53_4NODE_PD=1",
+  "scope": "One logical P across four eight-device hosts; globalTP32/EP32,attentionDP4TP8. No decode changes. Runtime patch preserves the frozen role source variants.",
+  "files": [
+    {
+      "repo_path": "python/sglang/srt/hardware_backend/npu/attention/glm53/pd_state.py",
+      "target": "/sgl-workspace/roles/prefill/python/sglang/srt/hardware_backend/npu/attention/glm53/pd_state.py",
+      "baseline_sha256": "1b918efbe11148f357263438640a4a608cbca24ae6ea2f357bc45f308ddf2277",
+      "candidate_sha256": "f19d8d8bcc89cca4f6f09602a5fdd2e3cdf966c011db2937e305f6328040ecdd"
+    },
+    {
+      "repo_path": "python/sglang/srt/hardware_backend/npu/attention/glm53/prefill_index_parallel.py",
+      "target": "/sgl-workspace/roles/prefill/python/sglang/srt/hardware_backend/npu/attention/glm53/prefill_index_parallel.py",
+      "baseline_sha256": "d890d909995de85099fb038cd5fdfbfabb2264c0bcecbd8e3bb3251f7dea7097",
+      "candidate_sha256": "c2d76eefb0595a0b80b301dbbcb0c04ac8fd6a11e4a5c3cb6588bb5aebafed71"
+    },
+    {
+      "repo_path": "python/sglang/srt/hardware_backend/npu/moe/glm53_collectives.py",
+      "target": "/sgl-workspace/roles/prefill/python/sglang/srt/hardware_backend/npu/moe/glm53_collectives.py",
+      "baseline_sha256": "12144d4b1029a4cb497d935dee026ede116e0b998e409f1c70020a6de786ea5f",
+      "candidate_sha256": "f79daa017ed4398039d24bfb84dbd3be450fafb00345c0971af6fde9d3c92a2f"
+    },
+    {
+      "repo_path": "python/sglang/srt/hardware_backend/npu/moe/glm53_device_ordered_indices.py",
+      "target": "/sgl-workspace/roles/prefill/python/sglang/srt/hardware_backend/npu/moe/glm53_device_ordered_indices.py",
+      "baseline_sha256": "fc2d7656bb7b0ef818247fc369859d647517d63b6faf86b7848709c18c84403d",
+      "candidate_sha256": "4da779fc58ff9ec3a6cbf266f140ca86793e15b96a0f6ef87cd80ee0e07ca68e"
+    },
+    {
+      "repo_path": "python/sglang/srt/hardware_backend/npu/moe/glm53_idle_attention.py",
+      "target": "/sgl-workspace/roles/prefill/python/sglang/srt/hardware_backend/npu/moe/glm53_idle_attention.py",
+      "baseline_sha256": "e4d646a759a4325e8f6f0e32ad99cfc0608c0a89e24e446564d6d76a6044db40",
+      "candidate_sha256": "3a47201cfba65b074cf5868bd5cf5fdf40ed03e699d6b285fd7d1c1ff772af0d"
+    },
+    {
+      "repo_path": "python/sglang/srt/layers/dp_attention.py",
+      "target": "/sgl-workspace/roles/prefill/python/sglang/srt/layers/dp_attention.py",
+      "baseline_sha256": "14b76198c962cf1ccd1fb958043b3fb2f87017fb6c30a5fb5cdf07df02f74410",
+      "candidate_sha256": "91d667b40a0a00287a589bd5fa0aac2ea8bfd70a8532aaa7d1a08e4185bdaa32"
+    },
+    {
+      "repo_path": "python/sglang/srt/managers/schedule_batch.py",
+      "target": "/sgl-workspace/roles/prefill/python/sglang/srt/managers/schedule_batch.py",
+      "baseline_sha256": "5d1ac8f3ca55479f696366bffa26ddfefea91d5e1a4b58d8f7d0cf1d0091b349",
+      "candidate_sha256": "6d582abde853e7708a00114ef242bac801c615f07c606848404cc36e146fbfc5"
+    },
+    {
+      "repo_path": "python/sglang/srt/mem_cache/kv_cache_builder.py",
+      "target": "/sgl-workspace/roles/prefill/python/sglang/srt/mem_cache/kv_cache_builder.py",
+      "baseline_sha256": "7f6b5850206442eb172b3df03f80ccc61d303a1ac1146e7220fe73934dcf90c2",
+      "candidate_sha256": "6a42843718baf6b0f7fee55233b8d3783584469da033aa7a2cc35851a5ac3fdd"
+    }
+  ]
+}

@@ -2937,11 +2937,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         # each TP8 attention domain. EP16 routes MoE tokens; it
                         # does not change the domain-local recurrent state or
                         # the token depth named by its checkpoint.
-                        os.environ.get("SGLANG_GLM53_2NODE_PD") == "1"
+                        get_parallel().nnodes in (2, 4)
+                        and os.environ.get(
+                            f"SGLANG_GLM53_{get_parallel().nnodes}NODE_PD"
+                        ) == "1"
                         and os.environ.get("SGLANG_GLM53_NORMAL_HCCL") == "1"
-                        and get_parallel().dp_size == 2
-                        and get_parallel().nnodes == 2
-                        and get_parallel().tp_size == get_parallel().ep_size == 16
+                        and get_parallel().dp_size == get_parallel().nnodes
+                        and get_parallel().tp_size == get_parallel().ep_size
+                        == 8 * get_parallel().nnodes
                         and get_parallel().enable_dp_attention
                         and get_parallel().attn_tp_size == 8
                         and get_parallel().pp_size == 1

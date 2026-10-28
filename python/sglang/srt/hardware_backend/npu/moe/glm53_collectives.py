@@ -4,7 +4,10 @@ Retains the verified fallback for vendor dynamic-receive-size failures. This
 path is explicitly enabled for GLM W8A8 layers; decode still uses DeepEP LL.
 
 The following experiments require the existing NORMAL_SKIP_IDLE_DP=1 scope
-in eager two-node DP2/TP8/EP16 prefill (all names have the SGLANG_GLM53_ prefix):
+in eager DP2/TP8/EP16 or DP4/TP8/EP32 prefill. The latter requires
+SGLANG_GLM53_4NODE_PD=1 on every P rank. Historical mode value "2node"
+also selects this explicitly gated four-node profile; kernel bounds remain.
+All names below have the SGLANG_GLM53_ prefix:
 NORMAL_SHAPE_CACHE=1 replaces repeated shape audits with an invalidation vote;
 NORMAL_BATCH_SHAPE_AUDIT=1 keeps that vote once per large target forward,
 with a CPU certificate for the remaining 41 MoE layers (requires SHAPE_CACHE);
@@ -143,22 +146,22 @@ def normal_hccl_profile(args, limit):
     )
     if not common:
         return None
-    if args.nnodes == 2:
-        # Each TP8 attention domain stays on one 8-device host. Only the EP16
-        # gather/combine crosses hosts. Keep this experimental profile explicit
-        # until hardware validation; no general nnodes/EP allow-list expansion.
+    if args.nnodes in (2, 4):
+        # Each TP8 attention domain stays on one 8-device host. EP16/EP32
+        # gather/combine crosses hosts. Each finite layout has its own opt-in;
+        # enabling the established two-node profile never admits four nodes.
         if (
-            os.getenv("SGLANG_GLM53_2NODE_PD", "0") == "1"
-            and args.tp_size == args.ep_size == 16
+            os.getenv(f"SGLANG_GLM53_{args.nnodes}NODE_PD", "0") == "1"
+            and args.tp_size == args.ep_size == 8 * args.nnodes
             and args.enable_dp_attention
-            and args.dp_size == 2
+            and args.dp_size == args.nnodes
             and args.attn_cp_size == args.dcp_size == 1
             and args.moe_dp_size == args.dwdp_size == 1
             and not args.enable_prefill_cp
             and args.disaggregation_mode == "prefill"
             and args.disable_overlap_schedule
         ):
-            return "prefill_2node_dp2_tp8_ep16"
+            return f"prefill_{args.nnodes}node_dp{args.dp_size}_tp8_ep{args.ep_size}"
         return None
     if args.nnodes != 1:
         return None
@@ -193,7 +196,8 @@ def normal_hccl_skip_idle_dp_enabled():
 
     args = get_server_args()
     return (
-        normal_hccl_profile(args, 10.0) == "prefill_2node_dp2_tp8_ep16"
+        normal_hccl_profile(args, 10.0)
+        in ("prefill_2node_dp2_tp8_ep16", "prefill_4node_dp4_tp8_ep32")
         and args.deepep_mode == "normal"
         and args.disable_cuda_graph
         and not args.enable_single_batch_overlap
@@ -201,18 +205,22 @@ def normal_hccl_skip_idle_dp_enabled():
 
 
 def _normal_dp_shape_metadata(forward_batch):
+    from sglang.srt.runtime_context import get_parallel
+
+    dp_size = get_parallel().attn_dp_size
     original = getattr(forward_batch, "original_global_num_tokens_cpu", None)
     padded = getattr(forward_batch, "global_num_tokens_cpu", None)
     for name, values in (("original", original), ("padded", padded)):
         if (
             not isinstance(values, (list, tuple))
-            or len(values) != 2
+            or dp_size not in (2, 4)
+            or len(values) != dp_size
             or any(type(value) is not int or value < 0 for value in values)
         ):
-            raise ValueError(f"GLM idle DP requires two nonnegative CPU {name} counts")
+            raise ValueError(f"GLM idle DP requires {dp_size} nonnegative CPU {name} counts")
     if (
         not forward_batch.dp_padding_mode.is_max_len()
-        or padded[0] != padded[1]
+        or any(value != padded[0] for value in padded)
         or any(real > capacity for real, capacity in zip(original, padded))
     ):
         raise ValueError("GLM idle DP requires matching MAX_LEN padded counts")
@@ -290,7 +298,7 @@ class _BatchShapeEpoch:
             self.dispatched
             or self.active_layer != self.next_layer
             or group is not self.group
-            or world != 16
+            or world != 8 * len(self.metadata[0])
             or x != ((rows, 4096), torch.bfloat16, device)
             or ids != ((rows, 8), torch.int64, device)
             or weights != ((rows, 8), torch.float32, device)
@@ -414,17 +422,18 @@ def normal_hccl_batch_shape_audit_scope(forward_batch, layers):
                 parallel = get_parallel()
                 ep = parallel.moe_ep_group
                 if (
-                    ep.world_size != 16
-                    or parallel.attn_dp_size != 2
+                    ep.world_size not in (16, 32)
+                    or ep.world_size != 8 * parallel.attn_dp_size
+                    or parallel.attn_dp_size != len(metadata[0])
                     or parallel.attn_tp_size != 8
                     or parallel.attn_dp_rank != ep.rank_in_group // 8
                     or parallel.attn_tp_rank != ep.rank_in_group % 8
                     or list(ep.ranks) != list(parallel.tp_group.ranks)
-                    or len(ep.ranks) != 16
-                    or list(ep.ranks) != list(range(ep.ranks[0], ep.ranks[0] + 16))
+                    or len(ep.ranks) != ep.world_size
+                    or list(ep.ranks) != list(range(ep.ranks[0], ep.ranks[0] + ep.world_size))
                 ):
                     raise RuntimeError(
-                        "GLM batch shape audit requires native DP2/TP8/EP16"
+                        "GLM batch shape audit requires native DP2/TP8/EP16 or DP4/TP8/EP32"
                     )
                 epoch = _BatchShapeEpoch(
                     forward_batch, metadata, ep.device_group, first_moe, len(layers)
@@ -529,19 +538,20 @@ def _normal_skip_idle_dp_routes(selected, group, world, rank, tokens, topk):
     # order. Attention DP d owns eight consecutive source-rank payload blocks.
     # These are CPU group attributes: no device read or new collective.
     if (
-        world != 16
-        or ep.world_size != 16
+        world not in (16, 32)
+        or ep.world_size != world
         or ep.device_group is not group
-        or len(tp_ranks) != 16
+        or len(tp_ranks) != world
         or list(ep.ranks) != list(tp_ranks)
-        or list(ep.ranks) != list(range(ep.ranks[0], ep.ranks[0] + 16))
+        or list(ep.ranks) != list(range(ep.ranks[0], ep.ranks[0] + world))
         or ep.rank_in_group != rank
-        or parallel.attn_dp_size != 2
+        or parallel.attn_dp_size * 8 != world
+        or len(counts) != parallel.attn_dp_size
         or parallel.attn_tp_size != 8
         or parallel.attn_dp_rank != rank // 8
         or parallel.attn_tp_rank != rank % 8
     ):
-        raise RuntimeError("GLM idle DP requires the native DP2/TP8/EP16 rank mapping")
+        raise RuntimeError("GLM idle DP requires the native DP2/TP8/EP16 or DP4/TP8/EP32 rank mapping")
     before = selected.numel()
     span = 8 * tokens * topk
     for domain, count in enumerate(counts):
@@ -600,7 +610,7 @@ def _check_equal_dispatch_shapes_cached(group, x, ids, weights, world):
     epoch = _active_batch_shape_epoch()
     if epoch is None and (
         os.getenv("SGLANG_GLM53_NORMAL_SHAPE_CACHE", "0") != "1"
-        or world != 16
+        or world not in (16, 32)
         or _idle_dp_counts.get() is None
     ):
         _dispatch_shape_cache.pop(group, None)
@@ -615,7 +625,7 @@ def _check_equal_dispatch_shapes_cached(group, x, ids, weights, world):
             epoch.dispatched = True
             return
         epoch.check_batch(epoch.batch)
-        if group is not epoch.group or world != 16:
+        if group is not epoch.group or world != 8 * len(epoch.metadata[0]):
             epoch.fail("dispatch group or world changed")
 
     dirty = torch.tensor(
@@ -703,7 +713,8 @@ def _normal_ordered_combine_enabled(world, tokens, topk, width, dtype):
     """Retain legacy EP8 opt-in and bound the new two-node P-only mode."""
     mode = os.getenv("SGLANG_GLM53_NORMAL_COMBINE_ORDERED", "0")
     if mode == "2node":
-        if world != 16 or _idle_dp_counts.get() is None:
+        if (world not in (16, 32) or _idle_dp_counts.get() is None
+                or world != 8 * len(_idle_dp_counts.get())):
             return False
         if os.getenv("SGLANG_GLM53_NORMAL_DEVICE_ROUTING", "0") == "1":
             raise ValueError("GLM ORDERED=2node requires NORMAL_DEVICE_ROUTING=0")
@@ -713,7 +724,7 @@ def _normal_ordered_combine_enabled(world, tokens, topk, width, dtype):
     else:
         return False
     # Match ordered_combine's existing kernel bound before payload allocation.
-    # EP16 admits at most 8191 local rows (131056 gathered rows), not 8192.
+    # EP16 admits 8191 local rows; EP32 admits 4095. Keep the kernel bound.
     if not (
         topk == 8
         and width == 4096
@@ -731,7 +742,7 @@ def collective_dispatch(group, x, ids, weights, num_experts=288):
     global _last_dispatch_metadata, _idle_dp_logged, _device_routing_logged
     world, rank = dist.get_world_size(group), dist.get_rank(group)
     epoch = _active_batch_shape_epoch()
-    if epoch is not None and (world != 16 or num_experts != 288):
+    if epoch is not None and (world != 8 * len(epoch.metadata[0]) or num_experts != 288):
         epoch.fail("dispatch world or expert count changed")
     tokens, width = x.shape
     topk = ids.shape[1]
@@ -741,7 +752,7 @@ def collective_dispatch(group, x, ids, weights, num_experts=288):
     routing_mode = os.getenv("SGLANG_GLM53_NORMAL_DEVICE_ROUTING", "0")
     device_routing = (
         routing_mode in ("1", "ordered")
-        and world == 16
+        and world in (16, 32)
         and _idle_dp_counts.get() is not None
     )
     device_ordered = device_routing and routing_mode == "ordered"
@@ -765,7 +776,7 @@ def collective_dispatch(group, x, ids, weights, num_experts=288):
             # still audited below; both paths retain identical INT8 payload
             # and stable FP32 accumulation. All P ranks use the same setting.
             device_ordered = device_routing = False
-    if world in (8, 16):
+    if world in (8, 16, 32):
         release_normal_hccl_cached_memory(x)
         _check_equal_dispatch_shapes_cached(group, x, ids, weights, world)
 
@@ -970,7 +981,7 @@ def collective_combine(group, y, state):
         options = {}
         if (
             os.getenv("SGLANG_GLM53_NORMAL_COMBINE_SKIP_EMPTY", "0") == "1"
-            and world == 16
+            and world in (16, 32)
             and _idle_dp_counts.get() is not None
         ):
             minimum = int(os.getenv("SGLANG_GLM53_NORMAL_COMBINE_SKIP_EMPTY_MIN_TOKENS", "0"))
@@ -1002,7 +1013,7 @@ def collective_combine(group, y, state):
             reduce_scatter_mode == "1"  # Preserve the existing explicit mode.
             or (
                 reduce_scatter_mode == "2node"
-                and world == 16
+                and world in (16, 32)
                 and _idle_dp_counts.get() is not None
             )
         )
@@ -1016,7 +1027,7 @@ def collective_combine(group, y, state):
         dist.reduce_scatter_tensor(local_out, out, op=dist.ReduceOp.SUM, group=group)
         if (
             os.getenv("SGLANG_GLM53_NORMAL_REDUCE_SCATTER_CHECK", "0") == "1"
-            and world == 16
+            and world in (16, 32)
             and _idle_dp_counts.get() is not None
         ):
             _check_normal_reduce_scatter(group, local_out, out, tokens)

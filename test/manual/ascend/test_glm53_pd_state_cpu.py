@@ -14,6 +14,7 @@ import math
 import ctypes
 import importlib.util
 import logging
+import os
 import sys
 import types
 import unittest
@@ -750,6 +751,12 @@ class TestGlm53PDState(unittest.TestCase):
             )
 
     def test_two_node_tp8_to_tp2_all_global_ranks(self):
+        self._check_tp8_to_tp2_all_global_ranks(p_domains=2)
+
+    def test_four_node_tp8_to_tp2_all_global_ranks(self):
+        self._check_tp8_to_tp2_all_global_ranks(p_domains=4)
+
+    def _check_tp8_to_tp2_all_global_ranks(self, p_domains):
         rank_mapping = source_functions(
             SRT / "disaggregation/common/conn.py", ["_resolve_rank_mapping"], {},
             "CommonKVManager",
@@ -770,7 +777,7 @@ class TestGlm53PDState(unittest.TestCase):
             self.assertEqual(info.target_tp_ranks, list(range(first, first + 4)))
             self.assertEqual(info.target_tp_rank, first)
             self.assertEqual(info.required_prefill_response_num, 4)
-            for p_dp in range(2):
+            for p_dp in range(p_domains):
                 for p_local in info.target_tp_ranks:
                     sender = types.SimpleNamespace(
                         attn_tp_size=8,
@@ -835,13 +842,42 @@ class TestGlm53PDState(unittest.TestCase):
     def test_two_node_tp8_to_tp2_target_and_draft_kpool_tail(self):
         self._check_target_and_draft_kpool_tail(world=16, p_tp=8, d_dp=8, nnodes=2)
 
-    def _check_target_and_draft_kpool_tail(self, world, p_tp, d_dp, nnodes):
+    def test_four_node_tp8_to_tp2_target_and_draft_kpool_tail(self):
+        with patch.dict(os.environ, {"SGLANG_GLM53_4NODE_PD": "1"}):
+            self._check_target_and_draft_kpool_tail(
+                world=32, p_tp=8, d_dp=8, nnodes=4, d_world=16, d_nodes=2
+            )
+
+    def test_four_node_state_registration_requires_explicit_flag_and_geometry(self):
+        parallel = types.SimpleNamespace(**(vars(PARALLEL) | dict(
+            tp_size=32, moe_ep_size=32, nnodes=4, enable_dp_attention=True,
+            dp_size=4, attn_dp_size=4, attn_tp_size=8,
+            dcp_size=1, moe_dp_size=1, dwdp_size=1,
+        )))
+        for flag in ("0", "", "true"):
+            with patch.dict(os.environ, {"SGLANG_GLM53_2NODE_PD": "1", "SGLANG_GLM53_4NODE_PD": flag}):
+                with self.assertRaisesRegex(ValueError, "PD state requires"):
+                    make_registered(5, parallel)
+        with patch.dict(os.environ, {"SGLANG_GLM53_4NODE_PD": "1"}):
+            for key, value in (("nnodes", 2), ("moe_ep_size", 16),
+                               ("attn_dp_size", 8), ("attn_tp_size", 4),
+                               ("dcp_size", 2), ("moe_dp_size", 2),
+                               ("dwdp_size", 2), ("pp_size", 2)):
+                with self.subTest(key=key), patch.object(parallel, key, value):
+                    with self.assertRaisesRegex(ValueError, "PD state requires"):
+                        make_registered(5, parallel)
+
+    def _check_target_and_draft_kpool_tail(
+        self, world, p_tp, d_dp, nnodes, d_world=None, d_nodes=None
+    ):
         p_parallel = types.SimpleNamespace(**(vars(PARALLEL) | dict(
             tp_size=world, moe_ep_size=world, enable_dp_attention=True, nnodes=nnodes,
             dp_size=world // p_tp, attn_dp_size=world // p_tp, attn_tp_size=p_tp,
+            dcp_size=1, moe_dp_size=1, dwdp_size=1,
         )))
         d_parallel = types.SimpleNamespace(**(vars(PARALLEL) | dict(
-            tp_size=world, moe_ep_size=world, enable_dp_attention=True, nnodes=nnodes,
+            tp_size=d_world or world, moe_ep_size=d_world or world,
+            enable_dp_attention=True, nnodes=d_nodes or nnodes,
             dp_size=d_dp, attn_dp_size=d_dp, attn_tp_size=2,
         )))
         source, source_draft, _, source_buffers = make_registered(5, p_parallel)
@@ -1095,7 +1131,10 @@ class TestGlm53PDState(unittest.TestCase):
     def test_draft5_910b_mamba_state_bytes(self):
         self._check_910b_mamba_state_bytes(draft_tokens=5)
 
-    def _check_910b_mamba_state_bytes(self, draft_tokens):
+    def test_four_node_to_two_node_draft5_mamba_state_bytes(self):
+        self._check_910b_mamba_state_bytes(draft_tokens=5, p_domains=4)
+
+    def _check_910b_mamba_state_bytes(self, draft_tokens, p_domains=2):
         # Conv has a row before its channel axis; temporal does not. A TP1 D
         # must combine all eight P shards without overwriting neighboring rows.
         conv_window = 3 + draft_tokens - 1
@@ -1103,7 +1142,7 @@ class TestGlm53PDState(unittest.TestCase):
             (4, 2, 0, 0), (4, 2, 1, 0), (8, 1, 0, 0),
             # Both P hosts and all eight D DP domains, including global ranks
             # 8..15 on the second D host. Transfer uses TP-local modulo ranks.
-            *((8, 2, d_rank, p_dp) for p_dp in range(2) for d_rank in range(16)),
+            *((8, 2, d_rank, p_dp) for p_dp in range(p_domains) for d_rank in range(16)),
         ):
             with self.subTest(p_tp=p_tp, d_tp=d_tp, d_tp_rank=d_tp_rank):
                 writers = p_tp // d_tp
@@ -1127,11 +1166,11 @@ class TestGlm53PDState(unittest.TestCase):
                         mode="prefill", draft_tokens=draft_tokens,
                     )
                     source.mamba_cache.conv[0].array[:, 2] = (
-                        p_tp_rank * 1000
+                        p_dp * 10000 + p_tp_rank * 1000
                         + np.arange(2 * conv_window * 6).reshape(2, conv_window, 6)
                     )
                     source.mamba_cache.temporal.array[:, 2] = (
-                        p_tp_rank * 1000
+                        p_dp * 10000 + p_tp_rank * 1000
                         + np.arange(2 * 2 * 7 * 5).reshape(2, 2, 7, 5)
                     )
                     src_states.append(source)

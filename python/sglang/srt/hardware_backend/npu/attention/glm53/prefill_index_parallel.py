@@ -20,7 +20,7 @@ _PD_DP_PERFORMANCE_ENV = "SGLANG_GLM53_PD_PREFILL_INDEX_TP_DP_PERFORMANCE"
 _PD_VERIFY_MODE = "verify"
 _PD_PERFORMANCE_MODE = "performance"
 _PD_MODES = frozenset((_PD_VERIFY_MODE, _PD_PERFORMANCE_MODE))
-_VALIDATED_PD_DP_ATTN_TOPOLOGIES = frozenset(((2, 8), (4, 4), (2, 4), (4, 2)))
+_VALIDATED_PD_DP_ATTN_TOPOLOGIES = frozenset(((2, 8), (4, 8), (4, 4), (2, 4), (4, 2)))
 
 # One record per execution mode and process is enough to prove that the
 # optimized branch ran. A server process owns only one rank in production.
@@ -167,14 +167,15 @@ def _pd_prefill_topology_supported(args):
         and (
             args.nnodes == 1
             or (
-                os.getenv("SGLANG_GLM53_2NODE_PD", "0") == "1"
-                and args.nnodes == 2
-                and args.tp_size == args.ep_size == 16
-                and args.dp_size == 2
+                args.nnodes in (2, 4)
+                and os.getenv(f"SGLANG_GLM53_{args.nnodes}NODE_PD", "0") == "1"
+                and args.tp_size == args.ep_size == 8 * args.nnodes
+                and args.dp_size == args.nnodes
                 and args.dcp_size == 1
             )
         )
-        and (args.tp_size, args.ep_size) in ((16, 16), (8, 8))
+        and (args.tp_size, args.ep_size) in ((32, 32), (16, 16), (8, 8))
+        and (args.tp_size != 32 or args.nnodes == 4)
         and args.pp_size == 1
         and args.moe_dp_size == args.dwdp_size == 1
         # ServerArgs contains input leaves, not ParallelContext.attn_tp_size.
@@ -211,13 +212,16 @@ def enabled(q, forward_batch):
     return (
         (
             args.tp_size == args.ep_size == 16
+            or (args.tp_size == args.ep_size == 32
+                and args.disaggregation_mode == "prefill"
+                and _pd_prefill_topology_supported(args))
             or (args.tp_size == args.ep_size == 8
                 and args.disaggregation_mode == "prefill")
         )
         and (
             args.nnodes == 1
             or (
-                args.nnodes == 2
+                args.nnodes in (2, 4)
                 and args.disaggregation_mode == "prefill"
                 and args.enable_dp_attention
                 and _pd_prefill_topology_supported(args)

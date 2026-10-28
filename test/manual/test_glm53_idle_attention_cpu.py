@@ -23,7 +23,7 @@ class IdleAttentionTests(unittest.TestCase):
         self.parallel = NS(attn_dp_size=2, attn_tp_size=8, attn_dp_rank=0)
         collective = ModuleType("collective")
         collective.normal_hccl_skip_idle_dp_enabled = lambda: self.profile
-        collective.normal_hccl_idle_dp_scope = lambda *args: nullcontext()
+        collective.normal_hccl_idle_dp_scope = lambda *args, **kwargs: nullcontext()
         modes = ModuleType("modes")
         modes.ForwardMode = NS(EXTEND=1)
         runtime = ModuleType("runtime")
@@ -116,7 +116,7 @@ class IdleAttentionTests(unittest.TestCase):
             comm = NS(prepare_attn=prepare, prepare_mlp=prepare, postprocess_layer=finish,
                       should_fuse_mlp_allreduce_with_next_layer=lambda b: False,
                       should_use_reduce_scatter=lambda b: False)
-            layer = NS(_normal_skip_idle_dp=True, is_nextn=nextn, self_attn=attention,
+            layer = NS(layer_id=3, _normal_skip_idle_dp=True, is_nextn=nextn, self_attn=attention,
                        mlp=mlp, layer_communicator=comm, layer_scatter_modes=None)
             x = torch.ones(8192, 4)
             output, _, _ = namespace["forward"](layer, None, x, self.batch, None)

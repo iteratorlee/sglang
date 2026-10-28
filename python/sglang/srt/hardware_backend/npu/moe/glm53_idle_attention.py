@@ -27,32 +27,35 @@ def skip_idle_attention(batch, *, is_nextn, local_rows):
         return False
     if not batch.dp_padding_mode.is_max_len():
         return False
+    parallel = get_parallel()
+    dp_size = parallel.attn_dp_size
     original = getattr(batch, "original_global_num_tokens_cpu", None)
     padded = getattr(batch, "global_num_tokens_cpu", None)
     if any(
         not isinstance(values, (list, tuple))
-        or len(values) != 2
+        or dp_size not in (2, 4)
+        or len(values) != dp_size
         or any(type(n) is not int or n < 0 for n in values)
         for values in (original, padded)
     ):
         return False
     if not (
-        0 < padded[0] == padded[1] == local_rows <= 16384
+        0 < local_rows <= 16384
+        and all(capacity == local_rows for capacity in padded)
         and all(real <= capacity for real, capacity in zip(original, padded))
         and sum(original) > 0
     ):
         return False
-    parallel = get_parallel()
-    if parallel.attn_dp_size != 2 or parallel.attn_tp_size != 8:
+    if parallel.attn_tp_size != 8:
         return False
     rank = parallel.attn_dp_rank
-    if rank not in (0, 1) or original[rank] != 0:
+    if rank not in range(dp_size) or original[rank] != 0:
         return False
     global _logged
     if not _logged:
         logger.info(
             "GLM53 idle P attention skipped: dp=%d original=%s padded=%s "
-            "local_rows=%d; MAX_LEN and EP16 experts remain active",
+            "local_rows=%d; MAX_LEN and EP experts remain active",
             rank,
             original,
             padded,

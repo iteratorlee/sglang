@@ -45,7 +45,7 @@ def _ordered_indices(
 
 
 def device_ordered_indices(ids, selected, low, experts):
-    """Build INT32 [gathered rows,8] indices for the scoped EP16 dispatcher.
+    """Build INT32 [gathered rows,8] indices for the scoped EP16/EP32 dispatcher.
 
     Metadata checks do not synchronize. Value/order/uniqueness follow from the
     dispatcher's stable selection; this is not a general arbitrary-route API.
@@ -63,13 +63,13 @@ def device_ordered_indices(ids, selected, low, experts):
         and selected.numel() <= ids.numel()
         and ids.is_contiguous()
         and selected.is_contiguous()
-        and experts == 18
-        and 0 <= low <= 270
-        and low % 18 == 0
+        and experts in (9, 18)
+        and 0 <= low <= 288 - experts
+        and low % experts == 0
     ):
         raise ValueError(
             "GLM device ordered indices require NPU contiguous integer [rows,8] "
-            "IDs, INT64 selected offsets, <=131070 rows and 18 local experts"
+            "IDs, INT64 selected offsets, <=131070 rows and 9 or 18 local experts"
         )
     out = torch.full(ids.shape, -1, dtype=torch.int32, device=ids.device)
     if selected.numel():
