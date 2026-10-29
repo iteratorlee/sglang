@@ -465,7 +465,17 @@ class ModelRunner:
         self.startup_weight_load = None
 
         # Load model weights and configure
-        self.initialize()
+        if _is_npu:
+            from sglang.srt.mem_cache.pool_host.glm53 import (
+                glm53_early_host_reservation,
+            )
+
+            # Device binding and distributed initialization above must precede
+            # pinned allocation; weights below must follow it. Opt-in, P only.
+            with glm53_early_host_reservation(self):
+                self.initialize()
+        else:
+            self.initialize()
         self.check_quantized_moe_compatibility()
 
         self._initialize_elastic_ep_joiner()

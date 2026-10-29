@@ -13,7 +13,10 @@ import gc
 import hashlib
 import json
 import logging
+import math
 import os
+from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
@@ -92,6 +95,10 @@ def extracted_core(allocator):
         "hashlib": hashlib,
         "logger": logging.getLogger(__name__),
         "_npu_host_cache_trimmed": False,
+        "_early_host_arena": None,
+        "math": math,
+        "contextmanager": contextmanager,
+        "wraps": wraps,
         "_is_cuda": False,
         "_is_hip": False,
     }
@@ -114,6 +121,9 @@ def extracted_core(allocator):
         "is_glm53_kpool",
         "_packed_host_allocation_enabled",
         "GLM53MLAPoolHost",
+        "_EarlyHostArena",
+        "_reserve_early_host_arena",
+        "glm53_early_host_reservation",
     }
     nodes = [
         n
@@ -183,7 +193,14 @@ class TestGLM53PackedHostArenaCPU(unittest.TestCase):
             runtime.__name__: runtime,
             "torch_npu": None,
         }
-        self.env_patch = mock.patch.dict(os.environ, {PACKED_ENV: "1", TRIM_ENV: "0"})
+        self.env_patch = mock.patch.dict(
+            os.environ,
+            {
+                PACKED_ENV: "1",
+                TRIM_ENV: "0",
+                "SGLANG_GLM53_HICACHE_EARLY_HOST_ALLOC": "0",
+            },
+        )
         self.module_patch = mock.patch.dict(sys.modules, self.modules)
         self.env_patch.start()
         self.addCleanup(self.env_patch.stop)

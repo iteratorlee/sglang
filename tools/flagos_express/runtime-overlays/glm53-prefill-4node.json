@@ -2,10 +2,10 @@
   "base_image": "harbor.baai.ac.cn/flagos-inner-models-release/glm-5.3-flash-w8a8-mtp-flagos-express:2026-10-28",
   "base_image_id": "sha256:7de5a8779d489607082c16554f6c73969c800495003c38753f3ac77fa37a0686",
   "base_prefill_manifest_sha256": "6714a5319c9854a088e9f390b1e520b9e3ffeb7ec1cbbb9f29c5807da6f8b74a",
-  "candidate_prefill_manifest_sha256": "0736318a2131abcfeaab735ad8fffb2327c658a86115bc6f7209be2b88c1d084",
+  "candidate_prefill_manifest_sha256": "6670e531c57b144bd83181083bd506eaf50e36df1cebc7de86e52ef58f753501",
   "role": "prefill",
   "required_opt_in": "SGLANG_GLM53_4NODE_PD=1",
-  "scope": "One logical P across four eight-device hosts; globalTP32/EP32,attentionDP4TP8. Optional packed pinned KV arena for eager NPU GLM53 C8 prefill; the separate host-cache trim remains optional diagnostic support and is not credited as the active optimization. No decode changes. Frozen role source variants are preserved.",
+  "scope": "One logical P across four eight-device hosts; globalTP32/EP32,attentionDP4TP8. Optional packed pinned KV arena for eager NPU GLM53 C8 prefill; the separate host-cache trim remains optional diagnostic support and is not credited as the active optimization. No decode changes. Frozen role source variants are preserved. Optional early pinned reservation before weight loading, reused by packed KV allocation, for eager C8 P on two or four hosts; no decode changes.",
   "files": [
     {
       "repo_path": "python/sglang/srt/hardware_backend/npu/attention/glm53/pd_state.py",
@@ -59,11 +59,17 @@
       "repo_path": "python/sglang/srt/mem_cache/pool_host/glm53.py",
       "target": "/sgl-workspace/roles/prefill/python/sglang/srt/mem_cache/pool_host/glm53.py",
       "baseline_sha256": "8752ac5afe3e9e0648bd64aa0bf6ff9b3428a39e0c477b5a80f420d6a55aae8e",
-      "candidate_sha256": "79d4345b6033c873a927087b832d871eaa9991254f840ac05e77f64581c99445"
+      "candidate_sha256": "14cbecd76bd1e2237f13b3be8c8f590317b41c5dcebb1141bb9a0ac1c48bcc0c"
+    },
+    {
+      "repo_path": "python/sglang/srt/model_executor/model_runner.py",
+      "target": "/sgl-workspace/roles/prefill/python/sglang/srt/model_executor/model_runner.py",
+      "baseline_sha256": "7789d4af5d08996ff4f8a9c3be716dc1f3c6f3cffc345219e73c547cdf4aea8b",
+      "candidate_sha256": "7ab45c817b614c79e602d838abd19da1fed392099789aadf2026f562727590f2"
     }
   ],
   "candidate_runtime_manifests": {
-    "prefill": "10fb647900a23e782be6602acb7a0f954c46b03793998573d4831136fe7c8f13",
+    "prefill": "54d857f6e509d3920386fa008d1f1405f369331218b7af034d3e67b1af5b7bae",
     "decode": "70bfd960f839ed9feb759d207b7710da7c4031b068654519770ed427286bc027"
   },
   "python_files": {
@@ -114,5 +120,29 @@
       "sglang.srt.runtime_context.get_disagg",
       "sglang.srt.model_executor.cuda_graph_config.cuda_graph_fully_disabled"
     ]
+  },
+  "early_host_reservation": {
+    "opt_in": "SGLANG_GLM53_HICACHE_EARLY_HOST_ALLOC=1",
+    "requires": "SGLANG_GLM53_HICACHE_PACKED_HOST_ALLOC=1",
+    "default_enabled": false,
+    "phase": "assigned NPU and distributed initialization precede reservation; weight loading follows",
+    "reservation": "CLI decimal GB budget, transferred once to unchanged typed target/draft KV views",
+    "supported_P_topologies": [
+      [
+        16,
+        2,
+        16,
+        2
+      ],
+      [
+        32,
+        4,
+        32,
+        4
+      ]
+    ],
+    "D_unchanged": true,
+    "CPU_tests_passed": 33,
+    "NPU_full_model_validation": "pending; not yet a demonstrated fix"
   }
 }

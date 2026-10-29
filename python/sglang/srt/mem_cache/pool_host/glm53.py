@@ -12,7 +12,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
+from contextlib import contextmanager
+from functools import wraps
 
 import torch
 
@@ -21,6 +24,177 @@ from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
 
 logger = logging.getLogger(__name__)
 _npu_host_cache_trimmed = False
+_early_host_arena = None
+
+
+class _EarlyHostArena:
+    """One process-local reservation, transferred exactly once to the KV pool."""
+
+    def __init__(self, arena, gpu_id):
+        self.arena = arena
+        self.gpu_id = gpu_id
+        self.claimed = False
+        self.consumed = False
+
+    def discard(self):
+        global _early_host_arena
+        if _early_host_arena is self:
+            _early_host_arena = None
+        self.arena = None
+
+    def claim(self, size_bytes):
+        if self.claimed or self.arena is None:
+            raise RuntimeError("GLM53 early host arena is not available for reuse")
+        if not 0 < size_bytes <= self.arena.numel():
+            reserved = self.arena.numel()
+            self.discard()
+            raise RuntimeError(
+                f"GLM53 early host arena insufficient: payload={size_bytes}, "
+                f"reserved={reserved}; refusing a second pinned allocation"
+            )
+        if torch.get_device_module("npu").current_device() != self.gpu_id:
+            self.discard()
+            raise RuntimeError("GLM53 early host arena belongs to another NPU")
+        self.claimed = True
+        return self.arena.narrow(0, 0, size_bytes)
+
+    def commit(self):
+        if not self.claimed:
+            self.discard()
+            raise RuntimeError("GLM53 host pool did not claim its early arena")
+        self.consumed = True
+        # Typed views now own the allocation; neither this record nor the
+        # process-global slot should extend its lifetime after pool.destroy().
+        self.discard()
+
+    def require_consumed(self):
+        if not self.consumed:
+            self.discard()
+            raise RuntimeError(
+                "GLM53 early host arena was not consumed by HiCache before forward"
+            )
+
+    def guard_first_forward(self, runner):
+        forward = runner.forward
+
+        @wraps(forward)
+        def checked_forward(*args, **kwargs):
+            self.require_consumed()
+            runner.forward = forward
+            return forward(*args, **kwargs)
+
+        # Only opted-in P runners receive a one-shot check. D and subsequent
+        # forwards have no extra branch, allocator call, or device inspection.
+        runner.forward = checked_forward
+
+
+def _reserve_early_host_arena(runner):
+    """Reserve the CLI's decimal-GB budget after device binding, before weights.
+
+    The hybrid assembler later splits this budget between KV and Mamba. KV
+    narrows this reservation to its unchanged page-aligned payload; Mamba keeps
+    its existing independent allocation. No KV capacity is inferred here.
+    """
+    global _early_host_arena
+    from sglang.srt.configs.mamba_utils import mamba2_state_dtype
+    from sglang.srt.runtime_context import (
+        get_memory,
+        get_model,
+        get_parallel,
+        get_schedule,
+    )
+
+    memory = get_memory()
+    model = runner.model_config
+    parallel = get_parallel()
+    supported = (
+        _packed_host_allocation_enabled(runner.device, True, True)
+        and memory.enable_hierarchical_cache
+        and memory.hicache_mem_layout == "page_first_kv_split"
+        and memory.hicache_io_backend == "kernel_ascend"
+        and memory.hicache_storage_backend in (None, "file")
+        and get_model().kv_cache_dtype == "int8"
+        and not memory.disable_radix_cache
+        and get_schedule().page_size == 64
+        and model.hf_config.architectures == ["Glm5NextForConditionalGeneration"]
+        and model.quantization == "modelslim"
+        and mamba2_state_dtype(model.hf_config).temporal == torch.float32
+        and (runner.ps.tp_size, runner.ps.attn_dp_size, parallel.nnodes)
+        in ((16, 2, 2), (32, 4, 4))
+        and runner.ps.moe_ep_size == runner.ps.tp_size
+        and runner.ps.pp_size == 1
+        and not parallel.dcp_enabled
+    )
+    if not supported:
+        raise ValueError(
+            "GLM53 early host reservation requires eager P, packed C8 HiCache, "
+            "FP32 SSM, ModelSlim GLM5Next, TP16/DP2/EP16 or TP32/DP4/EP32"
+        )
+    budget_gb = float(memory.hicache_size)
+    if not math.isfinite(budget_gb) or not 0 < budget_gb <= 64:
+        raise ValueError(
+            "GLM53 early host reservation requires 0 < hicache_size <= 64 GB"
+        )
+    budget_bytes = int(budget_gb * 1_000_000_000)
+    if budget_bytes <= 0:
+        raise ValueError("GLM53 early host reservation budget rounds to zero bytes")
+    quant_config = model._find_quant_modelslim_config() or {}
+    weight_schemes = {
+        value for key, value in quant_config.items() if key.endswith(".weight")
+    }
+    if not (
+        weight_schemes & {"W8A8", "W8A8_DYNAMIC"}
+        and weight_schemes <= {"FLOAT", "W8A8", "W8A8_DYNAMIC"}
+    ):
+        raise ValueError("GLM53 early host reservation requires a W8A8 checkpoint")
+    if _early_host_arena is not None:
+        raise RuntimeError(
+            "GLM53 early host reservation already exists in this process"
+        )
+    if torch.get_device_module("npu").current_device() != runner.gpu_id:
+        raise RuntimeError("GLM53 early host reservation requires the assigned NPU")
+    arena = ALLOC_MEMORY_FUNCS["npu"](
+        (budget_bytes,),
+        dtype=torch.uint8,
+        device="cpu",
+        pin_memory=True,
+        allocator=None,
+    )
+    _early_host_arena = _EarlyHostArena(arena, runner.gpu_id)
+    logger.info(
+        "GLM53 reserved early pinned KV arena before weights: budget_bytes=%d, npu=%d",
+        budget_bytes,
+        runner.gpu_id,
+    )
+    return _early_host_arena
+
+
+@contextmanager
+def glm53_early_host_reservation(runner):
+    """Scope weight-loading failures; retain successful reservations for L2 init."""
+    if (
+        os.environ.get("SGLANG_GLM53_HICACHE_EARLY_HOST_ALLOC") != "1"
+        or str(runner.device).split(":", 1)[0] != "npu"
+    ):
+        yield
+        return
+    from sglang.srt.runtime_context import get_disagg
+
+    if get_disagg().disaggregation_mode != "prefill":
+        yield
+        return
+    reservation = None
+    try:
+        if not runner.is_draft_worker:
+            reservation = _reserve_early_host_arena(runner)
+        yield
+        if reservation is not None:
+            reservation.guard_first_forward(runner)
+    except BaseException:
+        # A draft loader failure also releases the target's pending reservation.
+        if _early_host_arena is not None:
+            _early_host_arena.discard()
+        raise
 
 
 def _trim_npu_host_cache_before_hicache(device) -> bool:
@@ -121,44 +295,77 @@ class GLM53MLAPoolHost(HostKVCache):
         pool_label="kv",
         **kwargs,
     ):
-        if layout != "page_first_kv_split" or page_size % 256:
-            raise ValueError(
-                "GLM53 HiCache needs page_first_kv_split and a 256-token cache grid"
-            )
-        if kwargs.get("dcp_size", 1) != 1:
-            raise ValueError("GLM53 HiCache does not support DCP")
-        self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
-        self.device_pools = (device_pool, *self.mtp_draft_device_pools)
-        self.dsa_kv_cache_store_int8 = any(
-            getattr(pool, "dsa_kv_cache_store_int8", False)
-            for pool in self.device_pools
-        )
-        self.dsa_kv_cache_store_quantized = self.dsa_kv_cache_store_int8
-        for pool in self.device_pools:
-            if (
-                not is_glm53_kpool(pool)
-                or getattr(pool, "_glm53_index_layout", None) is not None
-            ):
-                raise ValueError(
-                    "GLM53 HiCache requires native, uncompressed physical page64 allocation"
+        reservation = _early_host_arena
+        try:
+            early_requested = False
+            if os.environ.get("SGLANG_GLM53_HICACHE_EARLY_HOST_ALLOC") == "1":
+                from sglang.srt.runtime_context import get_disagg
+
+                early_requested = (
+                    str(device_pool.device).split(":", 1)[0] == "npu"
+                    and get_disagg().disaggregation_mode == "prefill"
                 )
-            if getattr(pool, "layer_shard_enabled", False):
-                raise ValueError("GLM53 HiCache layer sharding is not implemented")
-        self.physical_page_size = 64
-        self._components = []
-        self._pool_buffers = {}
-        self._packed_host_arena = None
-        super().__init__(
-            device_pool,
-            host_to_device_ratio,
-            host_size,
-            page_size,
-            layout,
-            pin_memory,
-            device,
-            allocator_type,
-            pool_label=pool_label,
-        )
+            if early_requested or reservation is not None:
+                if not early_requested or not _packed_host_allocation_enabled(
+                    device_pool.device,
+                    pin_memory,
+                    getattr(device_pool, "dsa_kv_cache_store_int8", False),
+                ):
+                    raise RuntimeError(
+                        "GLM53 early host reservation requires packed C8 allocation"
+                    )
+                if reservation is None:
+                    raise RuntimeError(
+                        "GLM53 early host reservation missing; refusing a late allocation"
+                    )
+            if layout != "page_first_kv_split" or page_size % 256:
+                raise ValueError(
+                    "GLM53 HiCache needs page_first_kv_split and a 256-token cache grid"
+                )
+            if kwargs.get("dcp_size", 1) != 1:
+                raise ValueError("GLM53 HiCache does not support DCP")
+            self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
+            self.device_pools = (device_pool, *self.mtp_draft_device_pools)
+            self.dsa_kv_cache_store_int8 = any(
+                getattr(pool, "dsa_kv_cache_store_int8", False)
+                for pool in self.device_pools
+            )
+            self.dsa_kv_cache_store_quantized = self.dsa_kv_cache_store_int8
+            for pool in self.device_pools:
+                if (
+                    not is_glm53_kpool(pool)
+                    or getattr(pool, "_glm53_index_layout", None) is not None
+                ):
+                    raise ValueError(
+                        "GLM53 HiCache requires native, uncompressed physical page64 allocation"
+                    )
+                if getattr(pool, "layer_shard_enabled", False):
+                    raise ValueError("GLM53 HiCache layer sharding is not implemented")
+            self.physical_page_size = 64
+            self._components = []
+            self._pool_buffers = {}
+            self._packed_host_arena = None
+            super().__init__(
+                device_pool,
+                host_to_device_ratio,
+                host_size,
+                page_size,
+                layout,
+                pin_memory,
+                device,
+                allocator_type,
+                pool_label=pool_label,
+            )
+            if reservation is not None:
+                reservation.commit()
+        except BaseException:
+            if reservation is not None:
+                reservation.discard()
+                self._components = []
+                self._pool_buffers = {}
+                self._packed_host_arena = None
+                self.kv_buffer = None
+            raise
 
     def get_size_per_token(self):
         self.target_layer_num = self.device_pool.layer_num
@@ -214,13 +421,23 @@ class GLM53MLAPoolHost(HostKVCache):
             logger.info(
                 "GLM53 allocating packed pinned KV arena: payload_bytes=%d", total_bytes
             )
-            self._packed_host_arena = alloc(
-                (total_bytes,),
-                dtype=torch.uint8,
-                device=self.device,
-                pin_memory=self.pin_memory,
-                allocator=self.allocator,
-            )
+            if os.environ.get("SGLANG_GLM53_HICACHE_EARLY_HOST_ALLOC") == "1":
+                if _early_host_arena is None:
+                    raise RuntimeError(
+                        "GLM53 early host reservation missing; refusing a late allocation"
+                    )
+                self._packed_host_arena = _early_host_arena.claim(total_bytes)
+                logger.info(
+                    "GLM53 reused early pinned KV arena: payload_bytes=%d", total_bytes
+                )
+            else:
+                self._packed_host_arena = alloc(
+                    (total_bytes,),
+                    dtype=torch.uint8,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+                    allocator=self.allocator,
+                )
         for pool in self.device_pools:
             buffers = []
             for component in (pool.k_buffer, pool.index_k_buffer):
