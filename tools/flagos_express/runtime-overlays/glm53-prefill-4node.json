@@ -2,10 +2,10 @@
   "base_image": "harbor.baai.ac.cn/flagos-inner-models-release/glm-5.3-flash-w8a8-mtp-flagos-express:2026-10-28",
   "base_image_id": "sha256:7de5a8779d489607082c16554f6c73969c800495003c38753f3ac77fa37a0686",
   "base_prefill_manifest_sha256": "6714a5319c9854a088e9f390b1e520b9e3ffeb7ec1cbbb9f29c5807da6f8b74a",
-  "candidate_prefill_manifest_sha256": "9e00ab0647921cdbc315dbd79b46788f2c418e698e75e555bbe253ca49473d79",
+  "candidate_prefill_manifest_sha256": "f12337d8c42eedf21de4b33d1604960d925bd486d4cc7c08bf2e3d5df574b3d7",
   "role": "prefill",
   "required_opt_in": "SGLANG_GLM53_4NODE_PD=1",
-  "scope": "One logical P across four eight-device hosts; globalTP32/EP32,attentionDP4TP8. No decode changes. Runtime patch preserves the frozen role source variants.",
+  "scope": "One logical P across four eight-device hosts; globalTP32/EP32,attentionDP4TP8. Optional one-time startup host-cache cleanup for eager NPU GLM53 C8 prefill. No decode changes. Runtime patch preserves the frozen role source variants.",
   "files": [
     {
       "repo_path": "python/sglang/srt/hardware_backend/npu/attention/glm53/pd_state.py",
@@ -54,6 +54,31 @@
       "target": "/sgl-workspace/roles/prefill/python/sglang/srt/mem_cache/kv_cache_builder.py",
       "baseline_sha256": "7f6b5850206442eb172b3df03f80ccc61d303a1ac1146e7220fe73934dcf90c2",
       "candidate_sha256": "6a42843718baf6b0f7fee55233b8d3783584469da033aa7a2cc35851a5ac3fdd"
+    },
+    {
+      "repo_path": "python/sglang/srt/mem_cache/pool_host/glm53.py",
+      "target": "/sgl-workspace/roles/prefill/python/sglang/srt/mem_cache/pool_host/glm53.py",
+      "baseline_sha256": "8752ac5afe3e9e0648bd64aa0bf6ff9b3428a39e0c477b5a80f420d6a55aae8e",
+      "candidate_sha256": "6747a3a867e7c9475570dec510a71d060c9e12de4daddeae1ae73da7232f8344"
     }
-  ]
+  ],
+  "candidate_runtime_manifests": {
+    "prefill": "bae17afdaea5fa6f1f8145d9e86d80a8893824fb8c49f73be382d20a17e2c14e",
+    "decode": "70bfd960f839ed9feb759d207b7710da7c4031b068654519770ed427286bc027"
+  },
+  "python_files": {
+    "prefill": 3856,
+    "decode": 3855
+  },
+  "startup_host_cache_trim": {
+    "opt_in": "SGLANG_GLM53_HICACHE_TRIM_HOST_CACHE=1",
+    "default_enabled": false,
+    "repo_path": "python/sglang/srt/mem_cache/pool_host/glm53.py",
+    "phase": "Before eager NPU GLM53 C8 prefill host-cache allocation; once per process",
+    "baseline_source": "Public 2026-10-28 base image; identical file in immutable 2026-10-28-4p2d-r1 image",
+    "baseline_git_source_commit": "494f8de422f85579d006b15581a53b425b478c64",
+    "baseline_git_source_sha256": "8752ac5afe3e9e0648bd64aa0bf6ff9b3428a39e0c477b5a80f420d6a55aae8e",
+    "frozen_baseline_equals_git": true,
+    "unrelated_frozen_source_drift_preserved": true
+  }
 }

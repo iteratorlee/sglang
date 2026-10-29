@@ -11,11 +11,60 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import os
 
 import torch
 
 from sglang.srt.mem_cache.pool_host.base import HostKVCache
 from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
+
+logger = logging.getLogger(__name__)
+_npu_host_cache_trimmed = False
+
+
+def _trim_npu_host_cache_before_hicache(device) -> bool:
+    """Release unused weight-loading staging blocks once, before eager P L2.
+
+    TorchNPU caches pinned CPU allocations separately from device allocations.
+    Synchronizing before clearing that cache preserves live tensors and pending
+    copies. This is a startup operation, never a per-request operation.
+    """
+    global _npu_host_cache_trimmed
+    if (
+        _npu_host_cache_trimmed
+        or os.environ.get("SGLANG_GLM53_HICACHE_TRIM_HOST_CACHE") != "1"
+        or str(device).split(":", 1)[0] != "npu"
+    ):
+        return False
+
+    from sglang.srt.server_args import get_server_args
+
+    args = get_server_args()
+    if args.disaggregation_mode != "prefill" or not args.disable_cuda_graph:
+        return False
+
+    import gc
+
+    import torch_npu
+
+    torch_npu.npu.synchronize()
+    gc.collect()
+    before = dict(torch_npu.npu.host_memory_stats())
+    torch_npu.npu.host_empty_cache()
+    after = dict(torch_npu.npu.host_memory_stats())
+    _npu_host_cache_trimmed = True
+    logger.info(
+        "GLM53 startup pinned-host cache trim: allocated_bytes=%s -> %s, "
+        "active_bytes=%s -> %s, released_bytes=%s",
+        before.get("allocated_bytes.current"),
+        after.get("allocated_bytes.current"),
+        before.get("active_bytes.current"),
+        after.get("active_bytes.current"),
+        before.get("allocated_bytes.current", 0)
+        - after.get("allocated_bytes.current", 0),
+    )
+    return True
 
 
 def is_glm53_kpool(pool) -> bool:
@@ -123,6 +172,8 @@ class GLM53MLAPoolHost(HostKVCache):
         return f"glm53_c8_v1_{digest[:32]}"
 
     def init_kv_buffer(self):
+        if self.pin_memory and self.dsa_kv_cache_store_int8:
+            _trim_npu_host_cache_before_hicache(self.device_pool.device)
         alloc = ALLOC_MEMORY_FUNCS[self.device_pool.device]
         subpages = self.page_size // self.physical_page_size
         for pool in self.device_pools:
