@@ -1293,7 +1293,10 @@ class Req(ReqDllmMixin):
         # retracted request is rebootstrapped. Set in pause_generation(retract)
         # and consumed in the decode transfer commit; never plumbed to prefill.
         self.pd_rebootstrap_forced_output_id: Optional[int] = None
-        self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
+        self.skip_radix_cache_insert = (
+            bootstrap_host == FAKE_BOOTSTRAP_HOST
+            and os.environ.get("SGLANG_FAKE_BOOTSTRAP_ENABLE_RADIX_CACHE", "0") != "1"
+        )
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
