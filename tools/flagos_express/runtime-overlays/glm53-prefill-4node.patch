@@ -509,10 +509,10 @@ diff --git a/python/sglang/srt/mem_cache/pool_host/glm53.py b/python/sglang/srt/
 +    ):
 +        return False
 +
-+    from sglang.srt.server_args import get_server_args
++    from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
++    from sglang.srt.runtime_context import get_disagg
 +
-+    args = get_server_args()
-+    if args.disaggregation_mode != "prefill" or not args.disable_cuda_graph:
++    if get_disagg().disaggregation_mode != "prefill" or not cuda_graph_fully_disabled():
 +        return False
 +
 +    import gc
