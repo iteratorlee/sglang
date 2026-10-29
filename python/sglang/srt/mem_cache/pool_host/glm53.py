@@ -84,6 +84,20 @@ def is_glm53_kpool(pool) -> bool:
     )
 
 
+def _packed_host_allocation_enabled(device, pin_memory, quantized) -> bool:
+    if (
+        os.environ.get("SGLANG_GLM53_HICACHE_PACKED_HOST_ALLOC") != "1"
+        or str(device).split(":", 1)[0] != "npu"
+        or not pin_memory
+        or not quantized
+    ):
+        return False
+    from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
+    from sglang.srt.runtime_context import get_disagg
+
+    return get_disagg().disaggregation_mode == "prefill" and cuda_graph_fully_disabled()
+
+
 class GLM53MLAPoolHost(HostKVCache):
     """Cache target and packed MTP pools, including their index-key buffers.
 
@@ -133,6 +147,7 @@ class GLM53MLAPoolHost(HostKVCache):
         self.physical_page_size = 64
         self._components = []
         self._pool_buffers = {}
+        self._packed_host_arena = None
         super().__init__(
             device_pool,
             host_to_device_ratio,
@@ -168,7 +183,9 @@ class GLM53MLAPoolHost(HostKVCache):
                 list(getattr(p, "indexer_layer_ids", ())) for p in self.device_pools
             ],
         }
-        digest = hashlib.sha256(json.dumps(descriptor, sort_keys=True).encode()).hexdigest()
+        digest = hashlib.sha256(
+            json.dumps(descriptor, sort_keys=True).encode()
+        ).hexdigest()
         return f"glm53_c8_v1_{digest[:32]}"
 
     def init_kv_buffer(self):
@@ -176,25 +193,70 @@ class GLM53MLAPoolHost(HostKVCache):
             _trim_npu_host_cache_before_hicache(self.device_pool.device)
         alloc = ALLOC_MEMORY_FUNCS[self.device_pool.device]
         subpages = self.page_size // self.physical_page_size
+        packed = _packed_host_allocation_enabled(
+            self.device_pool.device, self.pin_memory, self.dsa_kv_cache_store_int8
+        )
+        offset = 0
+        if packed:
+            # TorchNPU rounds each pinned allocation up to a power of two. Keep
+            # the existing tensor/page layouts, but give their storage one owner
+            # so target/draft K and index buffers share that rounding overhead.
+            total_bytes = (
+                self.page_num
+                * subpages
+                * 64
+                * sum(
+                    component.shape[0] * component.shape[-1] * component.element_size()
+                    for pool in self.device_pools
+                    for component in (pool.k_buffer, pool.index_k_buffer)
+                )
+            )
+            logger.info(
+                "GLM53 allocating packed pinned KV arena: payload_bytes=%d", total_bytes
+            )
+            self._packed_host_arena = alloc(
+                (total_bytes,),
+                dtype=torch.uint8,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+            )
         for pool in self.device_pools:
             buffers = []
             for component in (pool.k_buffer, pool.index_k_buffer):
                 # Physical transfer view: [host physical page, layer, 64, 1, width].
                 # Storage view: [logical page, subpage, layer, 64, 1, width].
-                host = alloc(
-                    (
-                        self.page_num,
-                        subpages,
-                        component.shape[0],
-                        64,
-                        1,
-                        component.shape[-1],
-                    ),
-                    dtype=component.dtype,
-                    device=self.device,
-                    pin_memory=self.pin_memory,
-                    allocator=self.allocator,
+                shape = (
+                    self.page_num,
+                    subpages,
+                    component.shape[0],
+                    64,
+                    1,
+                    component.shape[-1],
                 )
+                if packed:
+                    size_bytes = (
+                        self.page_num
+                        * subpages
+                        * component.shape[0]
+                        * 64
+                        * component.shape[-1]
+                        * component.element_size()
+                    )
+                    host = (
+                        self._packed_host_arena.narrow(0, offset, size_bytes)
+                        .view(component.dtype)
+                        .view(shape)
+                    )
+                    offset += size_bytes
+                else:
+                    host = alloc(
+                        shape,
+                        dtype=component.dtype,
+                        device=self.device,
+                        pin_memory=self.pin_memory,
+                        allocator=self.allocator,
+                    )
                 self._components.append(host)
                 buffers.append(host.flatten(0, 1))
             self._pool_buffers[id(pool)] = tuple(buffers)
@@ -303,3 +365,4 @@ class GLM53MLAPoolHost(HostKVCache):
         super().destroy()
         self._pool_buffers.clear()
         self._components.clear()
+        self._packed_host_arena = None

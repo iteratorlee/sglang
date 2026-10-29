@@ -2,10 +2,10 @@
   "base_image": "harbor.baai.ac.cn/flagos-inner-models-release/glm-5.3-flash-w8a8-mtp-flagos-express:2026-10-28",
   "base_image_id": "sha256:7de5a8779d489607082c16554f6c73969c800495003c38753f3ac77fa37a0686",
   "base_prefill_manifest_sha256": "6714a5319c9854a088e9f390b1e520b9e3ffeb7ec1cbbb9f29c5807da6f8b74a",
-  "candidate_prefill_manifest_sha256": "41557f0e3d0c72006a9dd6dc9afa4b84ec731c84be5a5589c45d4c803fa7bc76",
+  "candidate_prefill_manifest_sha256": "0736318a2131abcfeaab735ad8fffb2327c658a86115bc6f7209be2b88c1d084",
   "role": "prefill",
   "required_opt_in": "SGLANG_GLM53_4NODE_PD=1",
-  "scope": "One logical P across four eight-device hosts; globalTP32/EP32,attentionDP4TP8. Optional one-time startup host-cache cleanup for eager NPU GLM53 C8 prefill. No decode changes. Runtime patch preserves the frozen role source variants.",
+  "scope": "One logical P across four eight-device hosts; globalTP32/EP32,attentionDP4TP8. Optional packed pinned KV arena for eager NPU GLM53 C8 prefill; the separate host-cache trim remains optional diagnostic support and is not credited as the active optimization. No decode changes. Frozen role source variants are preserved.",
   "files": [
     {
       "repo_path": "python/sglang/srt/hardware_backend/npu/attention/glm53/pd_state.py",
@@ -59,21 +59,51 @@
       "repo_path": "python/sglang/srt/mem_cache/pool_host/glm53.py",
       "target": "/sgl-workspace/roles/prefill/python/sglang/srt/mem_cache/pool_host/glm53.py",
       "baseline_sha256": "8752ac5afe3e9e0648bd64aa0bf6ff9b3428a39e0c477b5a80f420d6a55aae8e",
-      "candidate_sha256": "98509965d7751ef41faa77098574ce2503f8dc4c75586f2f99da028083865500"
+      "candidate_sha256": "79d4345b6033c873a927087b832d871eaa9991254f840ac05e77f64581c99445"
     }
   ],
   "candidate_runtime_manifests": {
-    "prefill": "e314e311500decad2230b10bde99f78f52a0431f6f290df5f4e62b8b007f8d4c",
+    "prefill": "10fb647900a23e782be6602acb7a0f954c46b03793998573d4831136fe7c8f13",
     "decode": "70bfd960f839ed9feb759d207b7710da7c4031b068654519770ed427286bc027"
   },
   "python_files": {
     "prefill": 3856,
     "decode": 3855
   },
+  "packed_host_allocation": {
+    "opt_in": "SGLANG_GLM53_HICACHE_PACKED_HOST_ALLOC=1",
+    "default_enabled": false,
+    "repo_path": "python/sglang/srt/mem_cache/pool_host/glm53.py",
+    "guards": [
+      "NPU",
+      "prefill",
+      "all CUDA graph phases disabled",
+      "pin_memory",
+      "C8"
+    ],
+    "allocation": "One pinned uint8 arena with typed views for the existing target/draft K and index components",
+    "component_allocations_before": 4,
+    "component_allocations_after": 1,
+    "preserved_contracts": [
+      "shape",
+      "stride",
+      "page_bytes",
+      "storage_namespace",
+      "MTP component views"
+    ],
+    "mamba_allocation_unchanged": true,
+    "diagnostic_configuration": {
+      "SGLANG_GLM53_HICACHE_PACKED_HOST_ALLOC": "1",
+      "SGLANG_GLM53_HICACHE_TRIM_HOST_CACHE": "0"
+    },
+    "validation_scope": "Storage-level byte equivalence is separate from full-model startup and accuracy validation"
+  },
   "startup_host_cache_trim": {
     "opt_in": "SGLANG_GLM53_HICACHE_TRIM_HOST_CACHE=1",
     "default_enabled": false,
     "repo_path": "python/sglang/srt/mem_cache/pool_host/glm53.py",
+    "status": "Optional diagnostic support; not the active optimization",
+    "observed_effect": "Prior full-model diagnostic released zero cached pinned bytes and host allocation failure persisted",
     "phase": "Before eager NPU GLM53 C8 prefill host-cache allocation; once per process",
     "baseline_source": "Public 2026-10-28 base image; identical file in immutable 2026-10-28-4p2d-r1 image",
     "baseline_git_source_commit": "494f8de422f85579d006b15581a53b425b478c64",
