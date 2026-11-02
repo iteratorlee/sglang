@@ -13,6 +13,8 @@ import os
 from pathlib import Path
 import sys
 import unittest
+from types import ModuleType
+from unittest import mock
 
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
@@ -25,6 +27,7 @@ HELPER = (
     Path(__file__).resolve().parents[3]
     / "python/sglang/srt/hardware_backend/npu/moe/glm53_packed_gather.py"
 )
+HELPER = Path(os.environ.get("SGLANG_GLM53_PACKED_HELPER_SOURCE", HELPER))
 
 
 def raw_bytes(tensor):
@@ -68,7 +71,7 @@ class PackedGatherCpuTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         name = "_glm53_packed_gather_cpu_test_helper"
-        spec = importlib.util.spec_from_file_location(name, HELPER)
+        spec = importlib.util.spec_from_file_location(name, HELPER, submodule_search_locations=[])
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module  # dataclass resolves its defining module here.
         spec.loader.exec_module(module)
@@ -102,6 +105,7 @@ class PackedGatherCpuTests(unittest.TestCase):
                 self.assertEqual(layout.nbytes, layout.words * 4)
                 self.assertEqual(layout.nbytes % 128, 0)
                 self.assertLessEqual(17 * layout.nbytes, 35 * 1024**2)
+                self.assertLessEqual(33 * layout.nbytes, 68 * 1024**2)
                 if rows:
                     self.assertLess(capacity, 2 * rows)
                     self.assertLessEqual(layout.nbytes, 2 * rows * 4 * sum(factors))
@@ -150,6 +154,73 @@ class PackedGatherCpuTests(unittest.TestCase):
         self.assertFalse(torch.equal(restored[1], tensors[1]))  # NaN != NaN.
         self.assert_bits_equal(restored[1], tensors[1])
 
+    def test_ep32_packet_parity_including_last_rank_and_expert_boundaries(self):
+        for rows in (1, 3, 17, 31, 32, 33, 257, 511, 512):
+            for dtype in (torch.int64, torch.int32):
+                with self.subTest(rows=rows, ids=dtype):
+                    peers = [payload(rows, rank, dtype, strided=True) for rank in range(32)]
+                    # Packing is independent of expert ownership; retain IDs at
+                    # both sides of the EP32 nine-expert boundaries verbatim.
+                    peers[-1][2][0] = torch.tensor(
+                        [0, 8, 9, 17, 18, 278, 279, 287], dtype=dtype
+                    )
+                    gathered = torch.cat([self.helper.pack_reference(*p) for p in peers])
+                    outputs = self.helper.unpack_reference(gathered, rows, dtype, world=32)
+                    for field, actual in enumerate(outputs):
+                        self.assert_bits_equal(actual, torch.cat([p[field] for p in peers]))
+                        self.assertTrue(actual.is_contiguous())
+                        self.assertEqual(actual.shape[0], 32 * rows)
+
+    def test_production_wrapper_one_collective_and_world_sized_outputs(self):
+        # Run the actual allocation/collective wrapper on CPU. Only NPU format
+        # validation, transport and Triton launches are replaced by CPU oracles.
+        helper = self.helper
+        validate = helper.validate_payload
+        kernels = ModuleType(helper.__name__ + ".glm53_packed_gather_triton")
+
+        def cpu_validate(*args, **kwargs):
+            kwargs.pop("npu", None)
+            return validate(*args, **kwargs)
+
+        def pack(q, scale, ids, weights, send, layout):
+            send.copy_(helper.pack_reference(q, scale, ids, weights))
+
+        def unpack(gathered, outputs, layout, world):
+            for actual, expected in zip(outputs, helper.unpack_reference(
+                gathered, layout.rows, outputs[2].dtype, world=world
+            )):
+                actual.copy_(expected)
+
+        kernels.pack, kernels.unpack = mock.Mock(side_effect=pack), mock.Mock(side_effect=unpack)
+        with mock.patch.dict(sys.modules, {kernels.__name__: kernels}), \
+             mock.patch.object(helper, "validate_payload", side_effect=cpu_validate):
+            for world in (16, 32):
+                for dtype in (torch.int64, torch.int32):
+                    peers = [payload(17, rank, dtype, strided=True) for rank in range(world)]
+                    group = object()
+
+                    def gather(out, send, *, group):
+                        self.assert_bits_equal(send, helper.pack_reference(*peers[0]))
+                        out.copy_(torch.cat([helper.pack_reference(*p) for p in peers]))
+
+                    before = helper.get_packed_gather_stats()["packed_gather_calls"]
+                    with mock.patch.object(helper.dist, "get_world_size", return_value=world), \
+                         mock.patch.object(helper.dist, "all_gather_into_tensor", side_effect=gather) as collective:
+                        outputs = helper.packed_all_gather(group, *peers[0], expected_rows=17)
+                    self.assertEqual(collective.call_count, 1)
+                    self.assertIs(collective.call_args.kwargs["group"], group)
+                    self.assertEqual(kernels.unpack.call_args.args[-1], world)
+                    self.assertEqual(helper.get_packed_gather_stats()["packed_gather_calls"], before + 1)
+                    for field, actual in enumerate(outputs):
+                        self.assert_bits_equal(actual, torch.cat([p[field] for p in peers]))
+
+            for world, rows in ((1, 1), (8, 1), (24, 1), (64, 1), (32, 0)):
+                with mock.patch.object(helper.dist, "get_world_size", return_value=world), \
+                     mock.patch.object(helper.dist, "all_gather_into_tensor") as collective:
+                    with self.assertRaises(ValueError):
+                        helper.packed_all_gather(object(), *payload(rows, 0, torch.int64), expected_rows=rows)
+                    collective.assert_not_called()
+
     def test_global_metadata_gate_includes_idle_peers_uniformly(self):
         for tokens in (0, 1, 7, 8, 9, 180, 4095, 4096, 4097, 8192):
             padded = ((tokens + 7) // 8 * 8,) * 2
@@ -160,8 +231,26 @@ class PackedGatherCpuTests(unittest.TestCase):
         for metadata in (None, ((0, 0), (8, 8)), ((1, 0), (7, 7)),
                          ((1, 0), (4104, 4104))):
             self.assertFalse(self.helper.target_metadata_eligible(16, metadata))
-        for world in (1, 8, 32):
+        for world in (1, 8, 24, 64):
             self.assertFalse(self.helper.target_metadata_eligible(world, ((8, 0), (8, 8))))
+
+    def test_ep32_all_idle_masks_and_bounded_global_metadata(self):
+        for tokens in (0, 1, 7, 8, 9, 128, 256, 4095, 4096, 4097, 16384):
+            padded = ((tokens + 7) // 8 * 8,) * 4
+            for mask in range(16):
+                original = tuple(tokens if mask & (1 << dp) else 0 for dp in range(4))
+                decisions = [self.helper.target_metadata_eligible(32, (original, padded)) for _ in range(32)]
+                self.assertEqual(decisions, [bool(mask) and 0 < tokens <= 4096] * 32)
+        self.assertTrue(self.helper.target_metadata_eligible(32, ((1, 128, 0, 255), (256,) * 4)))
+        for metadata in (None, ((0,) * 4, (8,) * 4), ((1, 0, 0, 0), (7,) * 4),
+                         ((1, 0, 0, 0), (4104,) * 4)):
+            self.assertFalse(self.helper.target_metadata_eligible(32, metadata))
+        for metadata in (((1, 0), (8, 8)), ((1, 0, 0, 0), (8, 8)),
+                         ((True, 0, 0, 0), (8,) * 4), ((-1, 0, 0, 0), (8,) * 4),
+                         ((1.0, 0, 0, 0), (8,) * 4), ((9, 0, 0, 0), (8,) * 4),
+                         ((1, 0, 0, 0), (8, 8, 16, 8)), ((1, 0, 0, 0), (8, 8, 8, 16))):
+            with self.subTest(metadata=metadata), self.assertRaises(ValueError):
+                self.helper.target_metadata_eligible(32, metadata)
 
     def test_malformed_shared_metadata_is_an_error(self):
         for metadata in (((1,), (8, 8)), ((1, 0), (8,)), ((True, 0), (8, 8)),

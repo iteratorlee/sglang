@@ -20,7 +20,8 @@ CPU routing; it is mutually exclusive with NORMAL_DEVICE_ROUTING=1.
 NORMAL_DEVICE_ROUTING=ordered explicitly enables device routing with the
 same ordered combine and a device inverse map in that two-node P scope.
 NORMAL_PACKED_GATHER=1 packs the four payloads into one raw INT32 gather for
-positive target EXTEND with original/padded DP counts <=4096 (local rows<=512).
+positive target EXTEND in DP2/TP8/EP16 or DP4/TP8/EP32, with original/padded
+DP counts <=4096 (local rows<=512). Other geometries retain four gathers.
 This artifact uses power-of-two packet capacities and runtime actual rows.
 It is read at module import; set identically on all EP ranks before startup.
 Use identical collective flags on every EP rank. All experiments default off.

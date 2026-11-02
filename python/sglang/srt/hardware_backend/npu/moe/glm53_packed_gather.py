@@ -11,7 +11,8 @@ import torch.distributed as dist
 
 WIDTH = 4096
 TOPK = 8
-WORLD = 16
+WORLD = 16  # Preserve the CPU oracle's historical default.
+SUPPORTED_WORLDS = (16, 32)  # Finite DP2/DP4, attention TP8, MoE TP1 profiles.
 MAX_ROWS = 512
 CAPACITIES = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
 ALIGN_WORDS = 32  # Each field and each source-rank record starts at 128 bytes.
@@ -33,16 +34,19 @@ def target_metadata_eligible(world, metadata):
     Caller supplies metadata only from a target layer's checked idle-DP scope.
     Never pass a rank's own token count. Flags/config must match all EP ranks.
     """
-    if world != WORLD or metadata is None:
+    if world not in SUPPORTED_WORLDS or metadata is None:
         return False
+    if not isinstance(metadata, (tuple, list)) or len(metadata) != 2:
+        raise ValueError("packed gather needs original and padded CPU counts")
     original, padded = metadata
+    dp_size = world // 8
     if any(
-        not isinstance(v, (tuple, list)) or len(v) != 2
+        not isinstance(v, (tuple, list)) or len(v) != dp_size
         or any(type(n) is not int or n < 0 for n in v)
         for v in (original, padded)
     ):
-        raise ValueError("packed gather needs two nonnegative global CPU counts")
-    if padded[0] != padded[1] or any(a > b for a, b in zip(original, padded)):
+        raise ValueError(f"packed gather needs {dp_size} nonnegative global CPU counts")
+    if any(n != padded[0] for n in padded) or any(a > b for a, b in zip(original, padded)):
         raise ValueError("packed gather needs matching MAX_LEN global padding")
     return 0 < max(original) <= 4096 and 0 < padded[0] <= 4096 and padded[0] % 8 == 0
 
@@ -144,27 +148,31 @@ def unpack_reference(gathered, rows, ids_dtype, world=WORLD):
 def packed_all_gather(group, q, scale, ids, weights, *, expected_rows):
     """One pack launch, one INT32 HCCL gather, one unpack launch; no fallback.
 
-    Requires rank-uniform admission and the existing shape audit in the caller.
+    Requires rank-uniform DP2/TP8/EP16 or DP4/TP8/EP32 admission and the
+    existing shape audit in the caller. The 512-local-row bound is unchanged:
+    EP32 gathers at most 16384 rows, below ordered combine's 131070-row bound.
+    Packing does not interpret expert IDs (18/9 local experts respectively).
     IDs use two raw words for INT64, one for INT32; there is no narrowing.
     """
     global _executions
     layout = validate_payload(q, scale, ids, weights, expected_rows=expected_rows, npu=True)
     # expected_rows comes from the shared CPU DP metadata in the caller. A
     # local mismatch raises above, never selects another packet size/gather.
-    if not layout.rows or dist.get_world_size(group) != WORLD:
-        raise ValueError("packed gather requires positive rows and EP16 admission")
+    world = dist.get_world_size(group)
+    if not layout.rows or world not in SUPPORTED_WORLDS:
+        raise ValueError("packed gather requires positive rows and EP16/EP32 admission")
     from .glm53_packed_gather_triton import pack, unpack
 
     send = torch.empty(layout.words, dtype=torch.int32, device=q.device)
-    gathered = torch.empty(WORLD * layout.words, dtype=torch.int32, device=q.device)
+    gathered = torch.empty(world * layout.words, dtype=torch.int32, device=q.device)
     pack(q, scale, ids, weights, send, layout)
     dist.all_gather_into_tensor(gathered, send, group=group)
     result = (
-        torch.empty((WORLD * layout.rows, WIDTH), dtype=torch.int8, device=q.device),
-        torch.empty((WORLD * layout.rows,), dtype=torch.float32, device=q.device),
-        torch.empty((WORLD * layout.rows, TOPK), dtype=ids.dtype, device=q.device),
-        torch.empty((WORLD * layout.rows, TOPK), dtype=torch.float32, device=q.device),
+        torch.empty((world * layout.rows, WIDTH), dtype=torch.int8, device=q.device),
+        torch.empty((world * layout.rows,), dtype=torch.float32, device=q.device),
+        torch.empty((world * layout.rows, TOPK), dtype=ids.dtype, device=q.device),
+        torch.empty((world * layout.rows, TOPK), dtype=torch.float32, device=q.device),
     )
-    unpack(gathered, result, layout, WORLD)
+    unpack(gathered, result, layout, world)
     _executions += 1
     return result
