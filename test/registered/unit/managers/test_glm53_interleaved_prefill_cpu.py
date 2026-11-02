@@ -1779,6 +1779,39 @@ def physical(free=4, evictable=0):
 
 
 class CandidateTests(unittest.TestCase):
+    def test_configurable_hbm_tail_preserves_owner_and_real_state_lifecycle(self):
+        for suffix in (2048, 4096):
+            with self.subTest(suffix=suffix):
+                h,c,prepare,sources,evictions=physical(4,0)
+                owner=h.scheduler.chunked_req
+                req=h.scheduler.waiting_queue[0]
+                req.full_untruncated_fill_ids=range(req.hit+suffix)
+                req.origin_input_ids=req.full_untruncated_fill_ids
+                before=(owner.extend_range,owner.kv.mamba_pool_idx,
+                        owner.kv.mamba_ping_pong_track_buffer[:],owner.last_node.refs)
+                donations,sends,checks=connect_output(h,c)
+                with patch.dict(os.environ,{'SGLANG_GLM53_INTERLEAVED_PREFILL_MAX_TOKENS':'4096'}), patch.object(Batch,'prepare_for_extend',prepare):
+                    batch=h.step()
+                    self.assertEqual(batch.reqs,[req])
+                    self.assertEqual(req.extend_range.length,suffix)
+                    self.assertIsNone(batch.chunked_req)
+                    self.assertEqual(before,(owner.extend_range,owner.kv.mamba_pool_idx,
+                        owner.kv.mamba_ping_pong_track_buffer[:],owner.last_node.refs))
+                    process_output(h,batch)
+                    self.assertEqual([x[0] for x in donations],[req.rid])
+                    resumed=h.step()
+                    self.assertEqual(resumed.reqs,[owner])
+                    self.assertEqual(owner.extend_range.length,16384)
+
+    def test_default_rejects_larger_tail_and_override_keeps_budget_gates(self):
+        h=Harness();owner=h.cold();req=h.hot(extend=2048)
+        self.assertEqual(h.step().reqs,[owner])
+        for chunk,hard in [(1024,32768),(16384,1024)]:
+            h=Harness(chunk=chunk,hard=hard);owner=h.cold();req=h.hot(extend=2048)
+            with patch.dict(os.environ,{'SGLANG_GLM53_INTERLEAVED_PREFILL_MAX_TOKENS':'4096'}):
+                self.assertEqual(h.step().reqs,[owner])
+                self.assertIn(req,h.scheduler.waiting_queue)
+
     def test_real_allocation_output_donation_and_forced_owner(self):
         for free, evictable in [(4, 0), (0, 4), (1, 3)]:
             with self.subTest(free=free, evictable=evictable):
@@ -1996,12 +2029,15 @@ class CandidateTests(unittest.TestCase):
             s.startup_available_gpu_memory_gb=0
             s.max_total_num_tokens=100000;s.swa_tokens_per_layer=0;s.startup_time=0
             s.spec_algorithm=NS(is_none=lambda:True,is_dspark=lambda:False)
+            # This fixture exercises hot-lane counters, not the independent
+            # distributed static-route control protocol added to the accessor.
+            s._glm53_static_route_control_readback=lambda: {'supported_topology':False}
             h.ns['DisaggregationMode']=NS(PREFILL='prefill',DECODE='decode')
             return s.get_internal_state(None).internal_state['glm53_prefill_hot_lane']
         for dp in (0,1):
             h=Harness();owner=h.cold();h.hot(extend=129)
             h.scheduler.ps.attn_dp_rank=dp
-            zero=dict(mode='standalone',dp_rank=dp,attn_tp_rank=0,
+            zero=dict(mode='standalone',max_tokens=512,dp_rank=dp,attn_tp_rank=0,
                 eligible_batches=0,admitted_batches=0,admitted_requests=0,admitted_paged_tokens=0)
             self.assertEqual(read(h),zero)
             original=Batch.prepare_for_extend

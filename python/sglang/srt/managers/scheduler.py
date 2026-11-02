@@ -3819,6 +3819,18 @@ class Scheduler(
             + self.page_size
             + min(owner.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
         )
+        # This is a latency policy, not a cache or state-allocation limit. Keep
+        # the established default while allowing a whole short HBM continuation
+        # to finish between cold chunks. Normal admission below still reserves
+        # the owner's next chunk and all four recoverable Mamba states.
+        hot_limit = int(os.environ.get(
+            "SGLANG_GLM53_INTERLEAVED_PREFILL_MAX_TOKENS", "512"
+        ))
+        if not 0 < hot_limit <= 4096 or hot_limit % self.page_size:
+            raise ValueError(
+                "GLM interleaved prefill limit must be a page-aligned integer "
+                "in (0, 4096]"
+            )
         for req in self.waiting_queue[:32]:
             if (
                 req.finished() or req.kv.holds_kv or req.kv.holds_mamba
@@ -3838,7 +3850,7 @@ class Scheduler(
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             suffix = len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
             if (
-                len(req.prefix_indices) == 0 or not 0 < suffix <= 512
+                len(req.prefix_indices) == 0 or not 0 < suffix <= hot_limit
                 or req.needs_host_load_back()
                 or req.mamba_branching_seqlen is not None
                 or adder.ceil_paged_tokens(suffix)
@@ -5344,6 +5356,9 @@ class Scheduler(
             counts = getattr(self, "_glm53_hot_lane_counts", [0, 0, 0, 0])
             ret["glm53_prefill_hot_lane"] = {
                 "mode": "standalone",
+                "max_tokens": int(os.environ.get(
+                    "SGLANG_GLM53_INTERLEAVED_PREFILL_MAX_TOKENS", "512"
+                )),
                 "dp_rank": self.ps.attn_dp_rank,
                 "attn_tp_rank": self.ps.attn_tp_rank,
                 "eligible_batches": counts[0],
