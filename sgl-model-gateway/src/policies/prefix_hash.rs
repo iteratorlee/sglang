@@ -345,12 +345,25 @@ impl PrefixHashPolicy {
                 .saturating_add(mamba_pressure)
         });
 
-        // For SSE, the gateway's P WorkerLoadGuard survives until D finishes
-        // streaming, even though P is done. A fresh P snapshot represents its
-        // actual lifecycle; stale/missing snapshots still fall back to local.
-        // A P-stage lease ends when P's response has been consumed. Its
-        // lifecycle must not depend on opting into reclaimable-cache capacity:
-        // the generic WorkerLoadGuard can outlive P through all of D's stream.
+        if matches!(worker.worker_type(), WorkerType::Decode) {
+            // A D lease/load guard already spans prealloc, transfer, waiting
+            // and running. These are alternative views of the same requests,
+            // not additional work to add to the local count. In particular,
+            // waiting on a slow P must not count one D request twice and evict
+            // an otherwise eligible prefix owner.
+            let queued = snapshot.queues.as_ref().map_or(
+                // The legacy aggregate already includes all D stage queues.
+                snapshot.num_waiting_reqs,
+                |queues| queues.waiting.saturating_add(stage_pressure),
+            );
+            return local
+                .max(snapshot.num_running_reqs.saturating_add(queued))
+                .saturating_add(capacity_pressure);
+        }
+
+        // A P-stage lease ends when P's response has been consumed. HTTP PD's
+        // PrefillStage owns the load guard for this same lifetime, including
+        // when feedback is stale/missing. Neither represents all of D's stream.
         let active = if cache_aware_prefill || stage_aware_prefill {
             Self::local_reservations(worker, info)
         } else {
@@ -1275,6 +1288,166 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_stage_load_counts_each_lifecycle_once() {
+        use crate::core::worker_manager::{DisaggregationLoadSnapshot, QueueLoadSnapshot};
+
+        let policy = long_prefix_policy();
+        let worker = BasicWorkerBuilder::new("http://d:8000")
+            .worker_type(WorkerType::Decode)
+            .build();
+        let reservations = PlacementMap::from([(worker.url().to_owned(), 3)]);
+        for stage in ["running", "waiting", "prealloc", "transfer", "retracted"] {
+            let mut snapshot = DPLoadSnapshot {
+                age_at_observation: Some(Duration::ZERO),
+                queues: Some(QueueLoadSnapshot::default()),
+                disaggregation: Some(DisaggregationLoadSnapshot::default()),
+                ..Default::default()
+            };
+            match stage {
+                "running" => snapshot.num_running_reqs = 3,
+                "waiting" => snapshot.queues.as_mut().unwrap().waiting = 3,
+                "prealloc" => {
+                    snapshot
+                        .disaggregation
+                        .as_mut()
+                        .unwrap()
+                        .decode_prealloc_queue_reqs = 3;
+                    // prealloc_ready is a subset, not another request queue.
+                    snapshot.queues.as_mut().unwrap().prealloc_ready = 2;
+                }
+                "transfer" => {
+                    snapshot
+                        .disaggregation
+                        .as_mut()
+                        .unwrap()
+                        .decode_transfer_queue_reqs = 3
+                }
+                "retracted" => {
+                    snapshot
+                        .disaggregation
+                        .as_mut()
+                        .unwrap()
+                        .decode_retracted_queue_reqs = 3
+                }
+                _ => unreachable!(),
+            }
+            snapshot.num_waiting_reqs = if stage == "running" { 0 } else { 3 };
+            // SRT's aggregate num_waiting_reqs already includes PD queues.
+            for with_queue_breakdown in [true, false] {
+                let mut current = snapshot.clone();
+                if !with_queue_breakdown {
+                    current.queues = None;
+                }
+                let mut snapshots = PlacementMap::from([(worker.url().to_owned(), current)]);
+                let info = SelectWorkerInfo {
+                    local_reservations: Some(&reservations),
+                    load_snapshots: Some(&snapshots),
+                    ..Default::default()
+                };
+                assert_eq!(policy.effective_load(&worker, &info), 3, "{stage}");
+                // External requests remain visible even with fewer local leases.
+                let empty = PlacementMap::new();
+                assert_eq!(
+                    policy.effective_load(
+                        &worker,
+                        &SelectWorkerInfo {
+                            local_reservations: Some(&empty),
+                            ..info
+                        }
+                    ),
+                    3,
+                    "{stage}"
+                );
+                snapshots.get_mut(worker.url()).unwrap().age_at_observation =
+                    Some(Duration::from_secs(4));
+                assert_eq!(
+                    policy.effective_load(
+                        &worker,
+                        &SelectWorkerInfo {
+                            local_reservations: Some(&reservations),
+                            load_snapshots: Some(&snapshots),
+                            ..Default::default()
+                        }
+                    ),
+                    3,
+                    "stale {stage}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_decode_transfer_wait_preserves_affinity_but_not_capacity_or_cap_bypass() {
+        use crate::core::worker_manager::{
+            DisaggregationLoadSnapshot, KVCapacitySnapshot, QueueLoadSnapshot,
+        };
+
+        let policy = long_prefix_policy();
+        let workers = pd_workers(WorkerType::Decode, 8);
+        let tokens = vec![7; 8192];
+        let base = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            estimated_tokens: tokens.len() + 2048,
+            hash_ring: Some(Arc::new(HashRing::new(&workers))),
+            soft_cap: Some(14),
+            ..Default::default()
+        };
+        let owner = policy.select_worker_impl(&workers, &base).0.unwrap();
+        let reservations = PlacementMap::from([(workers[owner].url().to_owned(), 1)]);
+        let mut snapshots = PlacementMap::from([(
+            workers[owner].url().to_owned(),
+            DPLoadSnapshot {
+                age_at_observation: Some(Duration::ZERO),
+                num_waiting_reqs: 1,
+                queues: Some(QueueLoadSnapshot::default()),
+                disaggregation: Some(DisaggregationLoadSnapshot {
+                    decode_transfer_queue_reqs: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )]);
+        let info = SelectWorkerInfo {
+            local_reservations: Some(&reservations),
+            load_snapshots: Some(&snapshots),
+            ..base.clone()
+        };
+        assert_eq!(
+            policy.select_worker_impl(&workers, &info),
+            (Some(owner), Branch::ObservedPlacement)
+        );
+
+        snapshots.get_mut(workers[owner].url()).unwrap().kv_capacity = Some(KVCapacitySnapshot {
+            full_available_tokens: 0,
+            full_evictable_tokens: 1_000_000, // D must not treat eviction as admission capacity.
+            ..Default::default()
+        });
+        let pressured = SelectWorkerInfo {
+            local_reservations: Some(&reservations),
+            load_snapshots: Some(&snapshots),
+            ..base.clone()
+        };
+        assert_ne!(
+            policy.select_worker_impl(&workers, &pressured).0,
+            Some(owner)
+        );
+        // The atomic reservation cap still filters candidates regardless of affinity.
+        let capped: PlacementMap<_, _> = workers.iter().map(|w| (w.url().to_owned(), 14)).collect();
+        assert_eq!(
+            policy
+                .select_worker_impl(
+                    &workers,
+                    &SelectWorkerInfo {
+                        local_reservations: Some(&capped),
+                        ..base
+                    }
+                )
+                .0,
+            None
+        );
+    }
+
+    #[test]
     fn test_prefill_stage_reservation_covers_stale_observation_without_double_counting() {
         use crate::core::worker_manager::DisaggregationLoadSnapshot;
 
@@ -1463,6 +1636,165 @@ mod tests {
         policy.pd_prefill_cache_capacity = true;
         policy.pd_prefill_stage_reservation = true;
         assert_eq!(policy.effective_load(&worker, &info), 3);
+    }
+
+    #[test]
+    fn test_prefill_stale_feedback_keeps_candidate_and_one_request_slack() {
+        use crate::core::worker_manager::{KVCapacitySnapshot, QueueLoadSnapshot};
+
+        let mut policy = long_prefix_policy();
+        policy.pd_prefill_cache_capacity = true;
+        policy.pd_prefill_stage_reservation = true;
+        policy.pd_prefill_affinity_slack = Some(1);
+        let workers = pd_workers(
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            4,
+        );
+        let tokens = vec![7; 8192];
+        let base = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            estimated_tokens: tokens.len() + 1,
+            hash_ring: Some(Arc::new(HashRing::new(&workers))),
+            ..Default::default()
+        };
+        let owner = policy.select_worker_impl(&workers, &base).0.unwrap();
+        let reservations = PlacementMap::from([(workers[owner].url().to_owned(), 1)]);
+        for age in [Some(Duration::ZERO), Some(Duration::from_secs(4)), None] {
+            let snapshots = PlacementMap::from([(
+                workers[owner].url().to_owned(),
+                DPLoadSnapshot {
+                    age_at_observation: age,
+                    num_running_reqs: 1,
+                    queues: Some(QueueLoadSnapshot::default()),
+                    kv_capacity: Some(KVCapacitySnapshot {
+                        full_available_tokens: 100_000,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )]);
+            let info = SelectWorkerInfo {
+                local_reservations: Some(&reservations),
+                load_snapshots: Some(&snapshots),
+                ..base.clone()
+            };
+            assert_eq!(policy.effective_load(workers[owner].as_ref(), &info), 1);
+            assert_eq!(
+                policy.select_worker_impl(&workers, &info),
+                (Some(owner), Branch::ObservedPlacement)
+            );
+        }
+        // With no slack, the DP4 default rejects load=1 even without snapshots:
+        // threshold=(1+1)/4*1.25=0.625, versus 1.25 with DP2.
+        policy.pd_prefill_affinity_slack = None;
+        assert_ne!(
+            policy
+                .select_worker_impl(
+                    &workers,
+                    &SelectWorkerInfo {
+                        local_reservations: Some(&reservations),
+                        ..base
+                    }
+                )
+                .0,
+            Some(owner)
+        );
+    }
+
+    #[test]
+    fn test_prefill_dp4_slack_one_hotspot_boundaries() {
+        let workers = pd_workers(
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            4,
+        );
+        let tokens = vec![7; 8192];
+        let base = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            hash_ring: Some(Arc::new(HashRing::new(&workers))),
+            ..Default::default()
+        };
+        // Scores are [observed owner, other P ranks], with no capacity pressure.
+        for (scores, keep_owner) in [
+            ([1, 0, 0, 0], true),
+            ([2, 0, 0, 0], false),
+            ([2, 1, 1, 1], true),
+            ([3, 1, 1, 1], false),
+            // Slack is an additional allowance, not a new hard load limit.
+            // The existing average-load rule can still accept a busier owner.
+            ([3, 3, 3, 0], true),
+        ] {
+            let mut policy = long_prefix_policy();
+            policy.pd_prefill_stage_reservation = true;
+            policy.pd_prefill_affinity_slack = Some(1);
+            let owner = policy.select_worker_impl(&workers, &base).0.unwrap();
+            let mut others = scores[1..].iter();
+            let reservations = workers
+                .iter()
+                .enumerate()
+                .map(|(index, worker)| {
+                    let count = if index == owner {
+                        scores[0]
+                    } else {
+                        *others.next().unwrap()
+                    };
+                    (worker.url().to_owned(), count)
+                })
+                .collect();
+            let selected = policy
+                .select_worker_impl(
+                    &workers,
+                    &SelectWorkerInfo {
+                        local_reservations: Some(&reservations),
+                        ..base.clone()
+                    },
+                )
+                .0;
+            assert!(selected.is_some());
+            assert_eq!(selected == Some(owner), keep_owner, "{scores:?}");
+        }
+    }
+
+    #[test]
+    fn test_stale_prefill_capacity_is_unknown_not_a_health_failure() {
+        use crate::core::worker_manager::KVCapacitySnapshot;
+
+        let mut policy = long_prefix_policy();
+        policy.pd_prefill_cache_capacity = true;
+        policy.pd_prefill_stage_reservation = true;
+        let workers = pd_workers(
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            1,
+        );
+        let tokens = vec![7; 8192];
+        let reservations = PlacementMap::from([(workers[0].url().to_owned(), 1)]);
+        for (age, expected_load) in [(Duration::ZERO, 3), (Duration::from_secs(4), 1)] {
+            let snapshots = PlacementMap::from([(
+                workers[0].url().to_owned(),
+                DPLoadSnapshot {
+                    age_at_observation: Some(age),
+                    kv_capacity: Some(KVCapacitySnapshot::default()),
+                    ..Default::default()
+                },
+            )]);
+            let info = SelectWorkerInfo {
+                tokens: Some(&tokens),
+                local_reservations: Some(&reservations),
+                load_snapshots: Some(&snapshots),
+                ..Default::default()
+            };
+            assert_eq!(
+                policy.effective_load(workers[0].as_ref(), &info),
+                expected_load
+            );
+            assert_eq!(policy.select_worker_impl(&workers, &info).0, Some(0));
+            assert!(workers[0].is_available());
+        }
     }
 
     #[test]

@@ -14,9 +14,61 @@ const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 12 * 1024 * 1024;
 const MAX_TOKENS: usize = 1024 * 1024;
 
+const TOKENIZE_TIMEOUT_ENV: &str = "SGLANG_GATEWAY_PD_CHAT_TOKENIZE_TIMEOUT_MS";
+const DEFAULT_TOKENIZE_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn parse_tokenize_timeout(raw: &str) -> Option<Duration> {
+    // Keep advisory CPU work bounded, including on a stalled tokenizer host.
+    raw.parse::<u64>()
+        .ok()
+        .filter(|ms| (1..=60_000).contains(ms))
+        .map(Duration::from_millis)
+}
+
+fn tokenize_timeout_from_env() -> Duration {
+    match std::env::var(TOKENIZE_TIMEOUT_ENV) {
+        Ok(raw) => parse_tokenize_timeout(&raw).unwrap_or_else(|| {
+            tracing::warn!(
+                env = TOKENIZE_TIMEOUT_ENV,
+                "Expected 1..=60000 milliseconds; using 2000"
+            );
+            DEFAULT_TOKENIZE_TIMEOUT
+        }),
+        Err(_) => DEFAULT_TOKENIZE_TIMEOUT,
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn tokenize_timeout_is_bounded_and_default_stays_two_seconds() {
+        assert_eq!(DEFAULT_TOKENIZE_TIMEOUT, Duration::from_secs(2));
+        for invalid in [
+            "",
+            "0",
+            "-1",
+            "1.5",
+            "60001",
+            "invalid",
+            "18446744073709551616",
+        ] {
+            assert_eq!(parse_tokenize_timeout(invalid), None, "{invalid}");
+        }
+        for ms in [1, 2000, 5000, 60000] {
+            assert_eq!(
+                parse_tokenize_timeout(&ms.to_string()),
+                Some(Duration::from_millis(ms))
+            );
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct ChatAffinity {
     slots: Semaphore,
+    tokenize_timeout: Duration,
     /// Reuse this request's authoritative final IDs in the native Chat input
     /// extension. Opt-in: deployments must use matching P/D templates/tokenizers.
     pub(super) reuse_token_ids: bool,
@@ -26,6 +78,7 @@ impl Default for ChatAffinity {
     fn default() -> Self {
         Self {
             slots: Semaphore::new(8),
+            tokenize_timeout: tokenize_timeout_from_env(),
             reuse_token_ids: std::env::var("SGLANG_GATEWAY_PD_CHAT_REUSE_TOKEN_IDS")
                 .is_ok_and(|value| value == "1"),
         }
@@ -128,7 +181,7 @@ impl ChatAffinity {
                 worker.base_url(),
                 "/v1/chat/tokenize",
             ))
-            .timeout(Duration::from_secs(2))
+            .timeout(self.tokenize_timeout)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(payload);
         if let Some(api_key) = worker.api_key() {
@@ -136,12 +189,12 @@ impl ChatAffinity {
         }
         // Share the gateway's pooled client, but never acquire a PD lease or
         // update inference load/circuit breakers for this CPU-only operation.
-        let mut response = request.send().await.map_err(|_| "transport")?;
+        let mut response = request.send().await.map_err(tokenize_transport_error)?;
         if !response.status().is_success() {
             return Err("http_status");
         }
         let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|_| "transport")? {
+        while let Some(chunk) = response.chunk().await.map_err(tokenize_transport_error)? {
             if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
                 return Err("response_too_large");
             }
@@ -161,6 +214,14 @@ impl ChatAffinity {
             return Err("invalid_response");
         }
         Ok(tokens.into())
+    }
+}
+
+fn tokenize_transport_error(error: reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else {
+        "transport"
     }
 }
 
