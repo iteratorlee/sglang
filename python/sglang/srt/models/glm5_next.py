@@ -17,7 +17,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
 )
 from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
 from sglang.srt.configs.model_config import is_deepseek_dsa
-from sglang.srt.distributed.parallel_state import get_pp_group
+from sglang.srt.distributed.parallel_state import get_dense_tp_group, get_pp_group
 from sglang.srt.distributed.utils import divide
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import (
@@ -645,6 +645,7 @@ class Glm5NextDecoderLayer(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
 
+        self._dense_tp_group = None
         if self.is_layer_sparse:
             self.mlp = Glm5NextMoE(
                 config=config,
@@ -657,6 +658,20 @@ class Glm5NextDecoderLayer(nn.Module):
         else:
             if enable_moe_dense_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
+            elif (
+                get_parallel().moe_dense_tp_size == 16 and get_parallel().tp_size == 32
+            ):
+                group = get_dense_tp_group()
+                if (
+                    group is None
+                    or group.world_size != 16
+                    or group.rank_in_group != get_parallel().tp_rank % 16
+                    or layer_id not in (0, 1, 2)
+                    or is_nextn
+                ):
+                    raise RuntimeError("dense TP16 was not initialized for this target")
+                self._dense_tp_group = group
+                mlp_tp_rank, mlp_tp_size = group.rank_in_group, group.world_size
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
             self.mlp = Glm5NextMLP(
@@ -668,7 +683,21 @@ class Glm5NextDecoderLayer(nn.Module):
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
                 swiglu_limit=config.swiglu_limit,
+                reduce_results=self._dense_tp_group is None,
             )
+            if self._dense_tp_group is not None:
+                for proj in (self.mlp.gate_up_proj, self.mlp.down_proj):
+                    if (
+                        not getattr(proj.scheme, "is_dynamic", False)
+                        or type(proj.scheme.kernel).__name__
+                        != "NPUW8A8Int8DynamicLinearMethod"
+                        or proj.weight.dtype != torch.int8
+                        or proj.bias is not None
+                        or proj.use_presharded_weights
+                    ):
+                        raise ValueError(
+                            "dense TP16 requires ordinary dynamic W8A8 loading"
+                        )
 
         self._normal_skip_idle_dp = False
         if (
@@ -856,6 +885,16 @@ class Glm5NextDecoderLayer(nn.Module):
             forward_batch
         )
 
+        if self._dense_tp_group is not None and (
+            should_allreduce_fusion
+            or use_reduce_scatter
+            or get_forward().sp_active
+            or self.mlp.gate_up_proj.gather_output
+            or self.mlp.down_proj.use_decode_attn_tp
+            or self.mlp.down_proj.use_dp_attention_reduce
+        ):
+            raise RuntimeError("dense TP16 requires unfused FULL eager MHC")
+
         if isinstance(self.mlp, Glm5NextMLP):
             gemm_output_zero_allocator = None
 
@@ -886,11 +925,16 @@ class Glm5NextDecoderLayer(nn.Module):
             mlp_reduce_scatter=use_reduce_scatter,
         ):
             with _mlp_ctx:
-                hidden_states = self.mlp(
-                    hidden_states,
-                    forward_batch,
-                    gemm_output_zero_allocator,
-                )
+                if self._dense_tp_group is None or hidden_states.shape[0] > 0:
+                    hidden_states = self.mlp(
+                        hidden_states,
+                        forward_batch,
+                        gemm_output_zero_allocator,
+                    )
+
+        if self._dense_tp_group is not None and hidden_states.shape[0] > 0:
+            # Both halves compute the FULL DP4 buffer; scatter remains global.
+            hidden_states = self._dense_tp_group.all_reduce(hidden_states)
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True

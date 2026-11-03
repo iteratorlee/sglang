@@ -95,11 +95,11 @@ def check_server_args(server_args: Any):
     assert cfg.base_gpu_id >= 0, "base_gpu_id must be non-negative"
     assert cfg.gpu_id_step >= 1, "gpu_id_step must be positive"
 
-    assert cfg.moe_dense_tp_size in (
-        None,
-        1,
-        cfg.tp_size,
-    ), "moe_dense_tp_size only supports None, 1, or tp_size currently"
+    from sglang.srt.hardware_backend.npu.moe.glm53_dense_tp import (
+        dense_tp16_enabled,
+    )
+
+    dense_tp16_enabled(cfg, is_npu=get_platform().is_npu)
 
     # Check served model name to not have colon as it is reserved for LoRA adapter syntax
     if not is_runai_obj_uri(cfg.served_model_name):

@@ -2090,6 +2090,7 @@ def init_model_parallel_group(
 
 
 _TP: Optional[GroupCoordinator] = None
+_DENSE_TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
 _DCP: Optional[GroupCoordinator] = None
@@ -2103,6 +2104,10 @@ _ENABLE_PDMUX_P_TP: bool = False
 def set_pdmux_status(enable_prefill_multiplexing: bool):
     global _ENABLE_PDMUX_P_TP
     _ENABLE_PDMUX_P_TP = enable_prefill_multiplexing
+
+
+def get_dense_tp_group() -> Optional[GroupCoordinator]:
+    return _DENSE_TP
 
 
 def get_tp_group() -> GroupCoordinator:
@@ -2463,6 +2468,7 @@ def initialize_model_parallel(
     recovered_rank: bool = False,
     rank_offset: int = 0,
     max_world_size: Optional[int] = None,
+    dense_tensor_model_parallel_size: Optional[int] = None,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -2534,6 +2540,28 @@ def initialize_model_parallel(
             f"tensor_model_parallel_size ({tensor_model_parallel_size}) x "
             f"pipeline_model_parallel_size ({pipeline_model_parallel_size})"
         )
+    if dense_tensor_model_parallel_size is not None and (
+        not _is_npu
+        or backend != "hccl"
+        or (
+            world_size,
+            tensor_model_parallel_size,
+            pipeline_model_parallel_size,
+            attention_data_parallel_size,
+            expert_model_parallel_size,
+            attention_context_model_parallel_size,
+            moe_data_model_parallel_size,
+            decode_context_parallel_size,
+            dense_tensor_model_parallel_size,
+        )
+        != (32, 32, 1, 4, 32, 1, 1, 1, 16)
+        or duplicate_tp_group
+        or enable_symm_mem
+        or recovered_rank
+        or rank_offset
+        or max_world_size is not None
+    ):
+        raise ValueError("unsupported dense TP subgroup topology")
     if decode_context_parallel_size < 1:
         raise RuntimeError(
             f"decode_context_parallel_size ({decode_context_parallel_size}) must be >= 1"
@@ -2832,6 +2860,22 @@ def initialize_model_parallel(
             group_name="self_pp",
         )
 
+    global _DENSE_TP
+    if dense_tensor_model_parallel_size is not None:
+        assert _DENSE_TP is None, "dense TP group is already initialized"
+        # Every rank creates BOTH halves in the same device/Gloo order.
+        _DENSE_TP = init_model_parallel_group(
+            [list(range(16)), list(range(16, 32))],
+            get_world_group().local_rank,
+            backend,
+            group_name="dense_tp",
+            use_pynccl=False,
+            use_custom_allreduce=False,
+            use_mscclpp_allreduce=False,
+            use_torch_symm_mem_allreduce=False,
+            use_message_queue_broadcaster=False,
+        )
+
 
 def create_custom_parallel_group(
     group_ranks: List[int], backend: str = "gloo"
@@ -3041,6 +3085,10 @@ def get_moe_tensor_parallel_rank():
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
     get_parallel().clear_derived_widths()
+    global _DENSE_TP
+    if _DENSE_TP is not None:
+        _DENSE_TP.destroy()
+        _DENSE_TP = None
     dwdp_mgr = get_global_dwdp_manager()
     if dwdp_mgr is not None:
         dwdp_mgr.cleanup()

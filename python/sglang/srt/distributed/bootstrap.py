@@ -10,6 +10,7 @@ import torch.distributed as dist
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import (
     get_default_distributed_backend,
+    get_dense_tp_group,
     get_pp_group,
     get_tp_group,
     get_world_group,
@@ -267,6 +268,14 @@ def _init_parallel_groups(
     moe_dp_size: int,
     dcp_size: int,
 ) -> None:
+    from sglang.srt.hardware_backend.npu.moe.glm53_dense_tp import (
+        dense_tp16_enabled,
+        validate_dense_tp16_model,
+    )
+
+    dense16 = dense_tp16_enabled(server_args, is_npu=is_npu())
+    if dense16:
+        validate_dense_tp16_model(model_config)
     is_ep_joiner = get_exec().moe.is_ep_joiner
     is_scale_joiner = get_exec().moe.is_ep_scale_joiner
     rank_offset = get_parallel().ep_join_rank_offset if is_scale_joiner else 0
@@ -299,7 +308,17 @@ def _init_parallel_groups(
         recovered_rank=is_ep_joiner,
         rank_offset=rank_offset,
         max_world_size=get_parallel().max_ep_size,
+        dense_tensor_model_parallel_size=16 if dense16 else None,
     )
+    dense_group = get_dense_tp_group()
+    if dense_group is not None:
+        # Mandatory even without --pre-warm-nccl: charge lazy transport memory
+        # before init_torch_distributed takes its pre_model_load_memory snapshot.
+        tensor = torch.zeros(1, device=f"npu:{gpu_id}")
+        dense_group.all_reduce(tensor)
+        current_platform.synchronize()
+        del tensor
+        current_platform.empty_cache()
     _tag_groups_for_flashinfer_allreduce_only()
     initialize_dp_attention(
         server_args=server_args,
