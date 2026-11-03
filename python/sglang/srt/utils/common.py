@@ -3880,6 +3880,26 @@ def require_mlp_tp_gather():
             # Scoped to the opt-in gate so the default path is untouched.
             return True
         else:
+            if (
+                get_parallel().moe_dense_tp_size == 1
+                and get_moe_a2a_backend().is_deepep()
+                and is_npu()
+                and os.getenv("SGLANG_GLM53_NORMAL_HCCL", "0") == "1"
+            ):
+                from sglang.srt.hardware_backend.npu.moe.glm53_collectives import (
+                    normal_hccl_profile,
+                )
+                from sglang.srt.runtime_context import get_server_args
+
+                args = get_server_args()
+                if args.deepep_mode == "normal" and normal_hccl_profile(args, 10) in (
+                    "prefill_2node_dp2_tp8_ep16",
+                    "prefill_4node_dp4_tp8_ep32",
+                ):
+                    # Normal HCCL needs the real global DP token counts even
+                    # with fully DP dense layers. Keep scheduler DP-sync and
+                    # uniform padding; Ascend MHC still uses SCATTERED MLPs.
+                    return True
             return (
                 get_parallel().moe_dense_tp_size
                 > get_parallel().tp_size // get_parallel().dp_size
