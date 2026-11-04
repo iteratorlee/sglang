@@ -343,7 +343,8 @@ async def lifespan(fast_api_app: FastAPI):
 
     # Initialize Anthropic-compatible serving handler
     fast_api_app.state.anthropic_serving = AnthropicServing(
-        fast_api_app.state.openai_serving_chat
+        fast_api_app.state.openai_serving_chat,
+        fast_api_app.state.chat_affinity_tokenizer,
     )
 
     # Launch tool server
@@ -2054,6 +2055,21 @@ async def anthropic_v1_messages(
     """Anthropic-compatible Messages API endpoint."""
     return await raw_request.app.state.anthropic_serving.handle_messages(
         request, raw_request
+    )
+
+
+@app.post("/v1/messages/tokenize", dependencies=[Depends(validate_json_request)])
+async def anthropic_v1_tokenize(raw_request: Request):
+    """Bounded AnthropicMessagesRequest parsing and tokenization on CPU only."""
+    from sglang.srt.entrypoints.openai.chat_affinity import MAX_REQUEST_BYTES
+
+    body = bytearray()
+    async for chunk in raw_request.stream():
+        if len(body) + len(chunk) > MAX_REQUEST_BYTES:
+            return ORJSONResponse({"supported": False, "reason": "too_large"})
+        body.extend(chunk)
+    return await raw_request.app.state.anthropic_serving.handle_tokenize(
+        bytes(body), raw_request
     )
 
 

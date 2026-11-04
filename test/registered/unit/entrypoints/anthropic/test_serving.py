@@ -859,10 +859,9 @@ class TestAnthropicServing(unittest.TestCase):
         serving._convert_to_chat_completion_request(request)
         self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [True])
 
-    def test_request_thinking_display_omitted_logs_warning_but_still_enables(self):
-        """``thinking.display='omitted'`` is accepted; reasoning stays on
-        because we cannot suppress reasoning text from the OpenAI stream.
-        ``enabled`` requires ``budget_tokens`` per SDK shape."""
+    def test_request_thinking_display_omitted_keeps_internal_reasoning_enabled(self):
+        """Output visibility does not disable the backend reasoning parser.
+        The unsupported hard budget still receives its existing warning."""
         import logging
 
         serving = self._serving()
@@ -879,7 +878,8 @@ class TestAnthropicServing(unittest.TestCase):
         ) as log:
             serving._convert_to_chat_completion_request(request)
         self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [True])
-        self.assertTrue(any("omitted" in r for r in log.output))
+        self.assertTrue(any("budget_tokens" in r for r in log.output))
+        self.assertFalse(any("omitted" in r for r in log.output))
 
     def test_request_output_config_effort_maps_to_reasoning_effort(self):
         """``output_config.effort`` rows map onto ``reasoning_effort``."""

@@ -250,6 +250,7 @@ class AnthropicToolChoice(BaseModel):
 
     type: Literal["auto", "any", "tool", "none"]
     name: Optional[str] = None
+    disable_parallel_tool_use: Optional[bool] = None
 
 
 class AnthropicThinkingParam(BaseModel):
@@ -357,6 +358,16 @@ class AnthropicCountTokensResponse(BaseModel):
     input_tokens: int
 
 
+class AnthropicSessionParams(BaseModel):
+    """Explicit SGLang session continuation fields (not Claude metadata)."""
+
+    id: Optional[str] = None
+    rid: Optional[str] = None
+    offset: Optional[int] = None
+    replace: Optional[bool] = None
+    drop_previous_output: Optional[bool] = None
+
+
 class AnthropicMessagesRequest(BaseModel):
     """Anthropic Messages API request."""
 
@@ -377,6 +388,25 @@ class AnthropicMessagesRequest(BaseModel):
     # when targeting non-Anthropic backends, so the schema must accept them.
     output_config: Optional[AnthropicOutputConfig] = None
     betas: Optional[list[str]] = None
+
+    # Trusted Gateway extensions. Keep this allowlist explicit: unknown Claude
+    # beta fields remain accepted/ignored, never forwarded as backend controls.
+    bootstrap_host: Optional[Union[list[str], str]] = None
+    bootstrap_port: Optional[Union[list[Optional[int]], int]] = None
+    bootstrap_room: Optional[Union[list[int], int]] = None
+    routed_dp_rank: Optional[int] = None
+    disagg_prefill_dp_rank: Optional[int] = None
+    cache_salt: Optional[Union[list[str], str]] = None
+    input_ids: Optional[list[Annotated[int, Field(strict=True, ge=0, lt=2**32)]]] = None
+    rid: Optional[Union[list[str], str]] = None
+    session_id: Optional[str] = None
+    session_params: Optional[AnthropicSessionParams] = None
+
+    @model_validator(mode="after")
+    def _validate_session_fields(self):
+        if self.session_id is not None and self.session_params is not None:
+            raise ValueError("session_id and session_params cannot both be set.")
+        return self
 
     @field_validator("model")
     @classmethod

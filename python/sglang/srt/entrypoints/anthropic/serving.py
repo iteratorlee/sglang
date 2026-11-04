@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, Union
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError
-
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicContentBlock,
     AnthropicCountTokensRequest,
@@ -43,6 +42,7 @@ from sglang.srt.entrypoints.anthropic.protocol import (
     ToolUseBlock,
     is_server_tool,
 )
+from sglang.srt.entrypoints.openai.chat_affinity import ChatAffinityTokenizer
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -51,9 +51,14 @@ from sglang.srt.entrypoints.openai.protocol import (
     Tool,
     ToolChoice,
     ToolChoiceFuncName,
+    UsageInfo,
 )
 from sglang.srt.observability.req_time_stats import monotonic_time
-from sglang.srt.parser.template_detection import detect_inline_system_support
+from sglang.srt.parser.template_detection import (
+    TemplateDetectionContext,
+    _is_glm53,
+    detect_inline_system_support,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
@@ -158,6 +163,13 @@ def _wrap_sse_event(data: str, event_type: str) -> str:
     return f"event: {event_type}\ndata: {data}\n\n"
 
 
+def _include_thinking(request: AnthropicMessagesRequest) -> bool:
+    thinking = request.thinking
+    return thinking is None or (
+        thinking.type != "disabled" and thinking.display != "omitted"
+    )
+
+
 def _scrub_error_message(message: str, status_code: int) -> str:
     """Return a safe outward-facing error message.
 
@@ -181,6 +193,32 @@ def _scrub_error_message(message: str, status_code: int) -> str:
     return cleaned or "Request failed"
 
 
+class _AnthropicAffinityTokenizer(ChatAffinityTokenizer):
+    """Normalize inside the existing bounded Chat CPU worker.
+
+    Borrow its executor and semaphore so Chat and Messages share one work limit
+    and cancellation handling. The owning Chat tokenizer closes the executor.
+    """
+
+    def __init__(self, serving, chat_tokenizer):
+        self.serving = serving
+        self.chat_serving = chat_tokenizer.chat_serving
+        self._executor = chat_tokenizer._executor
+        self._slot = chat_tokenizer._slot
+        self._chat_tokenizer = chat_tokenizer
+
+    def _tokenize(self, data):
+        request = (
+            AnthropicMessagesRequest.model_validate_json(data)
+            if isinstance(data, bytes)
+            else AnthropicMessagesRequest.model_validate(data)
+        )
+        chat_request = self.serving._convert_to_chat_completion_request(request)
+        return self._chat_tokenizer._tokenize(
+            chat_request.model_dump(exclude_none=True)
+        )
+
+
 class AnthropicServing:
     """Handler for Anthropic Messages API requests.
 
@@ -188,8 +226,17 @@ class AnthropicServing:
     OpenAI-compatible chat completion infrastructure.
     """
 
-    def __init__(self, openai_serving_chat: OpenAIServingChat):
+    def __init__(
+        self,
+        openai_serving_chat: OpenAIServingChat,
+        chat_affinity_tokenizer: Optional[ChatAffinityTokenizer] = None,
+    ):
         self.openai_serving_chat = openai_serving_chat
+        self._affinity_tokenizer = (
+            _AnthropicAffinityTokenizer(self, chat_affinity_tokenizer)
+            if chat_affinity_tokenizer is not None
+            else None
+        )
         self._merge_inline_system = not detect_inline_system_support(
             self._chat_template()
         )
@@ -202,6 +249,23 @@ class AnthropicServing:
         if tokenizer is None:
             return None
         return getattr(tokenizer, "chat_template", None)
+
+    def _uses_glm53_thinking_template(self) -> bool:
+        template = self._chat_template()
+        # Reuse the existing GLM-5.3 template signature. Its generation prompt
+        # always opens <think>; enable_thinking is not a template control.
+        return (
+            getattr(self.openai_serving_chat, "reasoning_parser", None) == "glm45"
+            and isinstance(template, str)
+            and _is_glm53(
+                TemplateDetectionContext(
+                    template=template,
+                    reasoning_config=None,
+                    force_reasoning=False,
+                    vocab=set(),
+                )
+            )
+        )
 
     async def handle_messages(
         self,
@@ -239,15 +303,17 @@ class AnthropicServing:
             # or as a raw dict when parsed from a nested tool_result payload.
             if isinstance(source, BaseModel):
                 source = source.model_dump(exclude_none=True)
+            if isinstance(source, str) and source:
+                return {"type": "image_url", "image_url": {"url": source}}
             if not isinstance(source, dict):
-                return None
+                raise ValueError("Image source must contain base64 data or a URL")
 
             source_type = source.get("type")
             if source_type == "base64":
                 media_type = source.get("media_type", "image/png")
                 data = source.get("data", "")
                 if not data:
-                    return None
+                    raise ValueError("Base64 image source requires data")
                 return {
                     "type": "image_url",
                     "image_url": {
@@ -264,7 +330,7 @@ class AnthropicServing:
                     },
                 }
 
-            return None
+            raise ValueError("Image source must contain base64 data or a URL")
 
         def _text_from_search_result(item: dict[str, Any]) -> str:
             search_parts = []
@@ -484,7 +550,7 @@ class AnthropicServing:
                 if block.type == "text" and block.text is not None:
                     content_parts.append({"type": "text", "text": block.text})
 
-                elif block.type == "image" and block.source:
+                elif block.type == "image":
                     image_part = _convert_anthropic_image_source_to_openai_part(
                         block.source
                     )
@@ -567,7 +633,31 @@ class AnthropicServing:
             "model": anthropic_request.model,
             "max_tokens": anthropic_request.max_tokens,
             "stream": anthropic_request.stream or False,
+            "bootstrap_host": anthropic_request.bootstrap_host,
+            "bootstrap_port": anthropic_request.bootstrap_port,
+            "bootstrap_room": anthropic_request.bootstrap_room,
+            "routed_dp_rank": anthropic_request.routed_dp_rank,
+            "disagg_prefill_dp_rank": anthropic_request.disagg_prefill_dp_rank,
+            "cache_salt": anthropic_request.cache_salt,
+            "input_ids": anthropic_request.input_ids,
+            "rid": anthropic_request.rid,
+            "session_id": anthropic_request.session_id,
+            "session_params": (
+                anthropic_request.session_params.model_dump(exclude_none=True)
+                if anthropic_request.session_params is not None
+                else None
+            ),
         }
+
+        # CPU routing IDs cannot encode processed media. Retain the message
+        # parts and use Chat's normal media path, including images in results.
+        if any(
+            part.get("type") in ("image_url", "audio_url", "video_url")
+            for message in openai_messages
+            if isinstance(message.get("content"), list)
+            for part in message["content"]
+        ):
+            request_data["input_ids"] = None
 
         if anthropic_request.temperature is not None:
             request_data["temperature"] = anthropic_request.temperature
@@ -606,18 +696,14 @@ class AnthropicServing:
                 )
             # Claude 4.7's ``adaptive`` is treated identically to ``enabled``
             # because the local backend has no auto-throttle equivalent.
-            # Anything other than ``disabled`` enables reasoning.
-            enabled = anthropic_request.thinking.type != "disabled"
-            if anthropic_request.thinking.display == "omitted":
-                # Anthropic 4.7 spec: keep reasoning ON but hide reasoning
-                # text from the client. The OpenAI streaming pipeline has
-                # no equivalent suppress knob — log so operators can see
-                # the request, then proceed with normal reasoning emission.
-                logger.warning(
-                    "Anthropic thinking.display='omitted' is accepted for "
-                    "SDK compatibility but reasoning text will still be "
-                    "emitted to the client"
-                )
+            # GLM-5.3 always prefills <think>, even with enable_thinking=False.
+            # Keep its parser active to separate the untagged reasoning prefix
+            # from the answer/tools; disabled/omitted controls visibility below.
+            # This changes no rendered tokens for that template contract.
+            enabled = (
+                anthropic_request.thinking.type != "disabled"
+                or self._uses_glm53_thinking_template()
+            )
             self.openai_serving_chat.apply_reasoning_enabled(chat_request, enabled)
 
         # Claude 4.7 ``output_config``: map ``effort`` onto the OpenAI
@@ -694,6 +780,10 @@ class AnthropicServing:
         # no tool the model could call. Silently downgrading to "no tool"
         # would deceive the caller, so raise an explicit 400.
         if anthropic_request.tool_choice is not None:
+            if anthropic_request.tool_choice.disable_parallel_tool_use is not None:
+                chat_request.parallel_tool_calls = (
+                    not anthropic_request.tool_choice.disable_parallel_tool_use
+                )
             tc_type = anthropic_request.tool_choice.type
             if tc_type == "none":
                 chat_request.tool_choice = "none"
@@ -732,6 +822,34 @@ class AnthropicServing:
 
         return chat_request
 
+    def _convert_to_internal_request(
+        self, chat_request, raw_request, anthropic_request=None
+    ):
+        adapted_request, processed_request = (
+            self.openai_serving_chat._convert_to_internal_request(
+                chat_request, raw_request
+            )
+        )
+        # Chat's internal converter forwards session_id but currently omits
+        # session_params. Both Anthropic handlers bypass its public entrypoint.
+        adapted_request.session_params = chat_request.session_params
+        if (
+            anthropic_request is not None
+            and anthropic_request.thinking is not None
+            and anthropic_request.thinking.type == "disabled"
+            and self._uses_glm53_thinking_template()
+            and getattr(processed_request, "_tool_call_constraint_kind", None)
+            == "json_schema"
+        ):
+            # A required/named tool can fall back to a plain JSON grammar.
+            # Preserve disabled mode's immediate constrained output and parsing:
+            # there is no native <tool_call> boundary to end forced reasoning.
+            # Skip the response reasoner as well, including any server-wide
+            # force_reasoning setting. Neither change touches the prompt IDs.
+            processed_request.separate_reasoning = False
+            adapted_request.require_reasoning = False
+        return adapted_request, processed_request
+
     async def _handle_non_streaming(
         self,
         chat_request: ChatCompletionRequest,
@@ -755,10 +873,8 @@ class AnthropicServing:
 
         try:
             # Convert to internal request
-            adapted_request, processed_request = (
-                self.openai_serving_chat._convert_to_internal_request(
-                    chat_request, raw_request
-                )
+            adapted_request, processed_request = self._convert_to_internal_request(
+                chat_request, raw_request, anthropic_request
             )
             adapted_request.received_time = received_time
 
@@ -768,6 +884,12 @@ class AnthropicServing:
             )
         except asyncio.CancelledError:
             raise
+        except ValueError as e:
+            return self._error_response(
+                status_code=400,
+                error_type="invalid_request_error",
+                message=str(e),
+            )
         except Exception as e:
             logger.exception("Error processing Anthropic request: %s", e)
             return self._error_response(
@@ -783,7 +905,9 @@ class AnthropicServing:
             return self._convert_openai_error_response(response)
 
         # Convert to Anthropic response
-        anthropic_response = self._convert_response(response)
+        anthropic_response = self._convert_response(
+            response, include_thinking=_include_thinking(anthropic_request)
+        )
         return JSONResponse(content=anthropic_response.model_dump(exclude_none=True))
 
     async def _handle_streaming(
@@ -805,14 +929,18 @@ class AnthropicServing:
             )
 
         try:
-            adapted_request, processed_request = (
-                self.openai_serving_chat._convert_to_internal_request(
-                    chat_request, raw_request
-                )
+            adapted_request, processed_request = self._convert_to_internal_request(
+                chat_request, raw_request, anthropic_request
             )
             adapted_request.received_time = received_time
         except asyncio.CancelledError:
             raise
+        except ValueError as e:
+            return self._error_response(
+                status_code=400,
+                error_type="invalid_request_error",
+                message=str(e),
+            )
         except Exception as e:
             logger.exception("Error converting streaming request: %s", e)
             return self._error_response(
@@ -852,11 +980,13 @@ class AnthropicServing:
         content_block_type: Optional[str] = None
         captured_thinking_signature: str = ""
         finish_reason: Optional[str] = None
+        latest_usage: Optional[UsageInfo] = None
         final_usage: Optional[AnthropicUsage] = None
         message_started = False
         had_content_delta = False
         message_id = f"msg_{uuid.uuid4().hex}"
         model = anthropic_request.model
+        include_thinking = _include_thinking(anthropic_request)
 
         def _message_start_event(usage) -> MessageStartEvent:
             return MessageStartEvent(
@@ -962,7 +1092,7 @@ class AnthropicServing:
             the close step is mandatory even on the error path.
             """
             frames: list[str] = []
-            frames.extend(_ensure_message_started(None))
+            frames.extend(_ensure_message_started(latest_usage))
             for event in _close_content_block_events():
                 frames.append(_emit(event))
             frames.append(_emit(_build_error_event(error_type, message)))
@@ -1040,7 +1170,7 @@ class AnthropicServing:
             data_str = sse_line[6:].strip()
 
             if data_str == "[DONE]":
-                for frame in _ensure_message_started(None):
+                for frame in _ensure_message_started(latest_usage):
                     yield frame
 
                 # No content AND no finish_reason: the backend dropped the
@@ -1115,6 +1245,9 @@ class AnthropicServing:
                 return
 
             if chunk.usage is not None:
+                # Keep prompt/cache counts for a deferred message_start; the
+                # final Anthropic message_delta carries output usage only.
+                latest_usage = chunk.usage
                 final_usage = _anthropic_usage_from_openai(
                     chunk.usage,
                     include_input=False,
@@ -1146,20 +1279,17 @@ class AnthropicServing:
             # usage is available; emitting message_start there would ship
             # input_tokens=0 to the client.
             has_delta_payload = bool(
-                delta.reasoning_content
+                (delta.reasoning_content and include_thinking)
                 or delta.tool_calls
                 or (delta.content is not None and delta.content != "")
-                or chunk.usage
+                or (chunk.usage and include_thinking)
             )
-            # The finish_reason chunk should also flip message_started so a
-            # zero-content completion (the path that previously fired the
-            # 'Backend produced no content' error) emits the standard
-            # message_start before [DONE] closes the stream.
-            if (
-                has_delta_payload or choice.finish_reason is not None
-            ) and not message_started:
-                yield _emit(_message_start_event(chunk.usage))
-                message_started = True
+            # An empty finish-only chunk can precede the usage-only chunk.
+            # Defer its start until usage or [DONE], while real content (also
+            # a zero-argument tool's id/name) still starts immediately.
+            if has_delta_payload:
+                for frame in _ensure_message_started(latest_usage):
+                    yield frame
 
             if (
                 not has_delta_payload
@@ -1169,7 +1299,7 @@ class AnthropicServing:
                 continue
 
             # Handle reasoning content deltas
-            if delta.reasoning_content:
+            if delta.reasoning_content and include_thinking:
                 for event in _ensure_content_block_events(
                     "thinking",
                     ThinkingBlock(thinking=""),
@@ -1256,7 +1386,7 @@ class AnthropicServing:
                 had_content_delta = True
 
     def _convert_response(
-        self, response: ChatCompletionResponse
+        self, response: ChatCompletionResponse, *, include_thinking: bool = True
     ) -> AnthropicMessagesResponse:
         """Convert an OpenAI ChatCompletionResponse to an Anthropic Messages response."""
         if not response.choices:
@@ -1273,7 +1403,7 @@ class AnthropicServing:
         # Add reasoning content as a thinking block. signature is omitted
         # entirely when the backend doesn't provide one — empty strings
         # would fail downstream Anthropic signature verifiers.
-        if choice.message.reasoning_content:
+        if choice.message.reasoning_content and include_thinking:
             content.append(ThinkingBlock(thinking=choice.message.reasoning_content))
 
         # Add text content
@@ -1412,65 +1542,81 @@ class AnthropicServing:
             content=error_resp.model_dump(),
         )
 
-    async def handle_count_tokens(
-        self,
-        request: AnthropicCountTokensRequest,
-        raw_request: Request,
-    ) -> JSONResponse:
-        """Handle /v1/messages/count_tokens endpoint.
-
-        Converts the request to a ChatCompletionRequest, applies the chat
-        template via the OpenAI handler to tokenize, and returns the count.
-        """
+    async def _tokenize_request(self, request) -> Union[dict, JSONResponse]:
+        """Run validation, conversion and rendering in the shared CPU pool."""
+        if self._affinity_tokenizer is None:
+            return {"supported": False, "reason": "unavailable"}
         try:
-            # Build a minimal AnthropicMessagesRequest so we can reuse conversion
-            messages_request = AnthropicMessagesRequest(
-                model=request.model,
-                messages=request.messages,
-                max_tokens=1,  # dummy, not used for counting
-                system=request.system,
-                thinking=request.thinking,
-                tools=request.tools,
-                tool_choice=request.tool_choice,
-            )
-            chat_request = self._convert_to_chat_completion_request(messages_request)
+            return await self._affinity_tokenizer.tokenize(request)
         except asyncio.CancelledError:
             raise
-        except Exception as e:
-            logger.exception("Error converting count_tokens request: %s", e)
+        except ValidationError as e:
+            # Do not echo input payloads (which can include image bytes).
+            message = "; ".join(
+                ".".join(str(p) for p in error["loc"]) + ": " + error["msg"]
+                for error in e.errors(include_input=False)
+            )
+            return self._error_response(
+                status_code=400,
+                error_type="invalid_request_error",
+                message=message,
+            )
+        except ValueError as e:
             return self._error_response(
                 status_code=400,
                 error_type="invalid_request_error",
                 message=str(e),
             )
+        except Exception:
+            logger.debug("Anthropic affinity tokenization unavailable", exc_info=True)
+            return {"supported": False, "reason": "tokenization_failed"}
 
-        try:
-            is_multimodal = (
-                self.openai_serving_chat.tokenizer_manager.model_config.is_multimodal
-            )
-            processed = self.openai_serving_chat._process_messages(
-                chat_request, is_multimodal
-            )
+    async def handle_tokenize(self, request, raw_request: Request) -> JSONResponse:
+        """Return the exact /v1/chat/tokenize advisory response shape."""
+        result = await self._tokenize_request(request)
+        return result if isinstance(result, JSONResponse) else JSONResponse(result)
 
-            if isinstance(processed.prompt_ids, list):
-                input_tokens = len(processed.prompt_ids)
-            else:
-                # prompt_ids is a string (multimodal case) — tokenize it
-                tokenizer = self.openai_serving_chat.tokenizer_manager.tokenizer
-                input_tokens = len(tokenizer.encode(processed.prompt_ids))
+    async def handle_count_tokens(
+        self,
+        request: AnthropicCountTokensRequest,
+        raw_request: Request,
+    ) -> JSONResponse:
+        """Count the same CPU-rendered IDs used for Gateway routing.
 
-            return JSONResponse(
-                content=AnthropicCountTokensResponse(
-                    input_tokens=input_tokens
-                ).model_dump()
+        Unsupported media/renderers cannot provide exact CPU-only counts and
+        return an explicit error instead of a misleading placeholder count.
+        """
+        messages_request = AnthropicMessagesRequest(
+            model=request.model,
+            messages=request.messages,
+            max_tokens=1,  # unused for rendering
+            system=request.system,
+            thinking=request.thinking,
+            tools=request.tools,
+            tool_choice=request.tool_choice,
+            output_config=request.output_config,
+            betas=request.betas,
+        )
+        result = await self._tokenize_request(messages_request)
+        if isinstance(result, JSONResponse):
+            return result
+        if not result.get("supported"):
+            reason = result.get("reason", "unsupported_request")
+            unavailable = reason in (
+                "busy",
+                "unavailable",
+                "model_changed",
+                "tokenization_failed",
             )
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.exception("Error counting tokens: %s", e)
             return self._error_response(
-                status_code=500,
-                error_type="api_error",
-                message="Internal server error",
-                exception_name=type(e).__name__,
+                status_code=503 if unavailable else 400,
+                error_type=(
+                    "overloaded_error" if unavailable else "invalid_request_error"
+                ),
+                message=f"CPU token counting unavailable: {reason}",
             )
+        return JSONResponse(
+            content=AnthropicCountTokensResponse(
+                input_tokens=result["count"]
+            ).model_dump()
+        )
