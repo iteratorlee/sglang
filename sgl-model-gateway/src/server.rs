@@ -257,6 +257,49 @@ async fn v1_chat_completions(
         .await
 }
 
+async fn v1_messages(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(message) = crate::routers::anthropic::validate(&body, false) {
+        return crate::routers::anthropic::error(StatusCode::BAD_REQUEST, message);
+    }
+    state
+        .router
+        .route_messages(Some(&headers), &body, body["model"].as_str())
+        .await
+}
+
+async fn v1_messages_count_tokens(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(message) = crate::routers::anthropic::validate(&body, true) {
+        return crate::routers::anthropic::error(StatusCode::BAD_REQUEST, message);
+    }
+    state
+        .router
+        .route_messages_count_tokens(Some(&headers), &body, body["model"].as_str())
+        .await
+}
+
+// Cover extraction/admission/auth failures as well as router errors. No success
+// body is read here, so native streaming remains incremental.
+async fn messages_errors(request: Request, next: axum::middleware::Next) -> Response {
+    let native = matches!(
+        request.uri().path(),
+        "/v1/messages" | "/v1/messages/count_tokens"
+    );
+    let response = next.run(request).await;
+    if native {
+        crate::routers::anthropic::normalize_error(response).await
+    } else {
+        response
+    }
+}
+
 async fn v1_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
@@ -609,6 +652,8 @@ pub fn build_app(
     let protected_routes = Router::new()
         .route("/generate", post(generate))
         .route("/v1/chat/completions", post(v1_chat_completions))
+        .route("/v1/messages", post(v1_messages))
+        .route("/v1/messages/count_tokens", post(v1_messages_count_tokens))
         .route("/v1/completions", post(v1_completions))
         .route("/v1/rerank", post(v1_rerank))
         .route("/v1/responses", post(v1_responses))
@@ -653,7 +698,8 @@ pub fn build_app(
         .route_layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
             middleware::wasm_middleware,
-        ));
+        ))
+        .route_layer(axum::middleware::from_fn(messages_errors));
 
     let public_routes = Router::new()
         .route("/liveness", get(liveness))
@@ -1235,5 +1281,55 @@ mod raw_chat_tests {
         assert_eq!(parsed.raw["max_completion_tokens"], 7);
         assert_eq!(parsed.raw["tool_choice"]["function"]["name"], "f");
         assert!(parsed.raw.get("functions").is_none());
+    }
+}
+
+#[cfg(test)]
+mod messages_tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn messages_auth_extraction_and_error_envelopes() {
+        let app = Router::new()
+            .route(
+                "/v1/messages",
+                post(|Json(body): Json<Value>| async move { Json(body) }),
+            )
+            .route("/v1/chat/completions", post(|| async { StatusCode::OK }))
+            .route_layer(axum::middleware::from_fn_with_state(
+                AuthConfig {
+                    api_key: Some("key".into()),
+                },
+                middleware::auth_middleware,
+            ))
+            .route_layer(axum::middleware::from_fn(messages_errors));
+        for (path, auth, body, expected) in [
+            ("/v1/messages", true, "{}", StatusCode::OK),
+            ("/v1/messages", false, "{}", StatusCode::UNAUTHORIZED),
+            ("/v1/messages", true, "{broken", StatusCode::BAD_REQUEST),
+            ("/v1/chat/completions", true, "{}", StatusCode::UNAUTHORIZED),
+        ] {
+            let mut request = http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json");
+            if auth {
+                request = request.header("x-api-key", "key");
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            if path == "/v1/messages" && !expected.is_success() {
+                let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+                let value: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(value["type"], "error");
+                assert!(value["error"]["type"].is_string());
+            }
+        }
     }
 }

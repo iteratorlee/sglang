@@ -138,6 +138,7 @@ struct OutputObservation {
     final_usage: bool,
     timing_incomplete: bool,
     terminal: bool,
+    native_stop: bool,
     errored: bool,
     native_text: String,
 }
@@ -152,6 +153,22 @@ impl OutputObservation {
             || value.get("type").and_then(Value::as_str) == Some("error")
         {
             self.errored = true;
+        }
+        if matches!(
+            value.get("type").and_then(Value::as_str),
+            Some(
+                "message"
+                    | "message_start"
+                    | "message_delta"
+                    | "message_stop"
+                    | "content_block_start"
+                    | "content_block_delta"
+                    | "content_block_stop"
+                    | "ping"
+            )
+        ) {
+            self.anthropic_json(value, now);
+            return;
         }
         if let Some(usage) = value.get("usage").filter(|v| v.is_object()) {
             // Replace rather than infer/accumulate: usage is cumulative, and the
@@ -229,6 +246,72 @@ impl OutputObservation {
         }
     }
 
+    fn anthropic_json(&mut self, value: &Value, now: Instant) {
+        let kind = value["type"].as_str().unwrap_or_default();
+        let usage = if kind == "message_start" {
+            value.pointer("/message/usage")
+        } else {
+            value.get("usage")
+        };
+        if let Some(usage) = usage {
+            if let Some(input) = usage.get("input_tokens").and_then(Value::as_u64) {
+                // Anthropic splits cached input out of input_tokens. All are
+                // prompt tokens, and the start/delta usages are cumulative.
+                self.prompt = Some(
+                    input
+                        .saturating_add(
+                            usage
+                                .get("cache_read_input_tokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0),
+                        )
+                        .saturating_add(
+                            usage
+                                .get("cache_creation_input_tokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0),
+                        ),
+                );
+            }
+            if let Some(output) = usage.get("output_tokens").and_then(Value::as_u64) {
+                self.completion = Some(output);
+                self.final_usage = kind == "message_delta" || kind == "message";
+            }
+        }
+        // stop_reason in message_delta is not the end of the SSE stream.
+        // Only message_stop certifies successful native stream completion.
+        self.native_stop |= kind == "message_stop";
+        self.terminal |= self.native_stop || kind == "message";
+        let mut visible = false;
+        let mut semantic = false;
+        if kind == "content_block_delta" {
+            let delta = &value["delta"];
+            visible = nonempty(delta.get("text")) || nonempty(delta.get("partial_json"));
+            semantic = nonempty(delta.get("thinking"));
+        } else if kind == "content_block_start" {
+            visible = nonempty(value.pointer("/content_block/text"));
+            semantic = nonempty(value.pointer("/content_block/thinking"));
+        } else if kind == "message" {
+            if let Some(blocks) = value["content"].as_array() {
+                for block in blocks {
+                    visible |= nonempty(block.get("text"))
+                        || block
+                            .get("input")
+                            .and_then(Value::as_object)
+                            .is_some_and(|v| !v.is_empty());
+                    semantic |= nonempty(block.get("thinking"));
+                }
+            }
+        }
+        if semantic || visible {
+            self.first_semantic.get_or_insert(now);
+            self.last_semantic = Some(now);
+        }
+        if visible {
+            self.first_visible.get_or_insert(now);
+        }
+    }
+
     fn tpot(&self) -> Option<f64> {
         if !self.final_usage || self.timing_incomplete {
             return None;
@@ -248,6 +331,7 @@ struct SseObserver {
     data: Vec<u8>,
     oversized_line: bool,
     oversized_event: bool,
+    error_event: bool,
 }
 
 impl SseObserver {
@@ -273,6 +357,8 @@ impl SseObserver {
                         self.line.pop();
                     }
                     if self.line.is_empty() {
+                        output.errored |= self.error_event;
+                        self.error_event = false;
                         if !self.oversized_event && !self.data.is_empty() {
                             if self.data.last() == Some(&b'\n') {
                                 self.data.pop();
@@ -288,6 +374,8 @@ impl SseObserver {
                         }
                         self.data.clear();
                         self.oversized_event = false;
+                    } else if let Some(name) = self.line.strip_prefix(b"event:") {
+                        self.error_event = name.strip_prefix(b" ").unwrap_or(name) == b"error";
                     } else if let Some(data) = self.line.strip_prefix(b"data:") {
                         let data = data.strip_prefix(b" ").unwrap_or(data);
                         if self.data.len().saturating_add(data.len()) + 1 <= MAX_OBSERVATION_BYTES
@@ -445,6 +533,16 @@ impl ObservedBody {
             && (self.sse.is_none() || self.observation.output.terminal);
         self.observation
             .finish(if good { "success" } else { "error" });
+    }
+}
+
+impl Drop for ObservedBody {
+    fn drop(&mut self) {
+        // Native clients may stop reading at message_stop (or an error) without
+        // polling HTTP EOF. Those observed outcomes are not cancellations.
+        if self.observation.output.native_stop || self.observation.output.errored {
+            self.complete();
+        }
     }
 }
 

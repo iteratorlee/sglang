@@ -1,4 +1,89 @@
-//! Incremental terminal-event detection for byte-preserving SSE forwarding.
+//! Incremental SSE protocol inspection. Forwarding retains the original bytes.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SseProtocol {
+    OpenAi,
+    Anthropic,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SseEventKind {
+    Data,
+    Done,
+    Error,
+}
+
+impl SseProtocol {
+    pub(crate) fn for_route(route: &str) -> Self {
+        if route == "/v1/messages" {
+            Self::Anthropic
+        } else {
+            Self::OpenAi
+        }
+    }
+
+    pub(crate) fn tokenize_endpoint(self) -> &'static str {
+        match self {
+            Self::OpenAi => "/v1/chat/tokenize",
+            Self::Anthropic => "/v1/messages/tokenize",
+        }
+    }
+
+    /// Inspect one complete event (the caller enforces the size bound). Handles
+    /// multiline data and CRLF without depending on transport chunk boundaries.
+    pub(crate) fn inspect(self, event: &[u8]) -> Result<SseEventKind, String> {
+        use serde_json::Value;
+        let text = std::str::from_utf8(event).map_err(|e| e.to_string())?;
+        let mut name = "";
+        let mut data = Vec::new();
+        for line in text.lines() {
+            let (field, value) = line.split_once(':').unwrap_or((line, ""));
+            let value = value.strip_prefix(' ').unwrap_or(value);
+            match field {
+                "event" => name = value,
+                "data" => data.push(value),
+                _ => {}
+            }
+        }
+        if name == "error" {
+            return Ok(SseEventKind::Error);
+        }
+        if self == Self::OpenAi && data == ["[DONE]"] {
+            return Ok(SseEventKind::Done);
+        }
+        if data.is_empty() {
+            return Ok(SseEventKind::Data);
+        }
+        let value: Value = serde_json::from_str(&data.join("\n")).map_err(|e| e.to_string())?;
+        if value.get("error").is_some_and(|e| !e.is_null())
+            || value["object"] == "error"
+            || value["type"] == "error"
+        {
+            return Ok(SseEventKind::Error);
+        }
+        if self == Self::Anthropic && (value["type"] == "message_stop" || name == "message_stop") {
+            return Ok(SseEventKind::Done);
+        }
+        Ok(SseEventKind::Data)
+    }
+
+    pub(crate) fn error_event(self, mut payload: serde_json::Value) -> bytes::Bytes {
+        if self == Self::Anthropic {
+            payload["type"] = serde_json::json!("error");
+            // Internal gateway codes remain useful diagnostic extensions, while
+            // Anthropic clients receive a recognized native error type.
+            if payload["error"]["type"]
+                .as_str()
+                .is_none_or(|t| !t.ends_with("_error"))
+            {
+                payload["error"]["type"] = serde_json::json!("api_error");
+            }
+            bytes::Bytes::from(format!("event: error\ndata: {payload}\n\n"))
+        } else {
+            bytes::Bytes::from(format!("data: {payload}\n\n"))
+        }
+    }
+}
 
 /// Recognize an event whose complete data is `[DONE]`, including its blank
 /// line terminator. Network chunks need not align with lines or events.
@@ -52,7 +137,33 @@ impl SseDoneDetector {
 
 #[cfg(test)]
 mod tests {
-    use super::SseDoneDetector;
+    use super::{SseDoneDetector, SseEventKind, SseProtocol};
+
+    #[test]
+    fn native_event_kinds_do_not_confuse_metadata_literals_and_terminal() {
+        let protocol = SseProtocol::Anthropic;
+        for event in [
+            b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n".as_slice(),
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"message_stop [DONE]\"}}\n\n",
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+            b": ping\n\n",
+        ] { assert_eq!(protocol.inspect(event).unwrap(), SseEventKind::Data); }
+        assert_eq!(
+            protocol
+                .inspect(b"event: message_stop\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n")
+                .unwrap(),
+            SseEventKind::Done
+        );
+        assert_eq!(
+            protocol.inspect(b"event: error\ndata: {}\n\n").unwrap(),
+            SseEventKind::Error
+        );
+        assert!(protocol.inspect(b"data: [DONE]\n\n").is_err());
+        assert_eq!(
+            SseProtocol::OpenAi.inspect(b"data: [DONE]\n\n").unwrap(),
+            SseEventKind::Done
+        );
+    }
 
     #[test]
     fn done_requires_complete_event_at_every_pair_of_chunk_boundaries() {

@@ -51,7 +51,7 @@ use crate::{
         error,
         grpc::utils::{error_type_from_status, route_to_endpoint},
         header_utils,
-        sse::SseDoneDetector,
+        sse::{SseDoneDetector, SseEventKind, SseProtocol},
         streaming_utils::BreakerTrackedStream,
         RouterTrait,
     },
@@ -215,12 +215,12 @@ enum EarlyPrefillFailure {
 }
 
 impl EarlyPrefillFailure {
-    async fn into_response(self) -> Response {
+    async fn into_response(self, protocol: SseProtocol) -> Response {
         match self {
             Self::Response(response) => response,
             Self::Http(response, _stage) => {
                 let url = response.url().to_string();
-                PDRouter::process_prefill_response(Ok(response), &url, false)
+                PDRouter::process_prefill_for_protocol(Ok(response), &url, false, protocol)
                     .await
                     .expect_err("non-success prefill status")
             }
@@ -264,25 +264,11 @@ fn early_sse_events(
     )
 }
 
+#[cfg(test)]
 fn early_sse_error(event: &[u8]) -> Result<bool, String> {
-    let text = std::str::from_utf8(event).map_err(|e| e.to_string())?;
-    let mut data = Vec::new();
-    for line in text.lines() {
-        let (field, value) = line.split_once(':').unwrap_or((line, ""));
-        let value = value.strip_prefix(' ').unwrap_or(value);
-        if field == "event" && value == "error" {
-            return Ok(true);
-        }
-        if field == "data" {
-            data.push(value);
-        }
-    }
-    if data.is_empty() || data == ["[DONE]"] {
-        return Ok(false);
-    }
-    let value: Value = serde_json::from_str(&data.join("\n")).map_err(|e| e.to_string())?;
-    Ok(value.get("error").is_some_and(|e| !e.is_null())
-        || value.get("object").and_then(Value::as_str) == Some("error"))
+    SseProtocol::OpenAi
+        .inspect(event)
+        .map(|kind| kind == SseEventKind::Error)
 }
 
 fn prefill_stage_reservation_from_env() -> bool {
@@ -611,6 +597,38 @@ impl PDRouter {
         raw_body: &Value,
         model_id: Option<&str>,
     ) -> Response {
+        let request_text = if self.policies_need_request_text() || self.pd_prefill_stage_reservation
+        {
+            Self::build_chat_request_text(body)
+        } else {
+            None
+        };
+        self.route_conversation_value(
+            headers,
+            raw_body,
+            model_id,
+            "/v1/chat/completions",
+            body.stream,
+            body.logprobs,
+            Self::get_chat_batch_size(body),
+            request_text,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn route_conversation_value(
+        &self,
+        headers: Option<&HeaderMap>,
+        raw_body: &Value,
+        model_id: Option<&str>,
+        route: &'static str,
+        is_stream: bool,
+        return_logprob: bool,
+        batch_size: Option<usize>,
+        request_text: Option<String>,
+    ) -> Response {
+        let protocol = SseProtocol::for_route(route);
         let tokens = if let Some(affinity) = &self.chat_affinity {
             // CPU work is independent of the final P/D rank selection.
             let worker = self
@@ -622,17 +640,11 @@ impl PDRouter {
                 .min_by(|a, b| a.base_url().cmp(b.base_url()));
             if let Some(worker) = worker {
                 affinity
-                    .tokenize(&self.client, worker.as_ref(), raw_body)
+                    .tokenize(&self.client, worker.as_ref(), raw_body, protocol)
                     .await
             } else {
                 None
             }
-        } else {
-            None
-        };
-        let request_text = if self.policies_need_request_text() || self.pd_prefill_stage_reservation
-        {
-            Self::build_chat_request_text(body)
         } else {
             None
         };
@@ -657,16 +669,16 @@ impl PDRouter {
         let forwarded = self.chat_affinity.as_ref().and_then(|affinity| {
             tokens
                 .as_deref()
-                .and_then(|ids| affinity.body_with_prompt_ids(raw_body, ids))
+                .and_then(|ids| affinity.body_with_prompt_ids(raw_body, ids, protocol))
         });
         if forwarded.is_some() {
             metrics::counter!("smg_pd_chat_prompt_ids_reused_total").increment(1);
         }
         let context = PDRequestContext {
-            route: "/v1/chat/completions",
-            batch_size: Self::get_chat_batch_size(body),
-            is_stream: body.stream,
-            return_logprob: body.logprobs,
+            route,
+            batch_size,
+            is_stream,
+            return_logprob,
             request_text,
             tokens,
             estimated_tokens,
@@ -1041,6 +1053,13 @@ impl PDRouter {
         decode: Arc<dyn Worker>,
     ) -> Response {
         let status = res.status();
+        if SseProtocol::for_route(context.route) == SseProtocol::Anthropic {
+            // This path has no tracked SSE body to own D's breaker outcome.
+            if context.is_stream {
+                decode.record_outcome(status.is_client_error());
+            }
+            return Self::native_backend_response(res).await;
+        }
 
         if context.is_stream {
             // Handle streaming error response
@@ -1069,10 +1088,7 @@ impl PDRouter {
                 }
             };
 
-            let sse_data = format!(
-                "data: {{'error': {}}}",
-                serde_json::to_string(&error_payload).unwrap_or_default()
-            );
+            let sse_data = format!("data: {}\n\n", json!({"error": error_payload}));
             let error_stream = tokio_stream::once(Ok(axum::body::Bytes::from(sse_data)));
 
             self.create_streaming_response(
@@ -1194,6 +1210,7 @@ impl PDRouter {
         decode_reservation: &mut Option<PDReservationLease>,
         _start_time: Instant,
     ) -> Response {
+        let protocol = SseProtocol::for_route(context.route);
         // P's guard and lease were acquired immediately after selection. They
         // remain live through the P body, including while D runs concurrently.
         let _decode_guard =
@@ -1219,20 +1236,27 @@ impl PDRouter {
         };
 
         // Build both requests
-        let prefill_request = self.build_post_with_headers(
+        let mut prefill_request = self.build_post_with_headers(
             &self.client,
             &prepared_prefill.endpoint_url,
             &prepared_prefill.body,
             headers,
             false,
         );
-        let decode_request = self.build_post_with_headers(
+        let mut decode_request = self.build_post_with_headers(
             &self.client,
             &prepared_decode.endpoint_url,
             &prepared_decode.body,
             headers,
             false,
         );
+
+        if protocol == SseProtocol::Anthropic {
+            prefill_request =
+                Self::authorize_native_backend(prefill_request, prefill.as_ref(), headers);
+            decode_request =
+                Self::authorize_native_backend(decode_request, decode.as_ref(), headers);
+        }
 
         // Run both in this handler task (not a detached tokio::spawn) so a client
         // disconnect cancels the pending decode request too, keeping the
@@ -1315,14 +1339,20 @@ impl PDRouter {
             prefill.record_outcome(prefill_ok);
 
             // Status-faithful error shaping (including P's 500; transport -> 502).
-            let mut response =
-                match Self::process_prefill_response(prefill_result, prefill.url(), false).await {
-                    Err(error_response) => error_response,
-                    Ok(_) => error::bad_gateway(
-                        "prefill_server_error",
-                        "Prefill reported failure but returned a success response".to_string(),
-                    ),
-                };
+            let mut response = match Self::process_prefill_for_protocol(
+                prefill_result,
+                prefill.url(),
+                false,
+                protocol,
+            )
+            .await
+            {
+                Err(error_response) => error_response,
+                Ok(_) => error::bad_gateway(
+                    "prefill_server_error",
+                    "Prefill reported failure but returned a success response".to_string(),
+                ),
+            };
             response.extensions_mut().insert(BreakerOutcomesRecorded);
             return response;
         }
@@ -1338,10 +1368,11 @@ impl PDRouter {
             drop(prefill_result);
             None
         } else {
-            let prefill_body_fut = Self::process_prefill_response(
+            let prefill_body_fut = Self::process_prefill_for_protocol(
                 prefill_result,
                 prefill.url(),
                 context.return_logprob,
+                protocol,
             );
             tokio::pin!(prefill_body_fut);
             loop {
@@ -1363,7 +1394,15 @@ impl PDRouter {
         };
         let prefill_body = match prefill_body_result {
             Some(Ok((_, body))) => body,
-            Some(Err(error_response)) => return error_response,
+            Some(Err(mut error_response)) => {
+                if protocol == SseProtocol::Anthropic {
+                    prefill.record_outcome(false);
+                    error_response
+                        .extensions_mut()
+                        .insert(BreakerOutcomesRecorded);
+                }
+                return error_response;
+            }
             None => None,
         };
         drop(prefill_stage);
@@ -1505,8 +1544,10 @@ impl PDRouter {
     }
 
     fn use_chat_early_stream(&self, context: &PDRequestContext<'_>, raw: &Value) -> bool {
-        self.pd_chat_early_stream
-            && context.route == "/v1/chat/completions"
+        if context.route == "/v1/messages" {
+            return context.is_stream;
+        }
+        self.pd_chat_early_stream && context.route == "/v1/chat/completions"
             && context.is_stream
             && !context.return_logprob
             // Raw extensions are preserved by the Chat route. Conservatively
@@ -1516,7 +1557,10 @@ impl PDRouter {
                 .all(|key| raw.get(*key).is_none_or(|v| v.is_null() || v == &json!(false)))
     }
 
-    async fn consume_early_prefill(response: reqwest::Response) -> Result<(), String> {
+    async fn consume_early_prefill(
+        response: reqwest::Response,
+        protocol: SseProtocol,
+    ) -> Result<(), String> {
         let is_sse = response
             .headers()
             .get(CONTENT_TYPE)
@@ -1528,13 +1572,17 @@ impl PDRouter {
             let mut done = false;
             while let Some(event) = events.next().await {
                 let event = event?;
-                if early_sse_error(&event)? {
-                    return Err(String::from_utf8_lossy(&event).into_owned());
+                match protocol.inspect(&event)? {
+                    SseEventKind::Error => return Err(String::from_utf8_lossy(&event).into_owned()),
+                    SseEventKind::Done => {
+                        done = true;
+                        break;
+                    }
+                    SseEventKind::Data => {}
                 }
-                done |= SseDoneDetector::default().feed(&event);
             }
             if !done {
-                return Err("Prefill SSE ended without [DONE]".to_string());
+                return Err("Prefill SSE ended without a terminal event".to_string());
             }
         } else {
             let mut stream = response.bytes_stream();
@@ -1549,7 +1597,9 @@ impl PDRouter {
             if serde_json::from_slice::<Value>(&body)
                 .ok()
                 .is_some_and(|v| {
-                    v.get("error").is_some_and(|e| !e.is_null()) || v["object"] == "error"
+                    v.get("error").is_some_and(|e| !e.is_null())
+                        || v["object"] == "error"
+                        || v["type"] == "error"
                 })
             {
                 return Err(String::from_utf8_lossy(&body).into_owned());
@@ -1562,11 +1612,12 @@ impl PDRouter {
         request: reqwest::RequestBuilder,
         worker: Arc<dyn Worker>,
         stage: PrefillStage,
+        protocol: SseProtocol,
     ) -> Result<(), EarlyPrefillFailure> {
         let result = request.send().await;
         match result {
             Ok(response) if response.status().is_success() => {
-                let result = Self::consume_early_prefill(response).await;
+                let result = Self::consume_early_prefill(response, protocol).await;
                 worker.record_outcome(result.is_ok());
                 result.map_err(|message| {
                     EarlyPrefillFailure::Response(error::bad_gateway(
@@ -1591,7 +1642,12 @@ impl PDRouter {
 
     // Once D headers have escaped, HTTP status/retry cannot express a late P
     // failure. Preserve the gateway error object and add its status in-band.
-    async fn early_stream_error(response: Response) -> bytes::Bytes {
+    async fn early_stream_error(response: Response, protocol: SseProtocol) -> bytes::Bytes {
+        let response = if protocol == SseProtocol::Anthropic {
+            crate::routers::anthropic::normalize_error(response).await
+        } else {
+            response
+        };
         let status = response.status().as_u16();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -1599,7 +1655,7 @@ impl PDRouter {
         let mut payload: Value = serde_json::from_slice(&body)
             .unwrap_or_else(|_| json!({"error":{"message":"PD stream failed"}}));
         payload["error"]["status"] = json!(status);
-        bytes::Bytes::from(format!("data: {payload}\n\n"))
+        protocol.error_event(payload)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1613,6 +1669,7 @@ impl PDRouter {
         prefill_stage: PrefillStage,
         decode_reservation: &mut Option<PDReservationLease>,
     ) -> Response {
+        let protocol = SseProtocol::for_route(context.route);
         // Reuse the configured request budget, starting before either send.
         // Reqwest's body timeout alone cannot run while D is backpressured.
         let deadline = tokio::time::Instant::now() + self.pd_chat_early_stream_timeout;
@@ -1620,6 +1677,7 @@ impl PDRouter {
             prefill_request,
             prefill,
             prefill_stage,
+            protocol,
         )));
         let mut decode_fut = Box::pin(decode_request.send());
         let response = loop {
@@ -1629,10 +1687,15 @@ impl PDRouter {
                     prefill = None;
                     if let Err(failure) = result {
                         drop(decode_fut);
-                        let mut response = failure.into_response().await;
+                        let mut response = failure.into_response(protocol).await;
                         response.extensions_mut().insert(BreakerOutcomesRecorded);
                         return response;
                     }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    let mut response = error::create_error(StatusCode::GATEWAY_TIMEOUT, "pd_stream_timeout", "PD stream exceeded the configured request timeout");
+                    response.extensions_mut().insert(BreakerOutcomesRecorded);
+                    return response;
                 }
                 result = &mut decode_fut => {
                     match result {
@@ -1684,7 +1747,7 @@ impl PDRouter {
                             if let Err(failure) = result {
                                 // Cancel D before waiting for downstream capacity.
                                 drop(decode.take());
-                                pending = Some(Self::early_stream_error(failure.into_response().await).await);
+                                pending = Some(Self::early_stream_error(failure.into_response(protocol).await, protocol).await);
                                 done = None;
                                 terminal = true;
                             }
@@ -1702,14 +1765,14 @@ impl PDRouter {
                         event = async { decode.as_mut().unwrap().next().await },
                             if decode.is_some() && pending.is_none() => {
                             let event = match event {
-                                Some(Ok(event)) => match early_sse_error(&event) {
-                                    Ok(is_error) => {
-                                        if is_error {
+                                Some(Ok(event)) => match protocol.inspect(&event) {
+                                    Ok(kind) => {
+                                        if kind == SseEventKind::Error {
                                             decode.as_mut().unwrap().mark_errored();
                                             drop(decode.take());
                                             drop(prefill.take());
                                             terminal = true;
-                                        } else if SseDoneDetector::default().feed(&event) {
+                                        } else if kind == SseEventKind::Done {
                                             decode.as_mut().unwrap().mark_completed();
                                             drop(decode.take());
                                             done = Some(event);
@@ -1720,7 +1783,7 @@ impl PDRouter {
                                     Err(e) => Err(e),
                                 },
                                 Some(Err(e)) => Err(e),
-                                None => Err("Decode SSE ended without [DONE]".to_string()),
+                                None => Err("Decode SSE ended without a terminal event".to_string()),
                             };
                             pending = Some(match event {
                                 Ok(event) => event,
@@ -1729,7 +1792,7 @@ impl PDRouter {
                                     drop(decode.take());
                                     drop(prefill.take());
                                     terminal = true;
-                                    Self::early_stream_error(error::bad_gateway("decode_stream_error", message)).await
+                                    Self::early_stream_error(error::bad_gateway("decode_stream_error", message), protocol).await
                                 }
                             });
                         }
@@ -1755,7 +1818,7 @@ impl PDRouter {
                     "message": "PD stream exceeded the configured request timeout",
                     "status": StatusCode::GATEWAY_TIMEOUT.as_u16(),
                 }});
-                let event = bytes::Bytes::from(format!("data: {payload}\n\n"));
+                let event = protocol.error_event(payload);
                 // Single-slot notification never waits for downstream capacity.
                 let _ = timeout_tx.send(event);
             }
@@ -2209,6 +2272,43 @@ impl PDRouter {
         }
     }
 
+    async fn native_backend_response(response: reqwest::Response) -> Response {
+        let status = response.status();
+        let headers = header_utils::preserve_response_headers(response.headers());
+        let body = Body::from_stream(response.bytes_stream());
+        let mut response = Response::new(body);
+        *response.status_mut() = status;
+        *response.headers_mut() = headers;
+        crate::routers::anthropic::normalize_error(response).await
+    }
+
+    async fn process_prefill_for_protocol(
+        result: Result<reqwest::Response, reqwest::Error>,
+        url: &str,
+        return_logprob: bool,
+        protocol: SseProtocol,
+    ) -> Result<(StatusCode, Option<bytes::Bytes>), Response> {
+        if protocol == SseProtocol::OpenAi {
+            return Self::process_prefill_response(result, url, return_logprob).await;
+        }
+        match result {
+            Ok(response) if response.status().is_success() => {
+                let status = response.status();
+                Self::consume_early_prefill(response, protocol)
+                    .await
+                    .map(|_| (status, None))
+                    .map_err(|message| {
+                        crate::routers::anthropic::error(StatusCode::BAD_GATEWAY, message)
+                    })
+            }
+            Ok(response) => Err(Self::native_backend_response(response).await),
+            Err(error) => Err(crate::routers::anthropic::error(
+                StatusCode::BAD_GATEWAY,
+                error.to_string(),
+            )),
+        }
+    }
+
     // Helper to process prefill response and extract body if needed for logprobs
     async fn process_prefill_response(
         prefill_result: Result<reqwest::Response, reqwest::Error>,
@@ -2302,6 +2402,25 @@ impl PDRouter {
         };
 
         Ok((prefill_status, prefill_body))
+    }
+
+    fn authorize_native_backend(
+        mut request: reqwest::RequestBuilder,
+        worker: &dyn Worker,
+        headers: Option<&HeaderMap>,
+    ) -> reqwest::RequestBuilder {
+        if let Some(key) = worker.api_key() {
+            request = request.bearer_auth(key);
+        } else if let Some(headers) = headers {
+            // Anthropic SDKs use x-api-key; SGLang's HTTP backend uses bearer
+            // authentication. Explicit worker credentials take precedence.
+            if !headers.contains_key(axum::http::header::AUTHORIZATION) {
+                if let Some(key) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+                    request = request.bearer_auth(key);
+                }
+            }
+        }
+        request
     }
 
     fn build_post_with_headers(
@@ -2564,6 +2683,84 @@ impl RouterTrait for PDRouter {
             .await
     }
 
+    async fn route_messages(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &Value,
+        model_id: Option<&str>,
+    ) -> Response {
+        use crate::routers::anthropic;
+        if let Err(message) = anthropic::validate(body, false) {
+            return anthropic::error(StatusCode::BAD_REQUEST, message);
+        }
+        let mut raw = body.clone();
+        // Internal prompt IDs may only come from this request's authoritative
+        // tokenizer result under ChatAffinity's existing opt-in/media safeguards.
+        if let Some(object) = raw.as_object_mut() {
+            object.remove("input_ids");
+            object.remove("routed_dp_rank");
+        }
+        let text = (self.policies_need_request_text() || self.pd_prefill_stage_reservation)
+            .then(|| serde_json::to_string(&json!({
+                "system": raw.get("system"), "tools": raw.get("tools"), "messages": raw.get("messages")
+            })).ok()).flatten();
+        let response = self
+            .route_conversation_value(
+                headers,
+                &raw,
+                model_id,
+                "/v1/messages",
+                raw.get("stream").and_then(Value::as_bool).unwrap_or(false),
+                false,
+                None,
+                text,
+            )
+            .await;
+        anthropic::normalize_error(response).await
+    }
+
+    async fn route_messages_count_tokens(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &Value,
+        model_id: Option<&str>,
+    ) -> Response {
+        use crate::routers::anthropic;
+        if let Err(message) = anthropic::validate(body, true) {
+            return anthropic::error(StatusCode::BAD_REQUEST, message);
+        }
+        let worker = self
+            .worker_registry
+            .get_prefill_workers()
+            .into_iter()
+            .filter(|w| w.is_available())
+            .filter(|w| !self.enable_igw || model_id.is_none_or(|m| w.model_id() == m))
+            .min_by(|a, b| a.base_url().cmp(b.base_url()));
+        let Some(worker) = worker else {
+            return anthropic::error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No prefill server available for token counting",
+            );
+        };
+        // CPU-only proxy: no P/D pair, bootstrap, leases, inference load,
+        // affinity tokenization or inference breaker outcomes.
+        let request = self.build_post_with_headers(
+            &self.client,
+            &Self::worker_endpoint_url(worker.as_ref(), "/v1/messages/count_tokens"),
+            body,
+            headers,
+            false,
+        );
+        let request = Self::authorize_native_backend(request, worker.as_ref(), headers);
+        match request.send().await {
+            Ok(response) => Self::native_backend_response(response).await,
+            Err(_) => anthropic::error(
+                StatusCode::BAD_GATEWAY,
+                "Token counting upstream request failed",
+            ),
+        }
+    }
+
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,
@@ -2676,6 +2873,8 @@ impl RouterTrait for PDRouter {
 
 #[cfg(test)]
 mod tests {
+    include!("pd_router/messages_tests.rs");
+
     use super::*;
     use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder, WorkerType};
 
@@ -2991,6 +3190,14 @@ mod tests {
     }
 
     async fn early_chat_mock(status: StatusCode, sse: bool) -> EarlyChatMock {
+        early_protocol_mock(status, sse, "/v1/chat/completions").await
+    }
+
+    async fn early_protocol_mock(
+        status: StatusCode,
+        sse: bool,
+        route: &'static str,
+    ) -> EarlyChatMock {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3013,7 +3220,7 @@ mod tests {
                     request.extend_from_slice(&buf[..n]);
                     if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
                         let head = String::from_utf8_lossy(&request[..end]);
-                        assert!(head.starts_with("POST /v1/chat/completions "));
+                        assert!(head.starts_with(&format!("POST {route} ")));
                         let len: usize = head
                             .lines()
                             .find_map(|line| {

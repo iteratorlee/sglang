@@ -208,6 +208,8 @@ pub fn should_forward_request_header(name: &str) -> bool {
     const REQUEST_ID_PREFIX: &str = "x-request-id-";
 
     name.eq_ignore_ascii_case("authorization")
+        || name.eq_ignore_ascii_case("anthropic-version")
+        || name.eq_ignore_ascii_case("anthropic-beta")
         || name.eq_ignore_ascii_case("x-request-id")
         || name.eq_ignore_ascii_case("x-correlation-id")
         || name.eq_ignore_ascii_case("traceparent")

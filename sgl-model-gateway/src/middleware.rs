@@ -124,10 +124,24 @@ pub async fn auth_middleware(
             .get(header::AUTHORIZATION)
             .and_then(|h| h.to_str().ok());
 
-        match auth_header {
-            Some(header_value) if header_value.starts_with("Bearer ") => {
-                let token = &header_value[7..]; // Skip "Bearer "
-                                                // Use constant-time comparison to prevent timing attacks
+        let token = auth_header
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .or_else(|| {
+                matches!(
+                    request.uri().path(),
+                    "/v1/messages" | "/v1/messages/count_tokens"
+                )
+                .then(|| {
+                    request
+                        .headers()
+                        .get("x-api-key")
+                        .and_then(|v| v.to_str().ok())
+                })
+                .flatten()
+            });
+        match token {
+            Some(token) => {
+                // Use constant-time comparison to prevent timing attacks
                 let token_bytes = token.as_bytes();
                 let expected_bytes = expected_key.as_bytes();
 
@@ -691,7 +705,7 @@ where
                 method == "POST"
                     && matches!(
                         req.uri().path(),
-                        "/generate" | "/v1/chat/completions" | "/v1/completions"
+                        "/generate" | "/v1/chat/completions" | "/v1/completions" | "/v1/messages"
                     )
             })
             .cloned();

@@ -21,6 +21,7 @@ use crate::protocols::{
     responses::{ResponsesGetParams, ResponsesRequest},
 };
 
+pub(crate) mod anthropic;
 pub mod conversations;
 pub mod error;
 pub mod factory;
@@ -122,6 +123,26 @@ pub trait RouterTrait: Send + Sync + Debug {
         model_id: Option<&str>,
     ) -> Response {
         self.route_chat(headers, body, model_id).await
+    }
+
+    /// Native Anthropic requests keep their full JSON envelope.
+    async fn route_messages(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &Value,
+        _model_id: Option<&str>,
+    ) -> Response {
+        anthropic::unsupported()
+    }
+
+    /// CPU-only counting must never dispatch a generation request.
+    async fn route_messages_count_tokens(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &Value,
+        _model_id: Option<&str>,
+    ) -> Response {
+        anthropic::unsupported()
     }
 
     /// Route a completion request
@@ -229,5 +250,54 @@ pub trait RouterTrait: Send + Sync + Debug {
     /// Check if this is a PD router
     fn is_pd_mode(&self) -> bool {
         self.router_type() == "pd"
+    }
+}
+
+#[cfg(test)]
+mod messages_tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct UnsupportedRouter;
+    #[async_trait]
+    impl RouterTrait for UnsupportedRouter {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn router_type(&self) -> &'static str {
+            "unsupported"
+        }
+        async fn route_chat(
+            &self,
+            _: Option<&HeaderMap>,
+            _: &ChatCompletionRequest,
+            _: Option<&str>,
+        ) -> Response {
+            StatusCode::NOT_IMPLEMENTED.into_response()
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_default_modes_fail_explicitly() {
+        let router = UnsupportedRouter;
+        for response in [
+            router
+                .route_messages(None, &serde_json::json!({}), None)
+                .await,
+            router
+                .route_messages_count_tokens(None, &serde_json::json!({}), None)
+                .await,
+        ] {
+            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["type"], "error");
+            assert!(value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("HTTP prefill/decode"));
+        }
     }
 }

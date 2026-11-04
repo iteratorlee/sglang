@@ -68,6 +68,37 @@ pub struct RouterManager {
 }
 
 impl RouterManager {
+    async fn route_native_messages(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &Value,
+        model_id: Option<&str>,
+        count_tokens: bool,
+    ) -> Response {
+        let effective = if self.enable_igw {
+            match self.resolve_model_id(model_id.or_else(|| body["model"].as_str())) {
+                Ok(id) => Some(id),
+                Err(response) => return super::anthropic::normalize_error(*response).await,
+            }
+        } else {
+            None
+        };
+        let model_id = effective.as_deref().or(model_id);
+        let Some(router) = self.select_router_for_request(headers, model_id) else {
+            return super::anthropic::error(
+                StatusCode::NOT_FOUND,
+                "No router available for this model",
+            );
+        };
+        if count_tokens {
+            router
+                .route_messages_count_tokens(headers, body, model_id)
+                .await
+        } else {
+            router.route_messages(headers, body, model_id).await
+        }
+    }
+
     pub fn new(worker_registry: Arc<WorkerRegistry>) -> Self {
         Self {
             worker_registry,
@@ -629,6 +660,26 @@ impl RouterTrait for RouterManager {
             )
                 .into_response()
         }
+    }
+
+    async fn route_messages(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &Value,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_native_messages(headers, body, model_id, false)
+            .await
+    }
+
+    async fn route_messages_count_tokens(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &Value,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_native_messages(headers, body, model_id, true)
+            .await
     }
 
     async fn route_completion(

@@ -352,3 +352,134 @@ fn standalone_final_usage_and_malformed_event_do_not_infer_timing() {
     assert!(out.timing_incomplete);
     assert_eq!(out.tpot(), None);
 }
+
+#[test]
+fn messages_semantic_tool_thinking_usage_and_stop() {
+    let start = Instant::now();
+    let mut out = OutputObservation::default();
+    observe(
+        &mut out,
+        json!({"type":"message_start", "message":{"role":"assistant", "content":[], "usage":{"input_tokens":5,"cache_read_input_tokens":10,"cache_creation_input_tokens":3,"output_tokens":0}}}),
+        start,
+    );
+    observe(
+        &mut out,
+        json!({"type":"content_block_start", "content_block":{"type":"tool_use", "id":"t1", "name":"read", "input":{}}}),
+        start,
+    );
+    observe(
+        &mut out,
+        json!({"type":"content_block_delta", "delta":{"type":"signature_delta", "signature":"sig"}}),
+        start,
+    );
+    assert!(out.first_semantic.is_none());
+    assert!(out.first_visible.is_none());
+    assert!(!out.final_usage);
+    observe(
+        &mut out,
+        json!({"type":"content_block_delta", "delta":{"type":"thinking_delta", "thinking":"reason"}}),
+        start + Duration::from_secs(1),
+    );
+    assert_eq!(out.first_semantic, Some(start + Duration::from_secs(1)));
+    assert!(out.first_visible.is_none());
+    observe(
+        &mut out,
+        json!({"type":"content_block_delta", "delta":{"type":"input_json_delta", "partial_json":"{}"}}),
+        start + Duration::from_secs(2),
+    );
+    assert_eq!(out.first_visible, Some(start + Duration::from_secs(2)));
+    observe(
+        &mut out,
+        json!({"type":"message_delta", "delta":{"stop_reason":"tool_use"}, "usage":{"output_tokens":3}}),
+        start + Duration::from_secs(3),
+    );
+    assert!(!out.terminal);
+    assert_eq!((out.prompt, out.completion), (Some(18), Some(3)));
+    assert_eq!(out.tpot(), Some(0.5));
+    observe(
+        &mut out,
+        json!({"type":"message_stop"}),
+        start + Duration::from_secs(4),
+    );
+    assert!(out.terminal);
+    assert!(out.final_usage);
+    assert!(!out.errored);
+}
+
+#[tokio::test]
+async fn messages_metrics_split_frames_preserve_bytes_and_record_actual_usage() {
+    let bytes = b"event: message_start\r\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":8,\"output_tokens\":0}}}\r\n\r\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    for split in 0..=bytes.len() {
+        let (m, h) = recorder();
+        let response = wrap(
+            m,
+            sse_body(vec![bytes[..split].to_vec(), bytes[split..].to_vec()]),
+            true,
+            StatusCode::OK,
+        );
+        assert_eq!(
+            &response.into_body().collect().await.unwrap().to_bytes()[..],
+            bytes
+        );
+        assert_eq!(
+            series(&h, "llm_gateway_requests_total", &["outcome=\"success\""]),
+            1.
+        );
+        assert_eq!(series(&h, "llm_gateway_prompt_tokens_total", &[]), 8.);
+        assert_eq!(series(&h, "llm_gateway_output_tokens_total", &[]), 2.);
+        assert_eq!(series(&h, "llm_gateway_usage_missing_total", &[]), 0.);
+    }
+}
+
+#[tokio::test]
+async fn messages_start_only_error_and_unterminated_stream_are_not_successes() {
+    for tail in ["", "event: error\ndata: {}\n\n", "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":2},\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n"] {
+        let (m, h) = recorder();
+        let bytes = format!("event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":8,\"output_tokens\":0}}}}}}\n\n{tail}");
+        let response = wrap(m, sse_body(vec![bytes.into_bytes()]), true, StatusCode::OK);
+        response.into_body().collect().await.unwrap();
+        assert_eq!(series(&h, "llm_gateway_requests_total", &["outcome=\"error\""]), 1.);
+        assert_eq!(series(&h, "llm_gateway_requests_total", &["outcome=\"success\""]), 0.);
+    }
+}
+
+#[tokio::test]
+async fn messages_client_finishes_at_message_stop_without_http_eof() {
+    let (m, h) = recorder();
+    let body = Body::from_stream(stream::iter([Ok::<_, Infallible>(Bytes::from_static(
+        b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":8,\"output_tokens\":0}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":2}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    ))]).chain(stream::pending()));
+    let response = wrap(m, body, true, StatusCode::OK);
+    let mut body = response.into_body();
+    body.frame().await.unwrap().unwrap();
+    drop(body);
+    assert_eq!(
+        series(&h, "llm_gateway_requests_total", &["outcome=\"success\""]),
+        1.
+    );
+    assert_eq!(
+        series(&h, "llm_gateway_requests_total", &["outcome=\"cancelled\""]),
+        0.
+    );
+    assert_eq!(series(&h, "llm_gateway_output_tokens_total", &[]), 2.);
+}
+
+#[tokio::test]
+async fn messages_client_stops_at_error_without_http_eof() {
+    let (m, h) = recorder();
+    let body = Body::from_stream(stream::iter([Ok::<_, Infallible>(Bytes::from_static(
+        b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"failed\"}}\n\n",
+    ))]).chain(stream::pending()));
+    let response = wrap(m, body, true, StatusCode::OK);
+    let mut body = response.into_body();
+    body.frame().await.unwrap().unwrap();
+    drop(body);
+    assert_eq!(
+        series(&h, "llm_gateway_requests_total", &["outcome=\"error\""]),
+        1.
+    );
+    assert_eq!(
+        series(&h, "llm_gateway_requests_total", &["outcome=\"cancelled\""]),
+        0.
+    );
+}
