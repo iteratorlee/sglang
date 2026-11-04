@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import math
 from typing import List, Tuple, Union
@@ -10,6 +11,7 @@ from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration
 from sglang.srt.models.glm4v_moe import Glm4vMoeForConditionalGeneration
+from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -34,6 +36,54 @@ GLM_VIDEO_DEFAULT_MAX_FRAMES = 2048
 GLM_VIDEO_PATCH_SIZE = 14
 GLM_VIDEO_MERGE_SIZE = 2
 GLM_VIDEO_PATCH_EXPAND_FACTOR = 4
+
+
+def _glm_vision_cache_layout(value):
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        # The content hash alone does not retain tensor segment boundaries.
+        return {
+            "type": type(value).__name__,
+            "items": [_glm_vision_cache_layout(part) for part in value],
+        }
+    return {"shape": list(value.shape), "dtype": str(value.dtype)}
+
+
+def _glm_vision_cache_namespace(item):
+    """Describe GLM vision inputs independently of their prompt placement."""
+    grids = {}
+    for name in ("image_grid_thw", "video_grid_thw"):
+        grid = getattr(item, name, None)
+        if grid is not None:
+            grids[name] = {
+                "layout": _glm_vision_cache_layout(grid),
+                # Ordered rows include temporal/spatial segment boundaries.
+                "values": grid.tolist(),
+            }
+    dp_sharded = bool(getattr(item, "dp_decode_sharded", False))
+    dp_meta = None
+    if dp_sharded:
+        meta = item.dp_meta
+        dp_meta = {
+            "n_units": int(meta["n_units"]),
+            "gpu_sample_counts": [int(count) for count in meta["gpu_sample_counts"]],
+        }
+    payload = {
+        "version": "glm-vision-input-v1",
+        "modality": item.modality.name,
+        "feature": _glm_vision_cache_layout(item.feature),
+        "precomputed_embeddings": _glm_vision_cache_layout(item.precomputed_embeddings),
+        "grids": grids,
+        "dp_decode_sharded": dp_sharded,
+        "dp_meta": dp_meta,
+    }
+    return (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
 
 
 def _glm_video_metadata(total_num_frames, fps, duration, frames_indices):
@@ -489,6 +539,26 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             # silently change the model input. The vision encoder runs on NPU.
             return "cpu"
         return super()._fast_image_processor_device(processor)
+
+    def _postprocess_mm_items_before_transport(self, mm_items, *, images):
+        for item in mm_items:
+            if item.modality not in (Modality.IMAGE, Modality.VIDEO):
+                continue
+            # This hook runs after image/video splitting, before transport and
+            # token padding. Recompute from the final payload: an earlier hash
+            # may be unscoped, or belong to a bundled item whose pad_value was
+            # copied by splitting. set_hash refreshes hash and pad_value together
+            # and re-finalizing cannot accidentally namespace an existing hash.
+            # Precomputed embeddings also retain grid/layout identity for prefix
+            # padding, even though they bypass vision in mm_schedule.
+            item.set_hash(
+                resolve_multimodal_item_hash(
+                    feature=item.feature,
+                    precomputed_embeddings=item.precomputed_embeddings,
+                    namespace=_glm_vision_cache_namespace(item),
+                )
+            )
+        return mm_items
 
     def get_mm_item_offsets(
         self,
