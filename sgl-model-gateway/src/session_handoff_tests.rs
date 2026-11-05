@@ -66,13 +66,13 @@ fn bounded_first_turn_rejects_history_tools_images_and_large_bodies() {
         ));
     }
     assert!(HandoffConfig {
-        candidate_bps: 1001,
+        candidate_bps: 5001,
         bounded_first_turn: true
     }
     .validate()
     .is_err());
     assert!(HandoffConfig {
-        candidate_bps: 1000,
+        candidate_bps: 5000,
         bounded_first_turn: true
     }
     .validate()

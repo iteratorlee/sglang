@@ -5,10 +5,11 @@
 //! Enable with SGLANG_GATEWAY_HANDOFF_LEGACY_ORIGIN=http://127.0.0.1:30266 and
 //! SGLANG_GATEWAY_HANDOFF_PIN_FILE=/absolute/persistent/path.json. Initial
 //! admission is zero. PUT /workers/session-handoff changes candidate_bps and
-//! bounded_first_turn (default false, capped at 1000 bps when enabled).
+//! bounded_first_turn (default false, capped at 5000 bps when enabled).
 //! Explicit enrollment: x-sglang-new-session: 1 plus a supported session ID.
 //! Bounded first turn describes API history, NOT proof of a historically new
-//! session. Stable IDs must be retained on every subsequent request. Pins have
+//! session; old short sessions can match this heuristic. Stable IDs must be
+//! retained on every subsequent request. Pins have
 //! no TTL/eviction; a full ledger stops enrollment. A restart restores pins,
 //! but cannot restore this gateway's PD prefix book or in-flight leases.
 
@@ -71,8 +72,8 @@ pub struct HandoffConfig {
 
 impl HandoffConfig {
     fn validate(self) -> Result<Self, &'static str> {
-        if self.candidate_bps > 10_000 || (self.bounded_first_turn && self.candidate_bps > 1000) {
-            Err("candidate_bps must be 0..10000, and at most 1000 with bounded_first_turn")
+        if self.candidate_bps > 10_000 || (self.bounded_first_turn && self.candidate_bps > 5000) {
+            Err("candidate_bps must be 0..10000, and at most 5000 with bounded_first_turn")
         } else {
             Ok(self)
         }
