@@ -54,6 +54,7 @@ pub(super) struct Activity {
     pub finished: Option<Instant>,
     pub warmed: bool,
     pub clean_end: bool,
+    pub cold_active: usize,
     pub body_bytes: usize,
 }
 pub(super) struct Runtime {
@@ -162,16 +163,21 @@ impl Drop for Lease {
             Destination::Legacy => r.active_legacy -= 1,
             Destination::Candidate => r.active_candidate -= 1,
         }
-        if self.cold {
-            r.cold_inflight -= 1;
-        }
+        let mut release_cold = self.cold && self.key.is_none();
         if let Some(a) = self.key.as_ref().and_then(|k| r.sessions.get_mut(k)) {
             a.active -= 1;
+            if self.cold {
+                a.cold_active -= 1;
+                release_cold = a.cold_active == 0;
+            }
             a.finished = Some(Instant::now());
             a.clean_end = self.completed;
             if self.destination == Destination::Candidate && self.completed {
                 a.warmed = true;
             }
+        }
+        if release_cold {
+            r.cold_inflight -= 1;
         }
         r.gauges();
     }
@@ -185,9 +191,14 @@ pub(super) fn begin(
     cold: bool,
 ) -> Lease {
     let key = key.filter(|k| r.sessions.contains_key(k) || r.sessions.len() < MAX_PINS);
+    let mut reserve_cold = cold && key.is_none();
     if let Some(k) = key.as_ref() {
         let a = r.sessions.entry(k.clone()).or_default();
         a.active += 1;
+        if cold {
+            reserve_cold = a.cold_active == 0;
+            a.cold_active += 1;
+        }
         if body_bytes > 0 {
             a.body_bytes = body_bytes;
         }
@@ -196,7 +207,7 @@ pub(super) fn begin(
         Destination::Legacy => r.active_legacy += 1,
         Destination::Candidate => r.active_candidate += 1,
     }
-    if cold {
+    if reserve_cold {
         r.cold_inflight += 1;
     }
     r.gauges();

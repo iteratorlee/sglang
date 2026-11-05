@@ -345,7 +345,11 @@ impl SessionHandoff {
                     .as_ref()
                     .and_then(|k| r.sessions.get(k))
                     .is_some_and(|a| a.warmed);
-            if cold && r.cold_inflight >= r.config.max_cold_inflight {
+            let same_cold_session = key
+                .as_ref()
+                .and_then(|k| r.sessions.get(k))
+                .is_some_and(|a| a.cold_active > 0);
+            if cold && !same_cold_session && r.cold_inflight >= r.config.max_cold_inflight {
                 // Existing candidate pins cannot fall back to legacy when the budget is full.
                 return Err(StatusCode::TOO_MANY_REQUESTS);
             }

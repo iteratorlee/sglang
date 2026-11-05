@@ -128,14 +128,16 @@ async fn cold_budget_rate_and_finite_switch_limit_are_independent() {
     let b = session_key("cold-two").unwrap();
     let (_, _, first) = f.choose(Some(a.clone()), None, true, 100).await.unwrap();
     assert_eq!(f.migration.lock().cold_inflight, 1);
-    assert!(matches!(
-        f.choose(Some(a.clone()), None, true, 100).await,
-        Err(StatusCode::TOO_MANY_REQUESTS)
-    ));
+    let (same, _, shared) = f.choose(Some(a.clone()), None, true, 100).await.unwrap();
+    assert_eq!(same, Destination::Candidate);
+    assert_eq!(f.migration.lock().cold_inflight, 1);
     let (d, _, other) = f.choose(Some(b.clone()), None, true, 100).await.unwrap();
     assert_eq!(d, Destination::Legacy);
     drop(other);
     drop(first);
+    assert_eq!(f.migration.lock().cold_inflight, 1);
+    drop(shared);
+    assert_eq!(f.migration.lock().cold_inflight, 0);
     // Freeing cold capacity alone does not bypass the assignment interval.
     age(&f, &b);
     f.migration.lock().last_assignment = Some(Instant::now());
@@ -398,4 +400,30 @@ async fn clean_eof_allows_next_turn_but_cancelled_body_keeps_minimum_grace() {
     assert_eq!(destination, Destination::Candidate);
     assert_eq!(reason, "migrated");
     drop(moved);
+}
+
+#[tokio::test]
+async fn unrelated_existing_candidate_waits_for_cold_budget_without_legacy_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = front(dir.path().join("pins.json"));
+    let one = session_key("imported-cold-one").unwrap();
+    let two = session_key("imported-cold-two").unwrap();
+    let map = BTreeMap::from([
+        (one.clone(), Destination::Candidate),
+        (two.clone(), Destination::Candidate),
+    ]);
+    assert_eq!(
+        import_pins(State(f.clone()), Json(map)).await.status(),
+        StatusCode::OK
+    );
+    let (_, _, first) = f.choose(Some(one), None, false, 0).await.unwrap();
+    assert!(matches!(
+        f.choose(Some(two.clone()), None, false, 0).await,
+        Err(StatusCode::TOO_MANY_REQUESTS)
+    ));
+    assert_eq!(f.store.lock().await.pins[&two], Destination::Candidate);
+    drop(first);
+    let (d, _, next) = f.choose(Some(two), None, false, 0).await.unwrap();
+    assert_eq!(d, Destination::Candidate);
+    drop(next);
 }
