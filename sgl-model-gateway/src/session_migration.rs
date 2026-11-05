@@ -234,9 +234,11 @@ struct GuardedBody {
     lease: Option<Lease>,
     successful: bool,
     remaining: Option<u64>,
+    sealed: bool,
 }
 impl GuardedBody {
     fn finish(&mut self) {
+        self.sealed = true;
         if let Some(mut lease) = self.lease.take() {
             lease.completed = self.successful && self.remaining.is_none_or(|n| n == 0);
             drop(lease);
@@ -251,6 +253,9 @@ impl HttpBody for GuardedBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
+        if this.sealed {
+            return Poll::Ready(None);
+        }
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(None) => {
                 this.finish();
@@ -266,6 +271,10 @@ impl HttpBody for GuardedBody {
                     let bytes = data.len() as u64;
                     if bytes > *remaining {
                         this.successful = false;
+                        this.finish();
+                        return Poll::Ready(Some(Err(axum::Error::new(io::Error::other(
+                            "response exceeds content-length",
+                        )))));
                     }
                     *remaining = remaining.saturating_sub(bytes);
                 }
@@ -280,10 +289,14 @@ impl HttpBody for GuardedBody {
         }
     }
     fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
+        self.sealed || self.inner.is_end_stream()
     }
     fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
+        if self.sealed {
+            SizeHint::with_exact(0)
+        } else {
+            self.inner.size_hint()
+        }
     }
 }
 pub(super) fn wrap(response: Response, lease: Lease) -> Response {
@@ -299,6 +312,7 @@ pub(super) fn wrap(response: Response, lease: Lease) -> Response {
         lease: Some(lease),
         successful,
         remaining,
+        sealed: false,
     };
     if guarded.inner.is_end_stream() {
         guarded.finish();

@@ -529,3 +529,54 @@ async fn truncated_content_length_is_not_a_clean_completion() {
     assert!(!f.migration.lock().sessions[&key].clean_end);
     assert_eq!(f.migration.lock().sessions[&key].active, 0);
 }
+
+#[tokio::test]
+async fn a_completed_length_seals_the_body_and_never_polls_trailing_frames() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = front(dir.path().join("pins.json"));
+    let key = session_key("sealed-length").unwrap();
+    let (_, _, lease) = f.choose(Some(key.clone()), None, false, 0).await.unwrap();
+    let frames = vec![
+        Ok(bytes::Bytes::from_static(b"done")),
+        Err(io::Error::other("outside completed HTTP framing")),
+    ];
+    let mut response = Response::new(Body::from_stream(futures_util::stream::iter(frames)));
+    response
+        .headers_mut()
+        .insert("content-length", HeaderValue::from_static("4"));
+    let mut body = wrap(response, lease).into_body();
+    let frame = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(frame.into_data().unwrap(), "done");
+    assert!(body.is_end_stream());
+    assert!(
+        std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
+            .await
+            .is_none()
+    );
+    assert!(f.migration.lock().sessions[&key].clean_end);
+}
+
+#[tokio::test]
+async fn oversized_frame_is_an_error_and_never_a_clean_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = front(dir.path().join("pins.json"));
+    let key = session_key("oversized-length").unwrap();
+    let (_, _, lease) = f.choose(Some(key.clone()), None, false, 0).await.unwrap();
+    let mut response = Response::new(Body::from_stream(futures_util::stream::iter([Ok::<
+        _,
+        Infallible,
+    >(
+        bytes::Bytes::from_static(b"too-long"),
+    )])));
+    response
+        .headers_mut()
+        .insert("content-length", HeaderValue::from_static("4"));
+    assert!(to_bytes(wrap(response, lease).into_body(), 100)
+        .await
+        .is_err());
+    assert!(!f.migration.lock().sessions[&key].clean_end);
+    assert_eq!(f.migration.lock().sessions[&key].active, 0);
+}
