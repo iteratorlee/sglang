@@ -452,3 +452,80 @@ async fn a_later_clean_parallel_response_does_not_erase_cancellation_grace() {
     assert_eq!(destination, Destination::Candidate);
     drop(safe);
 }
+
+#[tokio::test]
+async fn real_http_content_length_completion_is_clean_without_an_extra_eof_poll() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = front(dir.path().join("pins.json"));
+    let key = session_key("content-length").unwrap();
+    let endpoint_f = f.clone();
+    let endpoint_key = key.clone();
+    let app = Router::new().route(
+        "/json",
+        axum::routing::get(move || {
+            let f = endpoint_f.clone();
+            let key = endpoint_key.clone();
+            async move {
+                let (_, _, lease) = f.choose(Some(key), None, false, 0).await.unwrap();
+                let stream = futures_util::stream::iter([Ok::<_, Infallible>(
+                    bytes::Bytes::from_static(b"done"),
+                )]);
+                let mut response = Response::new(Body::from_stream(stream));
+                response
+                    .headers_mut()
+                    .insert("content-length", HeaderValue::from_static("4"));
+                wrap(response, lease)
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/json", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    assert_eq!(
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(url)
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+        "done"
+    );
+    for _ in 0..10 {
+        if f.migration.lock().sessions[&key].active == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(f.migration.lock().sessions[&key].clean_end);
+    enable(&f, 1);
+    f.migration.lock().config.quiet_secs = 0;
+    let (d, _, next) = f.choose(Some(key), None, true, 10).await.unwrap();
+    assert_eq!(d, Destination::Candidate);
+    drop(next);
+    task.abort();
+}
+
+#[tokio::test]
+async fn truncated_content_length_is_not_a_clean_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = front(dir.path().join("pins.json"));
+    let key = session_key("truncated-reply").unwrap();
+    let (_, _, lease) = f.choose(Some(key.clone()), None, false, 0).await.unwrap();
+    let mut response = Response::new(Body::from_stream(futures_util::stream::iter([Ok::<
+        _,
+        Infallible,
+    >(
+        bytes::Bytes::from_static(b"half"),
+    )])));
+    response
+        .headers_mut()
+        .insert("content-length", HeaderValue::from_static("8"));
+    assert_eq!(drain(wrap(response, lease)).await, "half");
+    assert!(!f.migration.lock().sessions[&key].clean_end);
+    assert_eq!(f.migration.lock().sessions[&key].active, 0);
+}

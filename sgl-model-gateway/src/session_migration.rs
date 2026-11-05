@@ -233,6 +233,15 @@ struct GuardedBody {
     inner: Body,
     lease: Option<Lease>,
     successful: bool,
+    remaining: Option<u64>,
+}
+impl GuardedBody {
+    fn finish(&mut self) {
+        if let Some(mut lease) = self.lease.take() {
+            lease.completed = self.successful && self.remaining.is_none_or(|n| n == 0);
+            drop(lease);
+        }
+    }
 }
 impl HttpBody for GuardedBody {
     type Data = bytes::Bytes;
@@ -244,23 +253,26 @@ impl HttpBody for GuardedBody {
         let this = self.get_mut();
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(None) => {
-                if let Some(mut lease) = this.lease.take() {
-                    lease.completed = this.successful;
-                    drop(lease);
-                }
+                this.finish();
                 Poll::Ready(None)
             }
             Poll::Ready(Some(Err(e))) => {
                 this.successful = false;
-                this.lease.take();
+                this.finish();
                 Poll::Ready(Some(Err(e)))
             }
             Poll::Ready(Some(Ok(frame))) => {
-                if this.inner.is_end_stream() {
-                    if let Some(mut lease) = this.lease.take() {
-                        lease.completed = this.successful;
-                        drop(lease);
+                if let (Some(remaining), Some(data)) = (this.remaining.as_mut(), frame.data_ref()) {
+                    let bytes = data.len() as u64;
+                    if bytes > *remaining {
+                        this.successful = false;
                     }
+                    *remaining = remaining.saturating_sub(bytes);
+                }
+                // Hyper may stop polling at Content-Length without another EOF poll.
+                // Count the unchanged frames instead of misclassifying a full reply as cancellation.
+                if this.remaining == Some(0) || this.inner.is_end_stream() {
+                    this.finish();
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
@@ -276,15 +288,22 @@ impl HttpBody for GuardedBody {
 }
 pub(super) fn wrap(response: Response, lease: Lease) -> Response {
     let successful = response.status().is_success();
+    let remaining = response
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
     let (parts, body) = response.into_parts();
-    Response::from_parts(
-        parts,
-        Body::new(GuardedBody {
-            inner: body,
-            lease: Some(lease),
-            successful,
-        }),
-    )
+    let mut guarded = GuardedBody {
+        inner: body,
+        lease: Some(lease),
+        successful,
+        remaining,
+    };
+    if guarded.inner.is_end_stream() {
+        guarded.finish();
+    }
+    Response::from_parts(parts, Body::new(guarded))
 }
 
 pub(crate) async fn status(State(front): State<Arc<SessionHandoff>>) -> Json<Value> {
