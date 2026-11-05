@@ -532,6 +532,52 @@ async fn list_workers_rest(State(state): State<Arc<AppState>>) -> Response {
     state.context.worker_service.list_workers().into_response()
 }
 
+async fn get_prefill_rollout(State(state): State<Arc<AppState>>) -> Response {
+    let policy = state.context.policy_registry.get_prefill_policy();
+    let Some(prefix) = policy
+        .as_any()
+        .downcast_ref::<crate::policies::PrefixHashPolicy>()
+    else {
+        return (StatusCode::CONFLICT, "prefill policy is not prefix_hash").into_response();
+    };
+    Json(prefix.prefill_rollout()).into_response()
+}
+
+async fn set_prefill_rollout(
+    State(state): State<Arc<AppState>>,
+    Json(config): Json<crate::policies::PrefillRollout>,
+) -> Response {
+    if !matches!(
+        state.context.router_config.mode,
+        RoutingMode::PrefillDecode { .. }
+    ) {
+        return (StatusCode::CONFLICT, "prefill rollout requires PD routing").into_response();
+    }
+    let policy = state.context.policy_registry.get_prefill_policy();
+    let Some(prefix) = policy
+        .as_any()
+        .downcast_ref::<crate::policies::PrefixHashPolicy>()
+    else {
+        return (StatusCode::CONFLICT, "prefill policy is not prefix_hash").into_response();
+    };
+    let workers = state.context.worker_registry.get_prefill_workers();
+    if config
+        .incumbent_urls
+        .iter()
+        .any(|url| !workers.iter().any(|w| w.base_url() == url))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "each incumbent URL must identify a registered P base URL",
+        )
+            .into_response();
+    }
+    match prefix.set_prefill_rollout(config) {
+        Ok(()) => Json(prefix.prefill_rollout()).into_response(),
+        Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
+    }
+}
+
 async fn get_worker(
     State(state): State<Arc<AppState>>,
     Path(worker_id_raw): Path<String>,
@@ -743,6 +789,12 @@ pub fn build_app(
     // Build worker routes
     let worker_routes = Router::new()
         .route("/workers", post(create_worker).get(list_workers_rest))
+        // Policy-only update: do not rebuild workers and reset their load,
+        // health or circuit state when changing an admission fraction.
+        .route(
+            "/workers/prefill-rollout",
+            get(get_prefill_rollout).put(set_prefill_rollout),
+        )
         .route(
             "/workers/{worker_id}",
             get(get_worker).put(update_worker).delete(delete_worker),

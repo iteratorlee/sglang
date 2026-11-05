@@ -35,11 +35,21 @@
 //! including load fallbacks, subject to all existing affinity checks. Short
 //! prompts and non-PD pools retain the original policy. This is an advisory
 //! placement observation, not an LCP index or evidence of resident cache state.
+//!
+//! Before registering extra P workers, PUT /workers/prefill-rollout with the
+//! incumbent base URLs, new_prefix_bps=0 and an owner_max_load ceiling (1..64).
+//! GET the configuration back, POST /workers, wait for healthy DP registration,
+//! then raise the prefix fraction (0..10000). No worker weight is consumed.
+//! Tokenless/short requests stay on incumbents; lowering the fraction to zero
+//! stops new placements, not existing owners. Books and rollout configuration
+//! are process-local and expire/evict: keep legacy sessions on their original
+//! gateway during deployment. A new process cannot recover an old process's
+//! observations, and shared D workers do not imply shared gateway lease caps.
 
 use std::{
     collections::{hash_map::DefaultHasher, HashMap as PlacementMap},
     hash::{Hash, Hasher},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
 
@@ -48,6 +58,7 @@ use crate::{
     core::{DPLoadSnapshot, Worker, WorkerType},
     observability::metrics::Metrics,
 };
+use serde::{Deserialize, Serialize};
 
 const LOAD_SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(3);
 const PREFILL_PLACEMENT_TTL: Duration = Duration::from_secs(7200);
@@ -55,6 +66,54 @@ const PREFILL_PLACEMENT_CAPACITY: usize = 4096;
 const MAX_PD_AFFINITY_PREFIX_TOKENS: usize = 65_536;
 
 type PlacementKey = (u64, u64); // (pool fingerprint, prefix hash)
+
+/// Process-local admission for an online P expansion. Configure before POST
+/// /workers, then raise new_prefix_bps. This is a fraction of unknown *prefixes*
+/// eligible for new P workers, not a request/traffic weight or a session ledger.
+/// Existing observations survive changes to the fraction (including zero).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PrefillRollout {
+    /// Exact real P base URLs, without @rank. Frozen on first configuration.
+    pub incumbent_urls: Vec<String>,
+    pub new_prefix_bps: u16,
+    /// Absolute effective-load ceiling for retaining a known P owner. Unlike
+    /// an average-load threshold this cannot tighten when idle P ranks join.
+    /// Includes capacity/work pressure; health and soft caps still take priority.
+    pub owner_max_load: usize,
+    /// Front-admitted candidates must use the new P group, even without token
+    /// affinity (e.g. explicit multimodal validation). Set bps=10000 before
+    /// enabling front admission. The front strips inbound internal markers.
+    #[serde(default)]
+    pub candidate_new_only: bool,
+}
+
+impl PrefillRollout {
+    fn incumbent(&self, worker: &dyn Worker) -> bool {
+        self.incumbent_urls
+            .iter()
+            .any(|url| url == worker.base_url())
+    }
+
+    fn admits(&self, worker: &dyn Worker, prefix: Option<u64>, candidate: bool) -> bool {
+        if candidate && self.candidate_new_only {
+            return !self.incumbent(worker) && self.new_prefix_bps == 10_000;
+        }
+        self.incumbent(worker)
+            || prefix.is_some_and(|hash| {
+                // Decorrelate the rollout bucket from the placement ring.
+                let bucket = xxhash_rust::xxh3::xxh3_64(&hash.to_le_bytes()) % 10_000;
+                bucket < u64::from(self.new_prefix_bps)
+            })
+    }
+
+    fn candidate(info: &SelectWorkerInfo) -> bool {
+        info.headers.is_some_and(|h| {
+            h.get("x-sglang-handoff-candidate")
+                .is_some_and(|v| v == "1")
+        })
+    }
+}
 
 #[derive(Debug)]
 struct PlacementEntry {
@@ -180,6 +239,7 @@ pub struct PrefixHashPolicy {
     /// not continually change its observed owner.
     pd_affinity_prefix_tokens: Option<usize>,
     pd_affinity_book: Mutex<PlacementBook>,
+    prefill_rollout: RwLock<Option<PrefillRollout>>,
 }
 
 impl PrefixHashPolicy {
@@ -208,7 +268,50 @@ impl PrefixHashPolicy {
             placement_book: Mutex::new(PlacementBook::default()),
             pd_affinity_prefix_tokens,
             pd_affinity_book: Mutex::new(PlacementBook::default()),
+            prefill_rollout: RwLock::new(None),
         }
+    }
+
+    pub fn prefill_rollout(&self) -> Option<PrefillRollout> {
+        self.prefill_rollout
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    pub fn set_prefill_rollout(&self, mut config: PrefillRollout) -> Result<(), &'static str> {
+        if self.pd_affinity_prefix_tokens.is_none() {
+            return Err("prefill rollout requires SGLANG_GATEWAY_PD_AFFINITY_PREFIX_TOKENS");
+        }
+        if config.incumbent_urls.is_empty()
+            || config.incumbent_urls.len() > 32
+            || config.incumbent_urls.iter().any(|url| {
+                !(url.starts_with("http://") || url.starts_with("https://"))
+                    || url.contains('@')
+                    || url.ends_with('/')
+                    || url.len() > 2048
+            })
+            || config.new_prefix_bps > 10_000
+            || !(1..=64).contains(&config.owner_max_load)
+        {
+            return Err(
+                "invalid incumbent base URLs, new_prefix_bps (0..10000), or owner_max_load (1..64)",
+            );
+        }
+        config.incumbent_urls.sort();
+        config.incumbent_urls.dedup();
+        let mut rollout = self
+            .prefill_rollout
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        if rollout
+            .as_ref()
+            .is_some_and(|old| old.incumbent_urls != config.incumbent_urls)
+        {
+            return Err("incumbent URLs cannot change during a process lifetime");
+        }
+        *rollout = Some(config);
+        Ok(())
     }
 
     fn parse_pd_affinity_prefix_tokens(value: &str, config: &PrefixHashConfig) -> Option<usize> {
@@ -460,6 +563,17 @@ impl PrefixHashPolicy {
         let (index, worker, owner_load) = available
             .iter()
             .find(|(_, worker, _)| worker.url() == owner_url)?;
+        if matches!(worker.worker_type(), WorkerType::Prefill { .. }) {
+            if let Some(rollout) = self.prefill_rollout() {
+                if rollout.candidate_new_only
+                    && PrefillRollout::candidate(info)
+                    && rollout.incumbent(worker.as_ref())
+                {
+                    return None;
+                }
+                return (*owner_load <= rollout.owner_max_load).then_some(*index);
+            }
+        }
         let total_load = available.iter().map(|(_, _, load)| load).sum();
         let least_load = available
             .iter()
@@ -484,11 +598,25 @@ impl PrefixHashPolicy {
         info: &SelectWorkerInfo,
         prefix_hash: u64,
     ) -> (Option<usize>, Branch) {
+        let rollout = self.prefill_rollout();
+        // A tokenless/short compatibility request cannot establish a stable
+        // long-prefix owner. Keep it on incumbents throughout the rollout.
+        let rollout_prefix = self.pd_affinity_prefix_tokens.and_then(|count| {
+            info.tokens
+                .filter(|tokens| tokens.len() >= count)
+                .map(|_| prefix_hash)
+        });
         // Build healthy worker URL to index map
         let healthy_workers: Vec<(usize, &Arc<dyn Worker>)> = workers
             .iter()
             .enumerate()
             .filter(|(_, w)| w.is_available() && Self::under_soft_cap(w.as_ref(), info))
+            .filter(|(_, w)| {
+                !matches!(w.worker_type(), WorkerType::Prefill { .. })
+                    || rollout.as_ref().is_none_or(|r| {
+                        r.admits(w.as_ref(), rollout_prefix, PrefillRollout::candidate(info))
+                    })
+            })
             .collect();
 
         if healthy_workers.is_empty() {
@@ -647,30 +775,23 @@ impl PrefixHashPolicy {
         pool_fingerprint: u64,
     ) -> (Option<usize>, Branch) {
         let key = (pool_fingerprint, prefix_hash);
-        let owner = book
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .owner(key, Instant::now());
+        // Serialize first placement of a prefix: concurrent first requests must
+        // not race and overwrite each other's owner. No I/O under this lock.
+        let mut book = book.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let owner = book.owner(key, Instant::now());
         if let Some(owner_url) = owner {
             if let Some(index) = self.observed_owner_allowed(workers, info, &owner_url) {
-                book.lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .record(key, workers[index].url(), Instant::now());
+                book.record(key, workers[index].url(), Instant::now());
                 return (Some(index), Branch::ObservedPlacement);
             }
-            book.lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .entries
-                .remove(&key);
+            book.entries.remove(&key);
         }
 
         // An unknown or unusable owner follows the original selection path.
         // Record the actual selected virtual URL, including a load fallback.
         let (selection, branch) = self.find_worker_with_load_balance(workers, info, prefix_hash);
         if let Some(index) = selection {
-            book.lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .record(key, workers[index].url(), Instant::now());
+            book.record(key, workers[index].url(), Instant::now());
         }
         (selection, branch)
     }
@@ -752,6 +873,252 @@ mod tests {
         policy.pd_prefill_placement = false;
         policy.pd_prefill_affinity_slack = None;
         policy
+    }
+
+    fn rollout_config(bps: u16) -> PrefillRollout {
+        PrefillRollout {
+            incumbent_urls: vec!["http://old0:8000".into(), "http://old1:8000".into()],
+            new_prefix_bps: bps,
+            owner_max_load: 2,
+            candidate_new_only: false,
+        }
+    }
+
+    fn rollout_workers() -> Vec<Arc<dyn Worker>> {
+        prefill_workers(
+            &[
+                "http://old0:8000",
+                "http://old1:8000",
+                "http://new0:8000",
+                "http://new1:8000",
+            ],
+            "model-a",
+        )
+    }
+
+    #[test]
+    fn test_rollout_config_validates_and_freezes_incumbents() {
+        let mut disabled = long_prefix_policy();
+        disabled.pd_affinity_prefix_tokens = None;
+        assert!(disabled.set_prefill_rollout(rollout_config(0)).is_err());
+        let policy = long_prefix_policy();
+        for (bps, ceiling) in [(10_001, 2), (100, 0), (100, 65)] {
+            let mut config = rollout_config(bps);
+            config.owner_max_load = ceiling;
+            assert!(policy.set_prefill_rollout(config).is_err());
+            assert!(policy.prefill_rollout().is_none());
+        }
+        for urls in [
+            vec![],
+            vec!["http://old:8000@0".into()],
+            vec!["old:8000".into()],
+        ] {
+            let mut config = rollout_config(0);
+            config.incumbent_urls = urls;
+            assert!(policy.set_prefill_rollout(config).is_err());
+        }
+        policy.set_prefill_rollout(rollout_config(0)).unwrap();
+        policy.set_prefill_rollout(rollout_config(1000)).unwrap();
+        let mut different = rollout_config(0);
+        different.incumbent_urls.pop();
+        assert!(policy.set_prefill_rollout(different).is_err());
+        assert_eq!(policy.prefill_rollout(), Some(rollout_config(1000)));
+    }
+
+    #[test]
+    fn test_rollout_expansion_preserves_p_and_d_observed_fallback_owners() {
+        let policy = long_prefix_policy();
+        let p = rollout_workers();
+        let d = pd_workers(WorkerType::Decode, 8);
+        let old_members = [p[..2].to_vec(), d.clone()].concat();
+        let new_members = [p.clone(), d.clone()].concat();
+        let tokens = vec![42; 8192];
+        let before = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            hash_ring: Some(Arc::new(HashRing::new(&old_members))),
+            soft_cap: Some(14),
+            ..Default::default()
+        };
+        // Establish actual load fallbacks, not merely the deterministic ring
+        // owner. Recomputing the old ring cannot reconstruct these observations.
+        let mut owners = Vec::new();
+        for workers in [&p[..2], &d[..]] {
+            let ring_owner = policy.select_worker_impl(workers, &before).0.unwrap();
+            workers[ring_owner].set_healthy(false);
+            let fallback = policy.select_worker_impl(workers, &before).0.unwrap();
+            assert_ne!(fallback, ring_owner);
+            workers[ring_owner].set_healthy(true);
+            owners.push(fallback);
+        }
+        policy.set_prefill_rollout(rollout_config(0)).unwrap();
+        let local = PlacementMap::from([(p[owners[0]].url().to_owned(), 1)]);
+        let after = SelectWorkerInfo {
+            hash_ring: Some(Arc::new(HashRing::new(&new_members))),
+            local_reservations: Some(&local),
+            ..before
+        };
+        // 1 > (1+1)/4 * 1.25: the previous expanding-pool threshold rejects P.
+        assert!(!policy.load_ok(1, 1, 4));
+        assert_eq!(
+            policy.select_worker_impl(&p, &after),
+            (Some(owners[0]), Branch::ObservedPlacement)
+        );
+        assert_eq!(
+            policy.select_worker_impl(&d, &after),
+            (Some(owners[1]), Branch::ObservedPlacement)
+        );
+        assert_eq!(policy.pd_affinity_book.lock().unwrap().entries.len(), 2);
+    }
+
+    #[test]
+    fn test_rollout_stable_buckets_and_ramp_only_change_unknown_prefixes() {
+        let policy = long_prefix_policy();
+        let replica = long_prefix_policy();
+        let workers = rollout_workers();
+        for p in [&policy, &replica] {
+            p.set_prefill_rollout(rollout_config(1000)).unwrap();
+        }
+        let ring = Arc::new(HashRing::new(&workers));
+        let mut owners = Vec::new();
+        let mut eligible = 0;
+        let mut admitted = 0;
+        for id in 0..512 {
+            let tokens = vec![id; 8192];
+            let info = SelectWorkerInfo {
+                tokens: Some(&tokens),
+                hash_ring: Some(ring.clone()),
+                ..Default::default()
+            };
+            let hash = xxhash_rust::xxh3::xxh3_64(bytemuck::cast_slice(&tokens));
+            let allowed = rollout_config(1000).admits(workers[2].as_ref(), Some(hash), false);
+            eligible += usize::from(allowed);
+            let owner = policy.select_worker_impl(&workers, &info).0.unwrap();
+            assert_eq!(replica.select_worker_impl(&workers, &info).0, Some(owner));
+            if owner >= 2 {
+                assert!(allowed, "load fallback must not bypass the cohort gate");
+                admitted += 1;
+            }
+            owners.push(owner);
+        }
+        assert!(admitted > 0 && admitted <= eligible && eligible < 100);
+        for bps in [10_000, 0] {
+            policy.set_prefill_rollout(rollout_config(bps)).unwrap();
+            for (id, owner) in owners.iter().enumerate() {
+                let mut tokens = vec![id as u32; 8192];
+                tokens.extend([999, 1000]); // growing continuation
+                let info = SelectWorkerInfo {
+                    tokens: Some(&tokens),
+                    hash_ring: Some(ring.clone()),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    policy.select_worker_impl(&workers, &info),
+                    (Some(*owner), Branch::ObservedPlacement)
+                );
+            }
+        }
+        // Rollback stops admitting unknown prefixes; it does not evict new-P owners.
+        let tokens = vec![9000; 8192];
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            hash_ring: Some(ring),
+            ..Default::default()
+        };
+        assert!(policy.select_worker_impl(&workers, &info).0.unwrap() < 2);
+    }
+
+    #[test]
+    fn test_front_candidates_only_use_new_p_even_without_tokens() {
+        let policy = long_prefix_policy();
+        let workers = rollout_workers();
+        let mut config = rollout_config(10_000);
+        config.candidate_new_only = true;
+        policy.set_prefill_rollout(config).unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-sglang-handoff-candidate",
+            http::HeaderValue::from_static("1"),
+        );
+        let tokens = vec![10; 8192];
+        let base = SelectWorkerInfo {
+            hash_ring: Some(Arc::new(HashRing::new(&workers))),
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        for prefix in [&tokens[..10], &tokens[..]] {
+            let info = SelectWorkerInfo {
+                tokens: Some(prefix),
+                ..base.clone()
+            };
+            assert!(policy.select_worker_impl(&workers, &info).0.unwrap() >= 2);
+        }
+        for _ in 0..16 {
+            assert!(policy.select_without_prefix(&workers, &base).unwrap() >= 2);
+        }
+        workers[2].set_healthy(false);
+        workers[3].set_healthy(false);
+        assert_eq!(
+            policy.select_without_prefix(&workers, &base),
+            None,
+            "never fall back onto old P"
+        );
+    }
+
+    #[test]
+    fn test_rollout_fallback_and_owner_bypass_are_bounded() {
+        let policy = long_prefix_policy();
+        policy.set_prefill_rollout(rollout_config(10_000)).unwrap();
+        let workers = rollout_workers();
+        let short = vec![1; 8191];
+        let info = SelectWorkerInfo {
+            tokens: Some(&short),
+            hash_ring: Some(Arc::new(HashRing::new(&workers))),
+            ..Default::default()
+        };
+        for _ in 0..32 {
+            assert!(policy.select_worker_impl(&workers, &info).0.unwrap() < 2);
+            assert!(
+                policy
+                    .select_without_prefix(
+                        &workers,
+                        &SelectWorkerInfo {
+                            tokens: None,
+                            ..info.clone()
+                        }
+                    )
+                    .unwrap()
+                    < 2
+            );
+        }
+        policy.set_prefill_rollout(rollout_config(0)).unwrap();
+        let long = vec![2; 8192];
+        let base = SelectWorkerInfo {
+            tokens: Some(&long),
+            ..info
+        };
+        let owner = policy.select_worker_impl(&workers, &base).0.unwrap();
+        let local = PlacementMap::from([(workers[owner].url().to_owned(), 3)]);
+        let overloaded = SelectWorkerInfo {
+            local_reservations: Some(&local),
+            ..base.clone()
+        };
+        assert_eq!(
+            policy.select_worker_impl(&workers, &overloaded).0,
+            Some(1 - owner)
+        );
+        // Health overrides the book, and zero admission never silently spills
+        // onto the new P even when all incumbents are unavailable.
+        workers[0].set_healthy(false);
+        workers[1].set_healthy(false);
+        assert_eq!(policy.select_worker_impl(&workers, &base).0, None);
+        workers[0].set_healthy(true);
+        let cap = PlacementMap::from([(workers[0].url().to_owned(), 1)]);
+        let capped = SelectWorkerInfo {
+            local_reservations: Some(&cap),
+            soft_cap: Some(1),
+            ..base
+        };
+        assert_eq!(policy.select_worker_impl(&workers, &capped).0, None);
     }
 
     fn pd_workers(worker_type: WorkerType, count: usize) -> Vec<Arc<dyn Worker>> {
