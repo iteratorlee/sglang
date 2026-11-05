@@ -402,29 +402,16 @@ impl PrefixHashPolicy {
     }
 
     fn pool_fingerprint(workers: &[Arc<dyn Worker>]) -> u64 {
-        let mut members: Vec<_> = workers
-            .iter()
-            .map(|worker| (worker.url(), worker.model_id()))
-            .collect();
-        members.sort_unstable();
-        let mut hasher = DefaultHasher::new();
-        members.hash(&mut hasher);
-        hasher.finish()
+        Self::pd_pool_fingerprint(workers, &SelectWorkerInfo::default())
     }
 
-    fn pd_pool_fingerprint(workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> u64 {
+    fn pd_pool_fingerprint(workers: &[Arc<dyn Worker>], _info: &SelectWorkerInfo) -> u64 {
         let mut hasher = DefaultHasher::new();
-        // HTTP PD passes an availability-filtered worker slice. Use the cached
-        // registry ring to avoid forgetting a fallback when a capped/unhealthy
-        // worker returns. The shared model ring contains both P and D, so also
-        // namespace by role and model. Without a ring, use the supplied pool.
-        info.hash_ring
-            .as_ref()
-            .map_or_else(
-                || Self::pool_fingerprint(workers),
-                |r| r.membership_fingerprint(),
-            )
-            .hash(&mut hasher);
+        // Books belong to this policy instance. Membership is deliberately not
+        // a namespace: adding P must preserve both P and D observations, even
+        // though HTTP PD uses a shared registry ring. A removed/unhealthy owner
+        // is rejected by URL at selection time. No cross-process persistence or
+        // proof of cache residency is implied by this model/role namespace.
         let mut models: Vec<_> = workers.iter().map(|w| w.model_id()).collect();
         models.sort_unstable();
         models.dedup();
@@ -998,6 +985,38 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_observed_fallback_survives_prefill_registration() {
+        let policy = long_prefix_policy();
+        let d = pd_workers(WorkerType::Decode, 8);
+        let p = prefill_workers(&["http://p:8000@0", "http://p:8000@1"], "model-a");
+        let mut members = [p, d.clone()].concat();
+        let tokens = vec![53; 8192];
+        let before = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            hash_ring: Some(Arc::new(HashRing::new(&members))),
+            soft_cap: Some(14),
+            ..Default::default()
+        };
+        let initial = policy.select_worker_impl(&d, &before).0.unwrap();
+        d[initial].set_healthy(false);
+        let fallback = policy.select_worker_impl(&d, &before).0.unwrap();
+        assert_ne!(fallback, initial);
+        d[initial].set_healthy(true);
+        members.extend(prefill_workers(
+            &["http://new:8000@0", "http://new:8000@1"],
+            "model-a",
+        ));
+        let after = SelectWorkerInfo {
+            hash_ring: Some(Arc::new(HashRing::new(&members))),
+            ..before
+        };
+        assert_eq!(
+            policy.select_worker_impl(&d, &after),
+            (Some(fallback), Branch::ObservedPlacement)
+        );
+    }
+
+    #[test]
     fn test_long_prefix_role_model_membership_and_expiry_namespaces() {
         let policy = long_prefix_policy();
         // Even overlapping URLs in the same ring cannot couple P and D state.
@@ -1040,7 +1059,7 @@ mod tests {
             hash_ring: Some(Arc::new(HashRing::new(&p[..1]))),
             ..info.clone()
         };
-        assert_ne!(
+        assert_eq!(
             p_key,
             PrefixHashPolicy::pd_pool_fingerprint(&p[..1], &removed)
         );
@@ -2138,9 +2157,9 @@ mod tests {
             PrefixHashPolicy::pool_fingerprint(&reversed)
         );
         let different_model = prefill_workers(&["http://p0:8000", "http://p1:8000"], "model-b");
-        let different_pool = prefill_workers(&["http://p0:8000", "http://p2:8000"], "model-a");
+        let different_pool = prefill_workers(&["http://p2:8000", "http://p3:8000"], "model-a");
         assert_ne!(key.0, PrefixHashPolicy::pool_fingerprint(&different_model));
-        assert_ne!(key.0, PrefixHashPolicy::pool_fingerprint(&different_pool));
+        assert_eq!(key.0, PrefixHashPolicy::pool_fingerprint(&different_pool));
         policy.placement_book.lock().unwrap().record(
             key,
             workers[1 - ring_owner].url(),
