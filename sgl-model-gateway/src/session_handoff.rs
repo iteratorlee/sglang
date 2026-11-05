@@ -37,6 +37,9 @@ use tokio::sync::Mutex;
 
 use crate::middleware::AuthConfig;
 
+#[path = "session_migration.rs"]
+pub(crate) mod migration;
+
 pub(crate) const CANDIDATE_HEADER: &str = "x-sglang-handoff-candidate";
 const HOP_HEADER: &str = "x-sglang-handoff-hop";
 const MAX_FIRST_TURN: usize = 64 * 1024;
@@ -48,7 +51,7 @@ pub(crate) struct HandoffIngress(pub Instant);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum Destination {
+pub(crate) enum Destination {
     Legacy,
     Candidate,
 }
@@ -195,6 +198,7 @@ pub struct SessionHandoff {
     store: Arc<Mutex<PinStore>>,
     max_body: usize,
     auth: AuthConfig,
+    migration: Arc<parking_lot::Mutex<migration::Runtime>>,
 }
 
 impl SessionHandoff {
@@ -241,62 +245,132 @@ impl SessionHandoff {
             store: Arc::new(Mutex::new(store)),
             max_body,
             auth,
+            migration: Arc::new(parking_lot::Mutex::new(migration::Runtime::default())),
         }))
     }
 
+    #[cfg(test)]
     async fn decide(
         &self,
         key: Option<String>,
         enrollment: Option<&'static str>,
     ) -> Result<(Destination, &'static str), ()> {
-        let Some(key) = key else {
-            return Ok((Destination::Legacy, "no_identity"));
-        };
+        self.choose(key, enrollment, false, 0)
+            .await
+            .map(|(d, r, _)| (d, r))
+            .map_err(|_| ())
+    }
+
+    async fn choose(
+        &self,
+        key: Option<String>,
+        enrollment: Option<&'static str>,
+        full_context: bool,
+        body_bytes: usize,
+    ) -> Result<(Destination, &'static str, migration::Lease), StatusCode> {
         let mut store = self.store.clone().lock_owned().await;
-        if let Some(destination) = store.pins.get(&key) {
-            return Ok((*destination, "pinned"));
-        }
-        if store.failed {
-            return Err(());
-        }
-        if store.pins.len() >= MAX_PINS {
-            return Ok((Destination::Legacy, "ledger_full"));
-        }
-        let config = store.config;
-        let eligible =
-            enrollment.is_some_and(|kind| kind == "explicit" || config.bounded_first_turn);
-        let bucket = u64::from_str_radix(&key[..16], 16).unwrap() % 10_000;
-        let destination = if eligible && bucket < u64::from(config.candidate_bps) {
-            Destination::Candidate
-        } else {
-            Destination::Legacy
-        };
-        let reason = if destination == Destination::Candidate {
-            enrollment.unwrap()
-        } else if config.candidate_bps == 0 {
-            "disabled"
-        } else if eligible {
-            "cohort_legacy"
-        } else {
-            "not_enrolled"
-        };
-        // The lock spans the durable decision, so concurrent first requests
-        // cannot enroll the same key into different destinations. Cancellation
-        // may leave a committed pin, but cannot dispatch before commit completes.
-        tokio::task::spawn_blocking(move || {
-            let mut updated = store.pins.clone();
-            updated.insert(key, destination);
-            if store.persist(&updated).is_err() {
-                // Even rename-success/fsync-failure is ambiguous: reject new
-                // keys until restart, never send an uncommitted request to P/D.
-                store.failed = true;
-                return Err(());
+        let current = key.as_ref().and_then(|k| store.pins.get(k)).copied();
+        let (destination, reason, assignment, migration_assignment, lease) = {
+            let mut r = self.migration.lock();
+            let mut destination = current.unwrap_or(Destination::Legacy);
+            let mut reason = if current.is_some() {
+                "pinned"
+            } else {
+                "no_identity"
+            };
+            let mut assignment = false;
+            let mut migration_assignment = false;
+            if let Some(k) = key.as_ref() {
+                if store.failed && current.is_none() {
+                    return Err(StatusCode::SERVICE_UNAVAILABLE);
+                }
+                if current.is_none() && store.pins.len() >= MAX_PINS {
+                    reason = "ledger_full";
+                } else {
+                    let old_eligible = enrollment
+                        .is_some_and(|kind| kind == "explicit" || store.config.bounded_first_turn);
+                    let bucket = u64::from_str_radix(&k[..16], 16).unwrap() % 10000;
+                    let cohort = current.is_none()
+                        && old_eligible
+                        && bucket < u64::from(store.config.candidate_bps);
+                    let moving = destination == Destination::Legacy
+                        && full_context
+                        && !store.failed
+                        && r.assignment_allowed(k, current.is_some(), Instant::now());
+                    if moving || cohort {
+                        // A session is never moved while another tracked request/body is live.
+                        let quiet = r.sessions.get(k).is_none_or(|a| a.active == 0);
+                        if quiet && r.cold_inflight < r.config.max_cold_inflight {
+                            destination = Destination::Candidate;
+                            assignment = true;
+                            migration_assignment = moving;
+                            reason = if moving {
+                                if current.is_some() {
+                                    "migrated"
+                                } else {
+                                    "new_history"
+                                }
+                            } else {
+                                enrollment.unwrap()
+                            };
+                        } else {
+                            reason = "cold_budget";
+                        }
+                    } else if current.is_none() {
+                        reason = if store.config.candidate_bps == 0 {
+                            "disabled"
+                        } else if old_eligible {
+                            "cohort_legacy"
+                        } else {
+                            "not_enrolled"
+                        };
+                    }
+                }
             }
-            store.pins = updated;
-            Ok((destination, reason))
-        })
-        .await
-        .map_err(|_| ())?
+            let cold = destination == Destination::Candidate
+                && !key
+                    .as_ref()
+                    .and_then(|k| r.sessions.get(k))
+                    .is_some_and(|a| a.warmed);
+            if cold && r.cold_inflight >= r.config.max_cold_inflight {
+                // Existing candidate pins cannot fall back to legacy when the budget is full.
+                return Err(StatusCode::TOO_MANY_REQUESTS);
+            }
+            let lease = migration::begin(
+                &self.migration,
+                &mut r,
+                key.clone(),
+                destination,
+                body_bytes,
+                cold,
+            );
+            (destination, reason, assignment, migration_assignment, lease)
+        };
+        let needs_pin = key
+            .as_ref()
+            .is_some_and(|k| store.pins.get(k).copied() != Some(destination))
+            && (current.is_some() || store.pins.len() < MAX_PINS);
+        if needs_pin {
+            let key = key.unwrap();
+            let runtime = self.migration.clone();
+            let known = current.is_some();
+            let result=tokio::task::spawn_blocking(move || {
+                let mut updated=store.pins.clone();updated.insert(key,destination);
+                if store.persist(&updated).is_err() {store.failed=true;return false;}
+                store.pins=updated;
+                if assignment {
+                    let mut r=runtime.lock();
+                    if known {r.migrated+=1;} else {r.enrolled+=1;}
+                    if migration_assignment {r.last_assignment=Some(Instant::now());}
+                    metrics::counter!("smg_session_migration_assignments_total","kind"=>if known {"migrated"}else{"new"}).increment(1);
+                }
+                true
+            }).await;
+            if !matches!(result, Ok(true)) {
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
+        }
+        Ok((destination, reason, lease))
     }
 
     async fn proxy(&self, request: Request) -> Response {
@@ -577,14 +651,19 @@ async fn route(
             return front.proxy(request).await;
         }
     };
-    let known = if let Some(key) = key.as_ref() {
-        front.store.lock().await.pins.contains_key(key)
+    let existing = if let Some(key) = key.as_ref() {
+        front.store.lock().await.pins.get(key).copied()
     } else {
-        false
+        None
     };
+    let known = existing.is_some();
+    let inspect_history =
+        front.migration.lock().config.enabled && existing != Some(Destination::Candidate);
     let auto = front.store.lock().await.config.bounded_first_turn;
     let mut first_turn = false;
-    if key.is_none() || (!known && !explicit && auto) {
+    let mut full_context = false;
+    let mut body_bytes = 0;
+    if key.is_none() || (!known && !explicit && auto) || inspect_history {
         // A header ID needs no buffering for explicit enrollment or pinned
         // continuations (including MM). Body IDs require reading the envelope;
         // serde ignores messages during identity extraction. Preserve bytes.
@@ -600,6 +679,10 @@ async fn route(
         if key.is_none() {
             (key, source) = body_identity(&bytes);
         }
+        body_bytes = bytes.len();
+        if inspect_history {
+            full_context = migration::full_chat_context(&bytes, parts.uri.path());
+        }
         if auto {
             first_turn = bounded_first_turn(&bytes);
         }
@@ -612,10 +695,13 @@ async fn route(
     } else {
         None
     };
-    match front.decide(key, enrollment).await {
-        Ok((destination, reason)) => {
+    match front
+        .choose(key, enrollment, full_context, body_bytes)
+        .await
+    {
+        Ok((destination, reason, lease)) => {
             record(destination, source, reason);
-            match destination {
+            let response = match destination {
                 Destination::Legacy => front.proxy(request).await,
                 Destination::Candidate => {
                     request
@@ -624,15 +710,19 @@ async fn route(
                     request.extensions_mut().insert(HandoffIngress(start));
                     next.run(request).await
                 }
-            }
+            };
+            migration::wrap(response, lease)
         }
-        Err(()) => {
-            metrics::counter!("smg_session_handoff_requests_total", "destination" => "reject", "source" => source, "reason" => "persist_failed").increment(1);
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "handoff persistence unavailable",
-            )
-                .into_response()
+        Err(status) => {
+            metrics::counter!("smg_session_handoff_requests_total", "destination" => "reject", "source" => source, "reason" => if status==StatusCode::TOO_MANY_REQUESTS {"cold_budget"} else {"persist_failed"}).increment(1);
+            let mut response =
+                (status, "handoff unavailable or cold-session budget busy").into_response();
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                response
+                    .headers_mut()
+                    .insert("retry-after", HeaderValue::from_static("1"));
+            }
+            response
         }
     }
 }

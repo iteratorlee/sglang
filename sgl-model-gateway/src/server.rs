@@ -801,6 +801,15 @@ pub fn build_app(
                 "/workers/session-handoff",
                 get(crate::session_handoff::status).put(crate::session_handoff::configure),
             )
+            .route(
+                "/workers/session-handoff/migration",
+                get(crate::session_handoff::migration::status)
+                    .put(crate::session_handoff::migration::configure),
+            )
+            .route(
+                "/workers/session-handoff/import-pins",
+                post(crate::session_handoff::migration::import_pins),
+            )
             .with_state::<Arc<AppState>>(front.clone())
     } else {
         Router::new()
