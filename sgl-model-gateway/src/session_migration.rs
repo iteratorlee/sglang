@@ -38,7 +38,7 @@ impl MigrationConfig {
             && self.legacy_sessions_bps <= 10000
             && (1..=4).contains(&self.max_cold_inflight)
             && (1..=3600).contains(&self.min_interval_secs)
-            && (5..=3600).contains(&self.quiet_secs)
+            && self.quiet_secs <= 3600
             && self.max_switches <= MAX_PINS as u64
             && self.session_hashes.len() <= 256
             && self.session_hashes.iter().all(|s| valid_hash(s))
@@ -53,6 +53,7 @@ pub(super) struct Activity {
     pub active: usize,
     pub finished: Option<Instant>,
     pub warmed: bool,
+    pub clean_end: bool,
     pub body_bytes: usize,
 }
 pub(super) struct Runtime {
@@ -92,7 +93,7 @@ impl Runtime {
                 json!({
             "session_hash":key,"destination":pins.get(key),"in_flight":a.active,
             "idle_seconds":a.finished.map(|t|now.saturating_duration_since(t).as_secs_f64()),
-            "warmed":a.warmed,"last_body_bytes":a.body_bytes})
+            "warmed":a.warmed,"last_completed_cleanly":a.clean_end,"last_body_bytes":a.body_bytes})
             })
             .collect();
         json!({"config":self.config,"enrolled":self.enrolled,"migrated":self.migrated,
@@ -117,9 +118,14 @@ impl Runtime {
             let Some(a) = self.sessions.get(key) else {
                 return false;
             };
+            let quiet_secs = if a.clean_end {
+                c.quiet_secs
+            } else {
+                c.quiet_secs.max(5)
+            };
             if a.active != 0
                 || !a.finished.is_some_and(|t| {
-                    now.saturating_duration_since(t) >= Duration::from_secs(c.quiet_secs)
+                    now.saturating_duration_since(t) >= Duration::from_secs(quiet_secs)
                 })
             {
                 return false;
@@ -162,6 +168,7 @@ impl Drop for Lease {
         if let Some(a) = self.key.as_ref().and_then(|k| r.sessions.get_mut(k)) {
             a.active -= 1;
             a.finished = Some(Instant::now());
+            a.clean_end = self.completed;
             if self.destination == Destination::Candidate && self.completed {
                 a.warmed = true;
             }

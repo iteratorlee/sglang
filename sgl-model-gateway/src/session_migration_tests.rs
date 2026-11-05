@@ -59,7 +59,7 @@ fn rich_full_history_is_supported_without_small_first_turn_heuristic() {
         ..Default::default()
     }
     .valid());
-    assert!(!MigrationConfig {
+    assert!(MigrationConfig {
         quiet_secs: 0,
         ..Default::default()
     }
@@ -371,4 +371,31 @@ async fn encoded_legacy_stream_is_tracked_and_blocks_a_competing_plain_move() {
     drop(stream);
     assert_eq!(f.migration.lock().sessions[&key].active, 0);
     server.abort();
+}
+
+#[tokio::test]
+async fn clean_eof_allows_next_turn_but_cancelled_body_keeps_minimum_grace() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = front(dir.path().join("pins.json"));
+    let clean = session_key("clean-next-turn").unwrap();
+    let cancelled = session_key("cancel-next-turn").unwrap();
+    let (_, _, finished) = f
+        .choose(Some(clean.clone()), None, false, 10)
+        .await
+        .unwrap();
+    drain(wrap(Response::new(Body::from("complete")), finished)).await;
+    let (_, _, unfinished) = f
+        .choose(Some(cancelled.clone()), None, false, 10)
+        .await
+        .unwrap();
+    drop(unfinished);
+    enable(&f, 2);
+    f.migration.lock().config.quiet_secs = 0;
+    let (destination, _, blocked) = f.choose(Some(cancelled), None, true, 10).await.unwrap();
+    assert_eq!(destination, Destination::Legacy);
+    drop(blocked);
+    let (destination, reason, moved) = f.choose(Some(clean), None, true, 10).await.unwrap();
+    assert_eq!(destination, Destination::Candidate);
+    assert_eq!(reason, "migrated");
+    drop(moved);
 }
