@@ -309,6 +309,12 @@ pub(crate) async fn import_pins(
     let added = updated.len() - store.pins.len();
     let result = tokio::task::spawn_blocking(move || {
         if store.persist(&updated).is_err() {
+            let uncertain: Vec<_> = updated
+                .iter()
+                .filter(|(k, v)| store.pins.get(*k) != Some(*v))
+                .map(|(k, _)| k.clone())
+                .collect();
+            store.quarantined.extend(uncertain);
             store.failed = true;
             return false;
         }

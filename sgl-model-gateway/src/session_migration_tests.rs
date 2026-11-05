@@ -153,7 +153,8 @@ async fn cold_budget_rate_and_finite_switch_limit_are_independent() {
         .unwrap();
     assert_eq!(d, Destination::Legacy);
     drop(over);
-    assert_eq!(f.migration.lock().enrolled + f.migration.lock().migrated, 2);
+    let runtime = f.migration.lock();
+    assert_eq!(runtime.enrolled + runtime.migrated, 2);
 }
 
 #[tokio::test]
@@ -295,4 +296,79 @@ async fn durable_failure_does_not_publish_a_migration_or_reset_live_leases() {
     assert_eq!(f.store.lock().await.pins[&key], Destination::Legacy);
     assert_eq!(f.migration.lock().cold_inflight, 0);
     assert_eq!(f.migration.lock().migrated, 0);
+}
+
+#[tokio::test]
+async fn post_rename_failure_quarantines_the_affected_existing_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pins.json");
+    let f = front(path.clone());
+    let key = session_key("post-rename").unwrap();
+    let (_, _, initial) = f.choose(Some(key.clone()), None, false, 1).await.unwrap();
+    drop(initial);
+    age(&f, &key);
+    enable(&f, 1);
+    f.store.lock().await.fail_after_rename = true;
+    assert!(matches!(
+        f.choose(Some(key.clone()), None, true, 1).await,
+        Err(StatusCode::SERVICE_UNAVAILABLE)
+    ));
+    let disk: BTreeMap<String, Destination> =
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(disk[&key], Destination::Candidate);
+    assert_eq!(f.store.lock().await.pins[&key], Destination::Legacy);
+    assert!(matches!(
+        f.choose(Some(key), None, false, 0).await,
+        Err(StatusCode::SERVICE_UNAVAILABLE)
+    ));
+    assert_eq!(f.migration.lock().active_legacy, 0);
+    assert_eq!(f.migration.lock().cold_inflight, 0);
+}
+
+#[tokio::test]
+async fn encoded_legacy_stream_is_tracked_and_blocks_a_competing_plain_move() {
+    let upstream = Router::new().route(
+        "/v1/messages",
+        post(|| async { Response::new(Body::from_stream(PendingBody(false))) }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let dir = tempfile::tempdir().unwrap();
+    let f = SessionHandoff::open(
+        origin,
+        dir.path().join("pins.json"),
+        1024 * 1024,
+        AuthConfig { api_key: None },
+    )
+    .unwrap();
+    let key = session_key("encoded-stream").unwrap();
+    let (_, _, initial) = f.choose(Some(key.clone()), None, false, 1).await.unwrap();
+    drop(initial);
+    age(&f, &key);
+    enable(&f, 1);
+    let app = Router::new()
+        .route("/v1/messages", post(|| async { "candidate" }))
+        .layer(axum::middleware::from_fn_with_state(f.clone(), dispatch));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-encoding", "identity")
+                .header("x-sglang-session-id", "encoded-stream")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut stream = response.into_body().into_data_stream();
+    assert!(stream.next().await.unwrap().is_ok());
+    assert_eq!(f.migration.lock().sessions[&key].active, 1);
+    let (d, _, parallel) = f.choose(Some(key.clone()), None, true, 5).await.unwrap();
+    assert_eq!(d, Destination::Legacy);
+    drop(parallel);
+    drop(stream);
+    assert_eq!(f.migration.lock().sessions[&key].active, 0);
+    server.abort();
 }

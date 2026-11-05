@@ -14,7 +14,7 @@
 //! but cannot restore this gateway's PD prefix book or in-flight leases.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -89,6 +89,9 @@ struct PinStore {
     pins: BTreeMap<String, Destination>,
     config: HandoffConfig,
     failed: bool,
+    quarantined: BTreeSet<String>,
+    #[cfg(test)]
+    fail_after_rename: bool,
 }
 
 fn private_file(path: &Path, exclusive: bool) -> io::Result<File> {
@@ -167,6 +170,9 @@ impl PinStore {
             pins,
             config: HandoffConfig::default(),
             failed: false,
+            quarantined: BTreeSet::new(),
+            #[cfg(test)]
+            fail_after_rename: false,
         };
         // Prove directory/file durability is usable before accepting traffic.
         store.persist(&store.pins)?;
@@ -183,6 +189,10 @@ impl PinStore {
             file.write_all(b"\n")?;
             file.sync_all()?;
             std::fs::rename(&temporary, &self.path)?;
+            #[cfg(test)]
+            if self.fail_after_rename {
+                return Err(io::Error::other("injected post-rename sync failure"));
+            }
             File::open(self.path.parent().unwrap())?.sync_all()
         })();
         if result.is_err() {
@@ -281,6 +291,9 @@ impl SessionHandoff {
             let mut assignment = false;
             let mut migration_assignment = false;
             if let Some(k) = key.as_ref() {
+                if store.quarantined.contains(k) {
+                    return Err(StatusCode::SERVICE_UNAVAILABLE);
+                }
                 if store.failed && current.is_none() {
                     return Err(StatusCode::SERVICE_UNAVAILABLE);
                 }
@@ -355,8 +368,8 @@ impl SessionHandoff {
             let runtime = self.migration.clone();
             let known = current.is_some();
             let result=tokio::task::spawn_blocking(move || {
-                let mut updated=store.pins.clone();updated.insert(key,destination);
-                if store.persist(&updated).is_err() {store.failed=true;return false;}
+                let mut updated=store.pins.clone();updated.insert(key.clone(),destination);
+                if store.persist(&updated).is_err() {store.failed=true;store.quarantined.insert(key);return false;}
                 store.pins=updated;
                 if assignment {
                     let mut r=runtime.lock();
@@ -668,8 +681,33 @@ async fn route(
         // continuations (including MM). Body IDs require reading the envelope;
         // serde ignores messages during identity extraction. Preserve bytes.
         if request.headers().contains_key("content-encoding") {
-            record(Destination::Legacy, source, "encoded_body");
-            return front.proxy(request).await;
+            // A body envelope cannot be inspected without decoding it. With a
+            // stable header, still retain its pin and stream lease; never bypass
+            // activity protection or silently redirect an existing candidate.
+            if key.is_none() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "encoded bodies require a stable session header",
+                )
+                    .into_response();
+            }
+            return match front.choose(key, None, false, 0).await {
+                Ok((destination, _, lease)) => {
+                    record(destination, source, "encoded_body");
+                    let response = match destination {
+                        Destination::Legacy => front.proxy(request).await,
+                        Destination::Candidate => {
+                            request
+                                .headers_mut()
+                                .insert(CANDIDATE_HEADER, HeaderValue::from_static("1"));
+                            request.extensions_mut().insert(HandoffIngress(start));
+                            next.run(request).await
+                        }
+                    };
+                    migration::wrap(response, lease)
+                }
+                Err(status) => (status, "encoded handoff unavailable").into_response(),
+            };
         }
         let (parts, body) = request.into_parts();
         let bytes = match to_bytes(body, front.max_body).await {
