@@ -55,6 +55,7 @@ pub(super) struct Activity {
     pub warmed: bool,
     pub clean_end: bool,
     pub cold_active: usize,
+    pub last_cancelled: Option<Instant>,
     pub body_bytes: usize,
 }
 pub(super) struct Runtime {
@@ -119,6 +120,11 @@ impl Runtime {
             let Some(a) = self.sessions.get(key) else {
                 return false;
             };
+            if a.last_cancelled
+                .is_some_and(|t| now.saturating_duration_since(t) < Duration::from_secs(5))
+            {
+                return false;
+            }
             let quiet_secs = if a.clean_end {
                 c.quiet_secs
             } else {
@@ -172,6 +178,9 @@ impl Drop for Lease {
             }
             a.finished = Some(Instant::now());
             a.clean_end = self.completed;
+            if !self.completed {
+                a.last_cancelled = Some(Instant::now());
+            }
             if self.destination == Destination::Candidate && self.completed {
                 a.warmed = true;
             }

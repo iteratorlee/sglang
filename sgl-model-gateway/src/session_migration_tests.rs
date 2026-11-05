@@ -27,7 +27,11 @@ fn enable(f: &SessionHandoff, budget: u64) {
 fn age(f: &SessionHandoff, key: &str) {
     let mut r = f.migration.lock();
     r.last_assignment = None;
-    r.sessions.get_mut(key).unwrap().finished = Some(Instant::now() - Duration::from_secs(120));
+    let activity = r.sessions.get_mut(key).unwrap();
+    activity.finished = Some(Instant::now() - Duration::from_secs(120));
+    activity.last_cancelled = activity
+        .last_cancelled
+        .map(|_| Instant::now() - Duration::from_secs(120));
 }
 async fn drain(response: Response) -> bytes::Bytes {
     to_bytes(response.into_body(), 2 * 1024 * 1024)
@@ -426,4 +430,25 @@ async fn unrelated_existing_candidate_waits_for_cold_budget_without_legacy_fallb
     let (d, _, next) = f.choose(Some(two), None, false, 0).await.unwrap();
     assert_eq!(d, Destination::Candidate);
     drop(next);
+}
+
+#[tokio::test]
+async fn a_later_clean_parallel_response_does_not_erase_cancellation_grace() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = front(dir.path().join("pins.json"));
+    let key = session_key("cancel-and-clean").unwrap();
+    let (_, _, cancelled) = f.choose(Some(key.clone()), None, false, 10).await.unwrap();
+    let (_, _, clean) = f.choose(Some(key.clone()), None, false, 10).await.unwrap();
+    drop(cancelled);
+    drain(wrap(Response::new(Body::from("complete")), clean)).await;
+    enable(&f, 1);
+    f.migration.lock().config.quiet_secs = 0;
+    assert!(f.migration.lock().sessions[&key].clean_end);
+    let (destination, _, retry) = f.choose(Some(key.clone()), None, true, 10).await.unwrap();
+    assert_eq!(destination, Destination::Legacy);
+    drop(retry);
+    age(&f, &key);
+    let (destination, _, safe) = f.choose(Some(key), None, true, 10).await.unwrap();
+    assert_eq!(destination, Destination::Candidate);
+    drop(safe);
 }
