@@ -483,6 +483,7 @@ impl Metrics {
         let path_interned = intern_string(path);
         counter!(
             "smg_http_requests_total",
+            "scope" => "gateway",
             "method" => method,
             "path" => path_interned,
         )
@@ -495,6 +496,7 @@ impl Metrics {
         let path_interned = intern_string(path);
         histogram!(
             "smg_http_request_duration_seconds",
+            "scope" => "gateway",
             "method" => method,
             "path" => path_interned
         )
@@ -503,7 +505,7 @@ impl Metrics {
 
     /// Set active HTTP connections count
     pub fn set_http_connections_active(count: usize) {
-        gauge!("smg_http_connections_active").set(count as f64);
+        gauge!("smg_http_connections_active", "scope" => "gateway").set(count as f64);
     }
 
     /// Record HTTP response.
@@ -512,6 +514,7 @@ impl Metrics {
         let error_interned = intern_string(error_code);
         counter!(
             "smg_http_responses_total",
+            "scope" => "gateway",
             "status_code" => status_str,
             "error_code" => error_interned
         )
@@ -522,6 +525,7 @@ impl Metrics {
     pub fn record_http_rate_limit(result: &'static str) {
         counter!(
             "smg_http_rate_limit_total",
+            "scope" => "gateway",
             "result" => result
         )
         .increment(1);

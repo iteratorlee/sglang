@@ -695,6 +695,14 @@ pub fn build_app(
     request_id_headers: Vec<String>,
     cors_allowed_origins: Vec<String>,
 ) -> Router {
+    // Invalid/missing durable state must fail startup, never silently enroll a
+    // fresh set of sessions after losing the legacy/candidate ledger.
+    let handoff = crate::session_handoff::SessionHandoff::from_env(
+        app_state.context.router_config.port,
+        max_payload_size,
+        auth_config.clone(),
+    )
+    .expect("invalid session handoff configuration or ledger");
     let protected_routes = Router::new()
         .route("/generate", post(generate))
         .route("/v1/chat/completions", post(v1_chat_completions))
@@ -787,7 +795,18 @@ pub fn build_app(
         );
 
     // Build worker routes
+    let handoff_routes = if let Some(front) = handoff.as_ref() {
+        Router::new()
+            .route(
+                "/workers/session-handoff",
+                get(crate::session_handoff::status).put(crate::session_handoff::configure),
+            )
+            .with_state::<Arc<AppState>>(front.clone())
+    } else {
+        Router::new()
+    };
     let worker_routes = Router::new()
+        .merge(handoff_routes)
         .route("/workers", post(create_worker).get(list_workers_rest))
         // Policy-only update: do not rebuild workers and reset their load,
         // health or circuit state when changing an admission fraction.
@@ -836,23 +855,33 @@ pub fn build_app(
             middleware::auth_middleware,
         ));
 
-    Router::new()
+    let app = Router::new()
         .merge(protected_routes)
         .merge(public_routes)
         .merge(admin_routes)
         .merge(worker_routes)
         .merge(mesh_routes)
-        .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(
-            max_payload_size,
-        ))
         .layer(middleware::create_logging_layer())
         .layer(
             middleware::HttpMetricsLayer::new(app_state.context.inflight_tracker.clone())
                 .with_pd_metrics(crate::observability::pd_metrics::PdMetrics::from_config(
                     &app_state.context.router_config,
                 )),
-        )
+        );
+    // Legacy proxying exits outside both HTTP gateway and llm_gateway
+    // observers. The front records only its separately scoped ingress metrics.
+    let app = if let Some(front) = handoff {
+        app.layer(axum::middleware::from_fn_with_state(
+            front,
+            crate::session_handoff::dispatch,
+        ))
+    } else {
+        app
+    };
+    app.layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            max_payload_size,
+        ))
         .layer(middleware::RequestIdLayer::new(request_id_headers))
         .layer(create_cors_layer(cors_allowed_origins))
         .fallback(sink_handler)

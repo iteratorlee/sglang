@@ -695,7 +695,10 @@ where
         // Convert method to static string to avoid allocation
         let method = method_to_static_str(req.method().as_str());
         let path = normalize_path_for_metrics(req.uri().path());
-        let start = Instant::now();
+        let start = req
+            .extensions()
+            .get::<crate::session_handoff::HandoffIngress>()
+            .map_or_else(Instant::now, |ingress| ingress.0);
         // This is outside admission, JSON extraction, token affinity and P/D
         // dispatch. Reuse the HTTP ingress clock, not the response-header clock.
         let pd_metrics = self
