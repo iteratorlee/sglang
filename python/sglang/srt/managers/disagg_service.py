@@ -45,6 +45,15 @@ def maybe_create_ascend_config_store(transfer_backend: TransferBackend) -> None:
         get_parallel().node_rank == 0 and transfer_backend == TransferBackend.ASCEND
     ):
         return
+    # Independent P replicas may join an already running P/D deployment. Their
+    # transfer engines must use the same store as D, while only the original
+    # owner starts that store. Never attempt to bind its remote address here.
+    if os.getenv("SGLANG_ASCEND_MF_REUSE_CONFIG_STORE", "0") == "1":
+        if not os.getenv("ASCEND_MF_STORE_URL", "").strip():
+            raise ValueError(
+                "ASCEND_MF_STORE_URL is required when reusing an Ascend config store"
+            )
+        return
     try:
         from memfabric_hybrid import create_config_store
 
