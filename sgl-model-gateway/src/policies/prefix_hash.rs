@@ -41,8 +41,13 @@
 //! GET the configuration back, POST /workers, wait for healthy DP registration,
 //! then raise the prefix fraction (0..10000). No worker weight is consumed.
 //! Tokenless/short requests stay on incumbents; lowering the fraction to zero
-//! stops new placements, not existing owners. Books and rollout configuration
-//! are process-local and expire/evict: keep legacy sessions on their original
+//! stops new placements, not existing owners for ordinary prefix cohorts.
+//! Front-marked candidates require restored candidate_new_only=true and
+//! new_prefix_bps=10000, including observed owners and tokenless requests;
+//! missing/incomplete rollout or no available new P fails selection closed.
+//! Stop new front pins with the front's candidate_bps=0 instead. Books and
+//! rollout configuration are process-local; book entries expire/evict. Keep
+//! legacy sessions on their original
 //! gateway during deployment. A new process cannot recover an old process's
 //! observations, and shared D workers do not imply shared gateway lease caps.
 
@@ -70,7 +75,8 @@ type PlacementKey = (u64, u64); // (pool fingerprint, prefix hash)
 /// Process-local admission for an online P expansion. Configure before POST
 /// /workers, then raise new_prefix_bps. This is a fraction of unknown *prefixes*
 /// eligible for new P workers, not a request/traffic weight or a session ledger.
-/// Existing observations survive changes to the fraction (including zero).
+/// Ordinary prefix observations survive changes to the fraction (including
+/// zero). Front candidates require the explicit, fully enabled new-P gate.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PrefillRollout {
@@ -96,8 +102,13 @@ impl PrefillRollout {
     }
 
     fn admits(&self, worker: &dyn Worker, prefix: Option<u64>, candidate: bool) -> bool {
-        if candidate && self.candidate_new_only {
-            return !self.incumbent(worker) && self.new_prefix_bps == 10_000;
+        if candidate {
+            // A restored front pin can arrive before the process-local rollout
+            // is restored. Never interpret an incomplete configuration as
+            // permission to use the incumbent P, including tokenless requests.
+            return self.candidate_new_only
+                && !self.incumbent(worker)
+                && self.new_prefix_bps == 10_000;
         }
         self.incumbent(worker)
             || prefix.is_some_and(|hash| {
@@ -564,13 +575,17 @@ impl PrefixHashPolicy {
             .iter()
             .find(|(_, worker, _)| worker.url() == owner_url)?;
         if matches!(worker.worker_type(), WorkerType::Prefill { .. }) {
-            if let Some(rollout) = self.prefill_rollout() {
-                if rollout.candidate_new_only
-                    && PrefillRollout::candidate(info)
-                    && rollout.incumbent(worker.as_ref())
-                {
-                    return None;
-                }
+            let rollout = self.prefill_rollout();
+            // Gate observed owners too: a prefix may already have an incumbent
+            // owner from a smoke request before handoff activation.
+            if PrefillRollout::candidate(info)
+                && !rollout
+                    .as_ref()
+                    .is_some_and(|r| r.admits(worker.as_ref(), None, true))
+            {
+                return None;
+            }
+            if let Some(rollout) = rollout {
                 return (*owner_load <= rollout.owner_max_load).then_some(*index);
             }
         }
@@ -613,9 +628,11 @@ impl PrefixHashPolicy {
             .filter(|(_, w)| w.is_available() && Self::under_soft_cap(w.as_ref(), info))
             .filter(|(_, w)| {
                 !matches!(w.worker_type(), WorkerType::Prefill { .. })
-                    || rollout.as_ref().is_none_or(|r| {
-                        r.admits(w.as_ref(), rollout_prefix, PrefillRollout::candidate(info))
-                    })
+                    || rollout
+                        .as_ref()
+                        .map_or(!PrefillRollout::candidate(info), |r| {
+                            r.admits(w.as_ref(), rollout_prefix, PrefillRollout::candidate(info))
+                        })
             })
             .collect();
 
@@ -1025,6 +1042,79 @@ mod tests {
             ..Default::default()
         };
         assert!(policy.select_worker_impl(&workers, &info).0.unwrap() < 2);
+    }
+
+    #[test]
+    fn test_front_restart_gate_blocks_until_rollout_and_new_p_are_restored() {
+        let policy = long_prefix_policy();
+        let p = rollout_workers();
+        let d = pd_workers(WorkerType::Decode, 8);
+        let tokens = vec![11; 8192];
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-sglang-handoff-candidate",
+            http::HeaderValue::from_static("1"),
+        );
+        let base = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            hash_ring: Some(Arc::new(HashRing::new(&[p.clone(), d.clone()].concat()))),
+            ..Default::default()
+        };
+        // Reproduce startup with only old P and a previously observed owner.
+        assert!(policy.select_worker_impl(&p[..2], &base).0.is_some());
+        let d_owner = policy.select_worker_impl(&d, &base).0;
+        let candidate = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..base.clone()
+        };
+        let assert_blocked = |workers: &[Arc<dyn Worker>]| {
+            for prefix in [&tokens[..10], &tokens[..]] {
+                let info = SelectWorkerInfo {
+                    tokens: Some(prefix),
+                    ..candidate.clone()
+                };
+                assert_eq!(policy.select_worker_impl(workers, &info).0, None);
+            }
+            let tokenless = SelectWorkerInfo {
+                tokens: None,
+                ..candidate.clone()
+            };
+            assert_eq!(policy.select_without_prefix(workers, &tokenless), None);
+            // The candidate marker must not turn this into a D membership gate.
+            assert_eq!(policy.select_worker_impl(&d, &candidate).0, d_owner);
+        };
+        assert_blocked(&p[..2]); // no rollout after restart
+        assert_blocked(&p); // registration alone must not open admission
+        for (new_only, bps) in [(false, 10_000), (true, 0), (true, 1000)] {
+            let mut config = rollout_config(bps);
+            config.candidate_new_only = new_only;
+            policy.set_prefill_rollout(config).unwrap();
+            assert_blocked(&p);
+        }
+        let mut restored = rollout_config(10_000);
+        restored.candidate_new_only = true;
+        policy.set_prefill_rollout(restored.clone()).unwrap();
+        assert_blocked(&p[..2]); // configured, but new P not yet registered
+        p[2].set_healthy(false);
+        p[3].set_healthy(false);
+        assert_blocked(&p); // registered, but new P not yet available
+        p[2].set_healthy(true);
+        p[3].set_healthy(true);
+        assert!(policy.select_worker_impl(&p, &candidate).0.unwrap() >= 2);
+        let tokenless = SelectWorkerInfo {
+            tokens: None,
+            ..candidate.clone()
+        };
+        assert!(policy.select_without_prefix(&p, &tokenless).unwrap() >= 2);
+        // Even an observed new-P owner cannot bypass a disabled rollout gate.
+        let mut disabled = restored.clone();
+        disabled.candidate_new_only = false;
+        policy.set_prefill_rollout(disabled).unwrap();
+        assert_blocked(&p);
+        policy.set_prefill_rollout(restored).unwrap();
+        assert!(policy.select_worker_impl(&p, &candidate).0.unwrap() >= 2);
+        // Unmarked traffic retains its ordinary policy behavior.
+        assert!(policy.select_worker_impl(&p[..2], &base).0.is_some());
     }
 
     #[test]
