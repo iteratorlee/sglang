@@ -171,6 +171,18 @@ def read_feedback(config):
     result = request(config['prometheus'], 'GET', '/api/v1/query?' + urlencode({'query': query}))
     if result.get('status') != 'success':
         raise RuntimeError('prometheus_query_failed')
+    timestamps = {}
+    for name in names:
+        # Instant vector value[0] is the evaluation time. timestamp() exposes
+        # the original stored sample time; query families separately because
+        # Prometheus removes __name__ and otherwise label sets can collide.
+        query = 'timestamp(' + name + '{cluster="' + config['cluster'] + '"})'
+        observed = request(config['prometheus'], 'GET', '/api/v1/query?' + urlencode({'query': query}))
+        if observed.get('status') != 'success':
+            raise RuntimeError('prometheus_timestamp_query_failed')
+        for entry in observed['data']['result']:
+            labels = tuple(sorted((k, v) for k, v in entry['metric'].items() if k != '__name__'))
+            timestamps[(name, labels)] = float(entry['value'][1])
     complete, sources, queues, running = set(), set(), {}, {}
     errors = []
     now = time.time()
@@ -187,7 +199,8 @@ def read_feedback(config):
         if not relevant:
             continue
         value = float(row['value'][1])
-        timestamp = float(row['value'][0])
+        key = (name, tuple(sorted((k, v) for k, v in labels.items() if k != '__name__')))
+        timestamp = timestamps.get(key)
         if (not finite(value) or value < 0 or not finite(timestamp)
                 or not -2 <= now - timestamp <= config.get('max_feedback_age_secs', 30)):
             invalid = True

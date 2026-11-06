@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+from urllib.parse import parse_qs, urlsplit
 
 
 # Loading the sibling by path also works with unittest discovery from elsewhere.
@@ -365,10 +366,19 @@ class ReadFeedbackTests(unittest.TestCase):
 
     def read(self):
         response = dict(status="success", data=dict(result=self.rows))
-        with mock.patch.object(admission, "request", return_value=response) as api:
+        def respond(_origin, _method, path):
+            query = parse_qs(urlsplit(path).query)['query'][0]
+            if query.startswith('timestamp('):
+                name = query[len('timestamp('):].split('{', 1)[0]
+                values = [dict(metric={k: v for k, v in row['metric'].items() if k != '__name__'},
+                               value=[self.NOW, row['value'][0]])
+                          for row in self.rows if row['metric']['__name__'] == name]
+                return dict(status='success', data=dict(result=values))
+            return response
+        with mock.patch.object(admission, "request", side_effect=respond) as api:
             with mock.patch.object(admission.time, "time", return_value=self.NOW):
                 result = admission.read_feedback(self.config)
-        self.assertEqual(api.call_count, 1)
+        self.assertEqual(api.call_count, 6)
         args = api.call_args[0]
         self.assertEqual(args[:2], (self.config["prometheus"], "GET"))
         self.assertTrue(args[2].startswith("/api/v1/query?"))
@@ -503,6 +513,29 @@ class ReadFeedbackTests(unittest.TestCase):
         with mock.patch.object(admission, "request", return_value={"status": "error"}):
             with self.assertRaises(RuntimeError):
                 admission.read_feedback(self.config)
+
+    def test_fresh_evaluation_time_does_not_hide_old_stored_samples(self):
+        def respond(_origin, _method, path):
+            query = parse_qs(urlsplit(path).query)['query'][0]
+            if query.startswith('timestamp('):
+                name = query[len('timestamp('):].split('{', 1)[0]
+                values = [dict(metric={k: v for k, v in row['metric'].items() if k != '__name__'},
+                               value=[self.NOW, self.NOW - 3600])
+                          for row in self.rows if row['metric']['__name__'] == name]
+                return dict(status='success', data=dict(result=values))
+            return dict(status='success', data=dict(result=self.rows))
+        with mock.patch.object(admission, 'request', side_effect=respond), \
+                mock.patch.object(admission.time, 'time', return_value=self.NOW):
+            self.assertFalse(admission.read_feedback(self.config)['fresh'])
+
+    def test_absent_underlying_timestamp_cannot_be_assumed_fresh(self):
+        def respond(_origin, _method, path):
+            query = parse_qs(urlsplit(path).query)['query'][0]
+            return dict(status='success', data=dict(
+                result=[] if query.startswith('timestamp(') else self.rows))
+        with mock.patch.object(admission, 'request', side_effect=respond), \
+                mock.patch.object(admission.time, 'time', return_value=self.NOW):
+            self.assertFalse(admission.read_feedback(self.config)['fresh'])
 
 
 class TickTests(PolicyFixture):
